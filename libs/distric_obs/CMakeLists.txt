@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(distric_obs VERSION 0.1.0 LANGUAGES C)
+project(distric_obs VERSION 0.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -14,6 +14,9 @@ set(SOURCES
     src/error.c
     src/metrics.c
     src/logging.c
+    src/tracing.c
+    src/health.c
+    src/http_server.c
 )
 
 # Header files
@@ -25,6 +28,9 @@ set(INTERNAL_HEADERS
     include/distric_obs/error.h
     include/distric_obs/metrics.h
     include/distric_obs/logging.h
+    include/distric_obs/tracing.h
+    include/distric_obs/health.h
+    include/distric_obs/http_server.h
 )
 
 # Static library
@@ -50,8 +56,8 @@ set_target_properties(distric_obs_shared PROPERTIES
 )
 
 # Link libraries
-target_link_libraries(distric_obs_static PRIVATE m)
-target_link_libraries(distric_obs_shared PRIVATE m)
+target_link_libraries(distric_obs_static PRIVATE m pthread)
+target_link_libraries(distric_obs_shared PRIVATE m pthread)
 
 # Install targets
 install(TARGETS distric_obs_static distric_obs_shared

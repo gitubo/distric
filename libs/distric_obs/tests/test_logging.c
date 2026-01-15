@@ -1,4 +1,4 @@
-#define _DEFAULT_SOURCE /* Needed for mkstemp */
+#define _DEFAULT_SOURCE 
 #include "distric_obs.h"
 #include "distric_obs/logging.h"
 #include <stdio.h>
