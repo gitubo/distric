@@ -1,2 +1,0 @@
-/usr/bin/ar qc libdistric_obs.a CMakeFiles/distric_obs_static.dir/src/error.c.o CMakeFiles/distric_obs_static.dir/src/metrics.c.o CMakeFiles/distric_obs_static.dir/src/logging.c.o
-/usr/bin/ranlib libdistric_obs.a

@@ -1,1 +1,0 @@
-/usr/bin/cc  -Wall -Wextra -Wpedantic -Werror -Wall -Wextra -Wpedantic -Werror -pthread -Wl,--dependency-file=CMakeFiles/bench_logging.dir/link.d CMakeFiles/bench_logging.dir/bench_logging.c.o -o bench_logging  ../libdistric_obs.a -lpthread -lm

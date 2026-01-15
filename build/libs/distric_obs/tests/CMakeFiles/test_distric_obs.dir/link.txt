@@ -1,1 +1,0 @@
-/usr/bin/cc  -Wall -Wextra -Wpedantic -Werror -Wall -Wextra -Wpedantic -Werror -pthread -Wl,--dependency-file=CMakeFiles/test_distric_obs.dir/link.d CMakeFiles/test_distric_obs.dir/test_distric_obs.c.o -o test_distric_obs  ../libdistric_obs.a -lpthread -lm
