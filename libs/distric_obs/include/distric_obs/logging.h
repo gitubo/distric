@@ -14,6 +14,7 @@
 typedef struct {
     char data[LOG_BUFFER_SIZE];
     size_t length;
+    _Atomic bool ready;  /* NEW: Commit flag for safe concurrent access */
 } log_entry_t;
 
 typedef struct {

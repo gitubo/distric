@@ -237,7 +237,7 @@ void bench_cpu_overhead() {
 }
 
 int main() {
-    printf("=== DistriC Logging Performance Benchmarks ===\n\n");
+    printf("=== Distrmake iC Logging Performance Benchmarks ===\n\n");
     
     bench_sync_logging();
     bench_async_logging();

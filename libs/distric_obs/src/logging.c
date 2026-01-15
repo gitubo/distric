@@ -87,11 +87,34 @@ static void* flush_thread_fn(void* arg) {
             continue;
         }
         
-        /* Read entry */
+        /* Get entry pointer */
         log_entry_t* entry = &rb->entries[read_pos & RING_BUFFER_MASK];
+        
+        /* FIX #2: Wait for writer to commit the entry */
+        /* Spin-wait with backoff for the entry to be marked ready */
+        int spin_count = 0;
+        while (!atomic_load(&entry->ready)) {
+            if (spin_count < 100) {
+                /* Tight spin for first 100 iterations */
+                __asm__ __volatile__("pause" ::: "memory");
+                spin_count++;
+            } else {
+                /* Yield after spinning */
+                usleep(1);
+            }
+            
+            /* Double-check we haven't been shut down */
+            if (!atomic_load(&rb->running) && 
+                atomic_load(&rb->read_pos) == atomic_load(&rb->write_pos)) {
+                return NULL;
+            }
+        }
         
         /* Write to file descriptor */
         write(logger->fd, entry->data, entry->length);
+        
+        /* Mark entry as consumed (allow reuse) */
+        atomic_store(&entry->ready, false);
         
         /* Advance read position */
         atomic_store(&rb->read_pos, read_pos + 1);
@@ -126,6 +149,11 @@ distric_err_t log_init(logger_t** logger, int fd, log_mode_t mode) {
         atomic_init(&log->ring_buffer->write_pos, 0);
         atomic_init(&log->ring_buffer->read_pos, 0);
         atomic_init(&log->ring_buffer->running, true);
+        
+        /* Initialize all entries as not ready */
+        for (size_t i = 0; i < RING_BUFFER_SIZE; i++) {
+            atomic_init(&log->ring_buffer->entries[i].ready, false);
+        }
         
         /* Start flush thread */
         if (pthread_create(&log->flush_thread, NULL, flush_thread_fn, log) != 0) {
@@ -268,21 +296,34 @@ distric_err_t log_write(
     } else {
         /* Write to ring buffer */
         ring_buffer_t* rb = logger->ring_buffer;
-        size_t write_pos = atomic_load(&rb->write_pos);
+        
+        /* FIX #1: Atomically reserve a slot */
+        size_t write_pos = atomic_fetch_add(&rb->write_pos, 1);
         size_t read_pos = atomic_load(&rb->read_pos);
         
-        /* Check if buffer is full */
+        /* FIX #6: Check if buffer is full AFTER reservation */
         if (write_pos - read_pos >= RING_BUFFER_SIZE) {
+            /* Buffer full - this creates a "hole" but prevents deadlock */
+            /* The flush thread will spin-wait on the ready flag forever if we don't handle this */
+            /* We need to mark this slot as skipped */
+            log_entry_t* entry = &rb->entries[write_pos & RING_BUFFER_MASK];
+            entry->length = 0; /* Mark as empty/skipped */
+            atomic_store(&entry->ready, true); /* Let flush thread skip it */
             return DISTRIC_ERR_BUFFER_OVERFLOW;
         }
         
         /* Copy to ring buffer entry */
         log_entry_t* entry = &rb->entries[write_pos & RING_BUFFER_MASK];
+        
+        /* Ensure ready flag is false before writing (should already be from previous use) */
+        atomic_store(&entry->ready, false);
+        
+        /* Copy data */
         memcpy(entry->data, buffer, offset);
         entry->length = offset;
         
-        /* Advance write position */
-        atomic_store(&rb->write_pos, write_pos + 1);
+        /* FIX #2: Commit the entry - signal to flush thread that data is ready */
+        atomic_store(&entry->ready, true);
     }
     
     return DISTRIC_OK;

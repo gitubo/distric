@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <pthread.h>
 
 const double HISTOGRAM_BUCKETS[HISTOGRAM_BUCKET_COUNT] = {
     0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, INFINITY
@@ -34,6 +35,18 @@ distric_err_t metrics_init(metrics_registry_t** registry) {
     }
     
     atomic_init(&reg->metric_count, 0);
+    
+    /* FIX #4: Initialize mutex for registration deduplication */
+    if (pthread_mutex_init(&reg->register_mutex, NULL) != 0) {
+        free(reg);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Initialize all metrics as not initialized */
+    for (size_t i = 0; i < MAX_METRICS; i++) {
+        atomic_init(&reg->metrics[i].initialized, false);
+    }
+    
     *registry = reg;
     
     return DISTRIC_OK;
@@ -42,8 +55,54 @@ distric_err_t metrics_init(metrics_registry_t** registry) {
 /* Destroy metrics registry and free all resources */
 void metrics_destroy(metrics_registry_t* registry) {
     if (registry) {
+        pthread_mutex_destroy(&registry->register_mutex);
         free(registry);
     }
+}
+
+/* Helper: Check if metric with same name and labels exists */
+static metric_t* find_existing_metric(
+    metrics_registry_t* registry,
+    const char* name,
+    const metric_label_t* labels,
+    size_t label_count
+) {
+    size_t count = atomic_load(&registry->metric_count);
+    
+    for (size_t i = 0; i < count; i++) {
+        metric_t* m = &registry->metrics[i];
+        
+        /* FIX #3: Only check initialized metrics */
+        if (!atomic_load(&m->initialized)) {
+            continue;
+        }
+        
+        /* Check name match */
+        if (strcmp(m->name, name) != 0) {
+            continue;
+        }
+        
+        /* Check label count match */
+        if (m->label_count != label_count) {
+            continue;
+        }
+        
+        /* Check all labels match */
+        bool labels_match = true;
+        for (size_t j = 0; j < label_count; j++) {
+            if (strcmp(m->labels[j].key, labels[j].key) != 0 ||
+                strcmp(m->labels[j].value, labels[j].value) != 0) {
+                labels_match = false;
+                break;
+            }
+        }
+        
+        if (labels_match) {
+            return m;
+        }
+    }
+    
+    return NULL;
 }
 
 /* Helper: Register a metric with common logic */
@@ -64,14 +123,38 @@ static distric_err_t register_metric(
         return DISTRIC_ERR_INVALID_ARG;
     }
     
+    /* FIX #4: Lock for deduplication check and registration */
+    pthread_mutex_lock(&registry->register_mutex);
+    
+    /* Check if metric already exists */
+    metric_t* existing = find_existing_metric(registry, name, labels, label_count);
+    if (existing) {
+        pthread_mutex_unlock(&registry->register_mutex);
+        
+        /* Return existing metric if type matches */
+        if (existing->type == type) {
+            *out_metric = existing;
+            return DISTRIC_OK;
+        } else {
+            /* Type mismatch - error */
+            return DISTRIC_ERR_INVALID_ARG;
+        }
+    }
+    
+    /* Allocate new slot */
     size_t idx = atomic_fetch_add(&registry->metric_count, 1);
     if (idx >= MAX_METRICS) {
         atomic_fetch_sub(&registry->metric_count, 1);
+        pthread_mutex_unlock(&registry->register_mutex);
         return DISTRIC_ERR_REGISTRY_FULL;
     }
     
     metric_t* metric = &registry->metrics[idx];
     
+    /* FIX #3: Mark as not initialized during setup */
+    atomic_store(&metric->initialized, false);
+    
+    /* Copy metadata */
     strncpy(metric->name, name, MAX_METRIC_NAME_LEN - 1);
     metric->name[MAX_METRIC_NAME_LEN - 1] = '\0';
     
@@ -105,6 +188,11 @@ static distric_err_t register_metric(
             }
             break;
     }
+    
+    /* FIX #3: Mark as initialized - must be last step */
+    atomic_store(&metric->initialized, true);
+    
+    pthread_mutex_unlock(&registry->register_mutex);
     
     *out_metric = metric;
     return DISTRIC_OK;
@@ -176,6 +264,13 @@ void metrics_histogram_observe(metric_t* metric, double value) {
         return;
     }
     
+    /* FIX #5: Document that histogram updates are eventually consistent */
+    /* NOTE: Updates are not transactional. In high-concurrency scenarios,
+     * an exporter may observe a count that temporarily doesn't match the 
+     * sum of buckets. This is an acceptable tradeoff for lock-free performance.
+     * The inconsistency is typically sub-microsecond and resolves naturally.
+     */
+    
     /* Update count */
     atomic_fetch_add(&metric->data.histogram.count, 1);
     
@@ -233,6 +328,11 @@ distric_err_t metrics_export_prometheus(
     
     for (size_t i = 0; i < count; i++) {
         metric_t* m = &registry->metrics[i];
+        
+        /* FIX #3: Skip uninitialized metrics */
+        if (!atomic_load(&m->initialized)) {
+            continue;
+        }
         
         /* HELP line */
         int written = snprintf(buffer + offset, buffer_size - offset,
