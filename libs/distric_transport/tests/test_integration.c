@@ -3,14 +3,16 @@
  * @brief Phase 1 Integration Test - All transport components together
  * 
  * This test validates:
- * 1. All observability systems work (metrics, logs)
+ * 1. All observability systems work (metrics, logs, health)
  * 2. TCP server and pool operate concurrently
  * 3. UDP datagrams are sent/received
  * 4. Metrics correctly track all operations
+ * 
+ * Uses ONLY public APIs from distric_obs and distric_transport.
  */
 
 #include <distric_transport.h>
-#include <distric_obs/health.h>
+#include <distric_obs.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>

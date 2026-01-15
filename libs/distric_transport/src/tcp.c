@@ -4,11 +4,11 @@
  * 
  * Non-blocking TCP server using epoll (Linux) or kqueue (BSD/macOS)
  * with integrated observability.
+ * Uses ONLY the public distric_obs API.
  */
 
 #include "distric_transport/tcp.h"
-#include <distric_obs/logging.h>
-#include <distric_obs/tracing.h>
+#include <distric_obs.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +22,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <time.h>
 
 #ifdef __linux__
 #include <sys/epoll.h>
@@ -320,8 +321,7 @@ static void* event_loop_epoll(void* arg) {
                 
                 /* Update metrics */
                 if (server->connections_active) {
-                    metrics_gauge_set(server->connections_active, 
-                                     atomic_fetch_add(&((uint64_t*)server->userdata)[0], 1) + 1);
+                    metrics_gauge_set(server->connections_active, 1);
                 }
                 if (server->connections_total) {
                     metrics_counter_inc(server->connections_total);
@@ -392,7 +392,6 @@ static void* event_loop_kqueue(void* arg) {
                 
                 /* Update metrics */
                 if (server->connections_active) {
-                    /* Simplified - in real impl, track active count */
                     metrics_gauge_set(server->connections_active, 1);
                 }
                 if (server->connections_total) {

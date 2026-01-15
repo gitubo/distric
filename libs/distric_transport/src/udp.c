@@ -3,10 +3,11 @@
  * @brief UDP Socket Implementation
  * 
  * Non-blocking UDP socket with integrated observability.
+ * Uses ONLY the public distric_obs API.
  */
 
 #include "distric_transport/udp.h"
-#include <distric_obs/logging.h>
+#include <distric_obs.h>
 
 #include <stdlib.h>
 #include <string.h>

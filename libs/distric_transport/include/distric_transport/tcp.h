@@ -21,7 +21,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <distric_obs.h>
-#include <distric_obs/tracing.h>
 
 #ifdef __cplusplus
 extern "C" {

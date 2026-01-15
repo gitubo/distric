@@ -3,15 +3,17 @@
  * @brief TCP Connection Pool Implementation
  * 
  * Thread-safe connection pooling with LRU eviction policy.
+ * Uses ONLY the public distric_obs API.
  */
 
 #include "distric_transport/tcp_pool.h"
-#include <distric_obs/logging.h>
+#include <distric_obs.h>
 
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <time.h>
 
 /* ============================================================================
  * INTERNAL STRUCTURES

@@ -1,18 +1,21 @@
 /**
  * @file distric_obs.h
- * @brief DistriC Observability Library - High-performance metrics and logging
+ * @brief DistriC Observability Library - Complete Public API
  * 
- * This library provides lock-free metrics collection and async structured logging
- * for distributed systems. All operations are thread-safe with minimal overhead.
+ * This is the ONLY header users need to include for full observability support.
+ * Provides lock-free metrics, async logging, distributed tracing, and health checks.
  * 
  * Features:
  * - Lock-free metrics (counters, gauges, histograms)
  * - Prometheus-compatible export format
  * - Async JSON logging with ring buffer
- * - Zero external dependencies
+ * - Distributed tracing with context propagation
+ * - Health check monitoring
+ * - HTTP server for /metrics and /health endpoints
+ * - Zero external dependencies (except pthread)
  * - <1% CPU overhead
  * 
- * @version 0.1.0
+ * @version 0.2.0
  * @author DistriC Development Team
  */
 
@@ -169,6 +172,164 @@ distric_err_t log_write(
 
 #define LOG_FATAL(logger, component, message, ...) \
     log_write(logger, LOG_LEVEL_FATAL, component, message, ##__VA_ARGS__, NULL)
+
+/* ============================================================================
+ * DISTRIBUTED TRACING
+ * ========================================================================= */
+
+typedef struct tracer_s tracer_t;
+typedef struct trace_span_s trace_span_t;
+
+/* Trace and span identifiers */
+typedef struct {
+    uint64_t high;
+    uint64_t low;
+} trace_id_t;
+
+typedef uint64_t span_id_t;
+
+/* Span status */
+typedef enum {
+    SPAN_STATUS_UNSET = 0,
+    SPAN_STATUS_OK = 1,
+    SPAN_STATUS_ERROR = 2,
+} span_status_t;
+
+/* Trace context for propagation */
+typedef struct {
+    trace_id_t trace_id;
+    span_id_t span_id;
+} trace_context_t;
+
+/* Initialize tracer with export callback */
+distric_err_t trace_init(
+    tracer_t** tracer, 
+    void (*export_callback)(trace_span_t*, size_t, void*),
+    void* user_data
+);
+
+/* Destroy tracer and flush pending spans */
+void trace_destroy(tracer_t* tracer);
+
+/* Start a new root span */
+distric_err_t trace_start_span(
+    tracer_t* tracer, 
+    const char* operation, 
+    trace_span_t** out_span
+);
+
+/* Start a child span */
+distric_err_t trace_start_child_span(
+    tracer_t* tracer, 
+    trace_span_t* parent,
+    const char* operation, 
+    trace_span_t** out_span
+);
+
+/* Add tag to span */
+distric_err_t trace_add_tag(
+    trace_span_t* span, 
+    const char* key, 
+    const char* value
+);
+
+/* Set span status */
+void trace_set_status(trace_span_t* span, span_status_t status);
+
+/* Finish span and submit for export */
+void trace_finish_span(tracer_t* tracer, trace_span_t* span);
+
+/* Context propagation - inject trace context into header string */
+distric_err_t trace_inject_context(
+    trace_span_t* span, 
+    char* header, 
+    size_t header_size
+);
+
+/* Context propagation - extract trace context from header string */
+distric_err_t trace_extract_context(
+    const char* header, 
+    trace_context_t* context
+);
+
+/* Create child span from extracted context */
+distric_err_t trace_start_span_from_context(
+    tracer_t* tracer, 
+    const trace_context_t* context,
+    const char* operation,
+    trace_span_t** out_span
+);
+
+/* Thread-local active span support */
+void trace_set_active_span(trace_span_t* span);
+trace_span_t* trace_get_active_span(void);
+
+/* ============================================================================
+ * HEALTH MONITORING
+ * ========================================================================= */
+
+typedef struct health_registry_s health_registry_t;
+typedef struct health_component_s health_component_t;
+
+/* Health status */
+typedef enum {
+    HEALTH_UP = 0,
+    HEALTH_DEGRADED = 1,
+    HEALTH_DOWN = 2,
+} health_status_t;
+
+/* Initialize health registry */
+distric_err_t health_init(health_registry_t** registry);
+
+/* Destroy health registry */
+void health_destroy(health_registry_t* registry);
+
+/* Register a health check component */
+distric_err_t health_register_component(
+    health_registry_t* registry,
+    const char* name,
+    health_component_t** out_component
+);
+
+/* Update component health status */
+distric_err_t health_update_status(
+    health_component_t* component,
+    health_status_t status,
+    const char* message
+);
+
+/* Get overall system health (worst status of all components) */
+health_status_t health_get_overall_status(health_registry_t* registry);
+
+/* Export health status as JSON */
+distric_err_t health_export_json(
+    health_registry_t* registry,
+    char** out_buffer,
+    size_t* out_size
+);
+
+/* Helper: Convert health status to string */
+const char* health_status_str(health_status_t status);
+
+/* ============================================================================
+ * HTTP OBSERVABILITY SERVER
+ * ========================================================================= */
+
+typedef struct obs_server_s obs_server_t;
+
+/* Initialize and start HTTP server for /metrics and /health endpoints */
+distric_err_t obs_server_init(
+    obs_server_t** server,
+    uint16_t port,
+    metrics_registry_t* metrics,
+    health_registry_t* health
+);
+
+/* Stop and destroy HTTP server */
+void obs_server_destroy(obs_server_t* server);
+
+/* Get server port (useful if port 0 was used for auto-assignment) */
+uint16_t obs_server_get_port(obs_server_t* server);
 
 #ifdef __cplusplus
 }
