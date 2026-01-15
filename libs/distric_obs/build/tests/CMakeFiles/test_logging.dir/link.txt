@@ -1,0 +1,1 @@
+/usr/bin/cc  -Wall -Wextra -Wpedantic -Werror -pthread -Wl,--dependency-file=CMakeFiles/test_logging.dir/link.d CMakeFiles/test_logging.dir/test_logging.c.o -o test_logging  ../libdistric_obs.a -lpthread -lm

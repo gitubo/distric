@@ -1,0 +1,1 @@
+/usr/bin/cc -fPIC  -Wall -Wextra -Wpedantic -Werror -Wall -Wextra -Wpedantic -Werror -pthread -Wl,--dependency-file=CMakeFiles/distric_obs_shared.dir/link.d -shared -Wl,-soname,libdistric_obs.so.0 -o libdistric_obs.so.0.1.0 CMakeFiles/distric_obs_shared.dir/src/error.c.o CMakeFiles/distric_obs_shared.dir/src/metrics.c.o CMakeFiles/distric_obs_shared.dir/src/logging.c.o  -lm
