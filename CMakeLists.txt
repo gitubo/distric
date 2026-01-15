@@ -13,6 +13,7 @@ enable_testing()
 
 # Add subdirectories
 add_subdirectory(libs/distric_obs)
+add_subdirectory(libs/distric_transport)
 
 # Future libraries can be added here
 # add_subdirectory(libs/distric_core)
