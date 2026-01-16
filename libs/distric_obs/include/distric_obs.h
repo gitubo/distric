@@ -269,7 +269,7 @@ trace_span_t* trace_get_active_span(void);
  * ========================================================================= */
 
 typedef struct health_registry_s health_registry_t;
-typedef struct health_component_s health_component_t;
+typedef struct health_component_s health_component_t;  /* Opaque type */
 
 /* Health status */
 typedef enum {

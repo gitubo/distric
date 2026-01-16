@@ -33,6 +33,7 @@ target_include_directories(distric_transport
 )
 
 # Link dependencies
+# CRITICAL: Link to distric_obs library and inherit its public include directories
 target_link_libraries(distric_transport
     PUBLIC
         distric_obs
