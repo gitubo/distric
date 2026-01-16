@@ -7,22 +7,28 @@
  * Uses ONLY the public distric_obs API.
  */
 
+#define _POSIX_C_SOURCE 200112L
+
 #include "distric_transport/tcp.h"
 #include <distric_obs.h>
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #ifdef __linux__
 #include <sys/epoll.h>
@@ -112,7 +118,7 @@ static int set_tcp_nodelay(int fd) {
 }
 
 static uint64_t generate_conn_id(void) {
-    static _Atomic uint64_t counter = 0;
+    static atomic_uint_fast64_t counter = 0;
     return atomic_fetch_add(&counter, 1) + 1;
 }
 
@@ -561,7 +567,7 @@ void tcp_server_stop(tcp_server_t* server) {
     pthread_join(server->event_thread, NULL);
     
     if (server->logger) {
-        LOG_INFO(server->logger, "tcp", "Server stopped");
+        LOG_INFO(server->logger, "tcp", "Server stopped", "status", "shutdown");
     }
 }
 

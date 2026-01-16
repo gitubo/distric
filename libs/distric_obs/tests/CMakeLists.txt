@@ -24,9 +24,9 @@ add_executable(test_http_server test_http_server.c)
 target_link_libraries(test_http_server PRIVATE distric_obs_static pthread m)
 add_test(NAME test_http_server COMMAND test_http_server)
 
-add_executable(test_integration test_integration.c)
-target_link_libraries(test_integration PRIVATE distric_obs_static pthread m)
-add_test(NAME test_integration COMMAND test_integration)
+add_executable(test_obs_integration test_integration.c)
+target_link_libraries(test_obs_integration PRIVATE distric_obs_static pthread m)
+add_test(NAME test_obs_integration COMMAND test_obs_integration)
 
 # Benchmarks
 add_executable(bench_metrics bench_metrics.c)

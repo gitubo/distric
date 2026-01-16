@@ -1,15 +1,23 @@
+//####################
+// FILE: /libs/distric_transport/src/udp.c
+//####################
+
 /**
  * @file udp.c
  * @brief UDP Socket Implementation
- * 
- * Non-blocking UDP socket with integrated observability.
+ * * Non-blocking UDP socket with integrated observability.
  * Uses ONLY the public distric_obs API.
  */
+
+/* Feature test macros for gethostbyname and basic POSIX functionality */
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200112L
 
 #include "distric_transport/udp.h"
 #include <distric_obs.h>
 
 #include <stdlib.h>
+#include <stdio.h>      /* Added for snprintf */
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -18,7 +26,7 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <netdb.h>
+#include <netdb.h>      /* Added for gethostbyname */
 #include <sys/select.h>
 
 /* ============================================================================
@@ -59,9 +67,9 @@ distric_err_t udp_socket_create(
     uint16_t port,
     metrics_registry_t* metrics,
     logger_t* logger,
-    udp_socket_t** socket
+    udp_socket_t** sock_out  /* RENAMED from 'socket' to avoid shadowing socket() */
 ) {
-    if (!bind_addr || !socket) {
+    if (!bind_addr || !sock_out) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
@@ -115,31 +123,33 @@ distric_err_t udp_socket_create(
         char port_str[16];
         snprintf(port_str, sizeof(port_str), "%u", port);
         
+        /* Added NULL sentinel for variadic macro */
         LOG_INFO(logger, "udp", "UDP socket created",
                 "bind_addr", bind_addr,
-                "port", port_str);
+                "port", port_str, NULL);
     }
     
-    *socket = sock;
+    *sock_out = sock;
     return DISTRIC_OK;
 }
 
 int udp_send(
-    udp_socket_t* socket,
+    udp_socket_t* sock,
     const void* data,
     size_t len,
     const char* dest_addr,
     uint16_t dest_port
 ) {
-    if (!socket || !data || len == 0 || !dest_addr) {
+    if (!sock || !data || len == 0 || !dest_addr) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
     /* Check datagram size (UDP limit is 65507 bytes) */
     if (len > 65507) {
-        if (socket->logger) {
-            LOG_WARN(socket->logger, "udp", "Datagram too large",
-                    "size", "exceeds 65507 bytes");
+        if (sock->logger) {
+            /* Added NULL sentinel */
+            LOG_WARN(sock->logger, "udp", "Datagram too large",
+                    "size", "exceeds 65507 bytes", NULL);
         }
         return DISTRIC_ERR_INVALID_ARG;
     }
@@ -147,8 +157,8 @@ int udp_send(
     /* Resolve destination */
     struct hostent* he = gethostbyname(dest_addr);
     if (!he) {
-        if (socket->errors_metric) {
-            metrics_counter_inc(socket->errors_metric);
+        if (sock->errors_metric) {
+            metrics_counter_inc(sock->errors_metric);
         }
         return DISTRIC_ERR_INVALID_ARG;
     }
@@ -160,36 +170,38 @@ int udp_send(
     memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
     
     /* Send datagram */
-    ssize_t sent = sendto(socket->fd, data, len, 0,
+    ssize_t sent = sendto(sock->fd, data, len, 0,
                          (struct sockaddr*)&addr, sizeof(addr));
     
     if (sent > 0) {
-        if (socket->packets_sent_metric) {
-            metrics_counter_inc(socket->packets_sent_metric);
+        if (sock->packets_sent_metric) {
+            metrics_counter_inc(sock->packets_sent_metric);
         }
-        if (socket->bytes_sent_metric) {
-            metrics_counter_add(socket->bytes_sent_metric, sent);
+        if (sock->bytes_sent_metric) {
+            metrics_counter_add(sock->bytes_sent_metric, sent);
         }
         
-        if (socket->logger) {
+        if (sock->logger) {
             char port_str[16];
             snprintf(port_str, sizeof(port_str), "%u", dest_port);
             char bytes_str[32];
             snprintf(bytes_str, sizeof(bytes_str), "%zd", sent);
             
-            LOG_DEBUG(socket->logger, "udp", "Datagram sent",
+            /* Added NULL sentinel */
+            LOG_DEBUG(sock->logger, "udp", "Datagram sent",
                      "dest_addr", dest_addr,
                      "dest_port", port_str,
-                     "bytes", bytes_str);
+                     "bytes", bytes_str, NULL);
         }
     } else {
-        if (socket->errors_metric) {
-            metrics_counter_inc(socket->errors_metric);
+        if (sock->errors_metric) {
+            metrics_counter_inc(sock->errors_metric);
         }
         
-        if (socket->logger) {
-            LOG_ERROR(socket->logger, "udp", "Send failed",
-                     "error", strerror(errno));
+        if (sock->logger) {
+            /* Added NULL sentinel */
+            LOG_ERROR(sock->logger, "udp", "Send failed",
+                     "error", strerror(errno), NULL);
         }
     }
     
@@ -197,14 +209,14 @@ int udp_send(
 }
 
 int udp_recv(
-    udp_socket_t* socket,
+    udp_socket_t* sock,
     void* buffer,
     size_t len,
     char* src_addr,
     uint16_t* src_port,
     int timeout_ms
 ) {
-    if (!socket || !buffer || len == 0) {
+    if (!sock || !buffer || len == 0) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
@@ -212,7 +224,7 @@ int udp_recv(
     if (timeout_ms >= 0) {
         fd_set read_fds;
         FD_ZERO(&read_fds);
-        FD_SET(socket->fd, &read_fds);
+        FD_SET(sock->fd, &read_fds);
         
         struct timeval tv;
         struct timeval* tv_ptr = NULL;
@@ -223,14 +235,14 @@ int udp_recv(
             tv_ptr = &tv;
         }
         
-        int ready = select(socket->fd + 1, &read_fds, NULL, NULL, tv_ptr);
+        int ready = select(sock->fd + 1, &read_fds, NULL, NULL, tv_ptr);
         
         if (ready == 0) {
             /* Timeout */
             return 0;
         } else if (ready < 0) {
-            if (socket->errors_metric) {
-                metrics_counter_inc(socket->errors_metric);
+            if (sock->errors_metric) {
+                metrics_counter_inc(sock->errors_metric);
             }
             return ready;
         }
@@ -240,15 +252,15 @@ int udp_recv(
     struct sockaddr_in addr;
     socklen_t addr_len = sizeof(addr);
     
-    ssize_t received = recvfrom(socket->fd, buffer, len, 0,
+    ssize_t received = recvfrom(sock->fd, buffer, len, 0,
                                (struct sockaddr*)&addr, &addr_len);
     
     if (received > 0) {
-        if (socket->packets_recv_metric) {
-            metrics_counter_inc(socket->packets_recv_metric);
+        if (sock->packets_recv_metric) {
+            metrics_counter_inc(sock->packets_recv_metric);
         }
-        if (socket->bytes_recv_metric) {
-            metrics_counter_add(socket->bytes_recv_metric, received);
+        if (sock->bytes_recv_metric) {
+            metrics_counter_add(sock->bytes_recv_metric, received);
         }
         
         /* Extract source address */
@@ -259,7 +271,7 @@ int udp_recv(
             *src_port = ntohs(addr.sin_port);
         }
         
-        if (socket->logger) {
+        if (sock->logger) {
             char src_addr_str[256];
             inet_ntop(AF_INET, &addr.sin_addr, src_addr_str, sizeof(src_addr_str));
             char port_str[16];
@@ -267,32 +279,35 @@ int udp_recv(
             char bytes_str[32];
             snprintf(bytes_str, sizeof(bytes_str), "%zd", received);
             
-            LOG_DEBUG(socket->logger, "udp", "Datagram received",
+            /* Added NULL sentinel */
+            LOG_DEBUG(sock->logger, "udp", "Datagram received",
                      "src_addr", src_addr_str,
                      "src_port", port_str,
-                     "bytes", bytes_str);
+                     "bytes", bytes_str, NULL);
         }
     } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        if (socket->errors_metric) {
-            metrics_counter_inc(socket->errors_metric);
+        if (sock->errors_metric) {
+            metrics_counter_inc(sock->errors_metric);
         }
         
-        if (socket->logger) {
-            LOG_ERROR(socket->logger, "udp", "Receive failed",
-                     "error", strerror(errno));
+        if (sock->logger) {
+            /* Added NULL sentinel */
+            LOG_ERROR(sock->logger, "udp", "Receive failed",
+                     "error", strerror(errno), NULL);
         }
     }
     
     return (int)received;
 }
 
-void udp_close(udp_socket_t* socket) {
-    if (!socket) return;
+void udp_close(udp_socket_t* sock) {
+    if (!sock) return;
     
-    if (socket->logger) {
-        LOG_INFO(socket->logger, "udp", "UDP socket closed");
+    if (sock->logger) {
+        /* Added NULL sentinel */
+        LOG_INFO(sock->logger, "udp", "UDP socket closed", NULL);
     }
     
-    close(socket->fd);
-    free(socket);
+    close(sock->fd);
+    free(sock);
 }

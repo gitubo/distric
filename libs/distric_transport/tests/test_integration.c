@@ -11,13 +11,23 @@
  * Uses ONLY public APIs from distric_obs and distric_transport.
  */
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <distric_transport.h>
 #include <distric_obs.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <assert.h>
+#include <stdlib.h>
 
 #define TCP_PORT 19100
 #define UDP_PORT 19101

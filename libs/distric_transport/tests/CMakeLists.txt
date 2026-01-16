@@ -16,6 +16,6 @@ target_link_libraries(test_udp distric_transport distric_obs Threads::Threads)
 add_test(NAME test_udp COMMAND test_udp)
 
 # Integration Test: Full Transport Layer
-add_executable(test_integration test_integration.c)
-target_link_libraries(test_integration distric_transport distric_obs Threads::Threads)
-add_test(NAME test_integration COMMAND test_integration)
+add_executable(test_transport_integration test_integration.c)
+target_link_libraries(test_transport_integration distric_transport distric_obs Threads::Threads)
+add_test(NAME test_transport_integration COMMAND test_transport_integration)

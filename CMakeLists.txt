@@ -11,10 +11,6 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic -Werror")
 # Enable testing
 enable_testing()
 
-# CRITICAL: Build order matters!
-# distric_obs must be built BEFORE distric_transport
-# because transport depends on obs
-
 # Add observability library FIRST
 add_subdirectory(libs/distric_obs)
 

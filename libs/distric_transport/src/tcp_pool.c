@@ -1,14 +1,21 @@
+//####################
+// FILE: /libs/distric_transport/src/tcp_pool.c
+//####################
+
 /**
  * @file tcp_pool.c
  * @brief TCP Connection Pool Implementation
- * 
- * Thread-safe connection pooling with LRU eviction policy.
+ * * Thread-safe connection pooling with LRU eviction policy.
  * Uses ONLY the public distric_obs API.
  */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200112L
+#endif
+
 #include "distric_transport/tcp_pool.h"
 #include <distric_obs.h>
-
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -37,7 +44,7 @@ struct tcp_pool_s {
     _Atomic uint64_t misses;
     
     pthread_mutex_t lock;
-    
+
     metrics_registry_t* metrics;
     logger_t* logger;
     
@@ -58,7 +65,6 @@ static uint64_t get_timestamp_ms(void) {
 
 static pool_entry_t* find_entry(tcp_pool_t* pool, const char* host, uint16_t port) {
     pool_entry_t* entry = pool->entries;
-    
     while (entry) {
         if (!entry->in_use && 
             entry->port == port && 
@@ -137,7 +143,6 @@ distric_err_t tcp_pool_acquire(
     
     /* Try to find existing connection */
     pool_entry_t* entry = find_entry(pool, host, port);
-    
     if (entry) {
         /* Cache hit */
         entry->in_use = true;
@@ -169,11 +174,10 @@ distric_err_t tcp_pool_acquire(
     }
     
     pthread_mutex_unlock(&pool->lock);
-    
+
     /* Connect (outside lock) */
     tcp_connection_t* new_conn;
     distric_err_t err = tcp_connect(host, port, 5000, pool->metrics, pool->logger, &new_conn);
-    
     if (err != DISTRIC_OK) {
         return err;
     }
@@ -197,7 +201,7 @@ distric_err_t tcp_pool_acquire(
     
     pool->entries = new_entry;
     pool->current_size++;
-    
+
     if (pool->pool_size_metric) {
         metrics_gauge_set(pool->pool_size_metric, pool->current_size);
     }
@@ -224,7 +228,7 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
     if (!pool || !conn) return;
     
     pthread_mutex_lock(&pool->lock);
-    
+
     /* Find entry for this connection */
     pool_entry_t* entry = pool->entries;
     pool_entry_t* prev = NULL;
@@ -284,7 +288,7 @@ void tcp_pool_destroy(tcp_pool_t* pool) {
     if (!pool) return;
     
     pthread_mutex_lock(&pool->lock);
-    
+
     /* Close all connections */
     pool_entry_t* entry = pool->entries;
     while (entry) {
@@ -295,7 +299,8 @@ void tcp_pool_destroy(tcp_pool_t* pool) {
     }
     
     if (pool->logger) {
-        LOG_INFO(pool->logger, "tcp_pool", "Connection pool destroyed");
+        /* FIX: Added NULL to satisfy variadic macro requirements */
+        LOG_INFO(pool->logger, "tcp_pool", "Connection pool destroyed", NULL);
     }
     
     pthread_mutex_unlock(&pool->lock);

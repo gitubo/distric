@@ -3,6 +3,14 @@
  * @brief Unit tests for UDP socket
  */
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <distric_transport.h>
 #include <stdio.h>
 #include <string.h>
