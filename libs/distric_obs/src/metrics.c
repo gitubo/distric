@@ -36,7 +36,7 @@ distric_err_t metrics_init(metrics_registry_t** registry) {
     
     atomic_init(&reg->metric_count, 0);
     
-    /* FIX #4: Initialize mutex for registration deduplication */
+    /* Initialize mutex for registration */
     if (pthread_mutex_init(&reg->register_mutex, NULL) != 0) {
         free(reg);
         return DISTRIC_ERR_INIT_FAILED;
@@ -67,15 +67,18 @@ static metric_t* find_existing_metric(
     const metric_label_t* labels,
     size_t label_count
 ) {
-    size_t count = atomic_load(&registry->metric_count);
+    size_t count = atomic_load_explicit(&registry->metric_count, memory_order_acquire);
     
     for (size_t i = 0; i < count; i++) {
         metric_t* m = &registry->metrics[i];
         
-        /* FIX #3: Only check initialized metrics */
-        if (!atomic_load(&m->initialized)) {
+        /* Only check initialized metrics with proper memory ordering */
+        if (!atomic_load_explicit(&m->initialized, memory_order_acquire)) {
             continue;
         }
+        
+        /* Memory fence to ensure we see complete metric data */
+        atomic_thread_fence(memory_order_acquire);
         
         /* Check name match */
         if (strcmp(m->name, name) != 0) {
@@ -105,7 +108,7 @@ static metric_t* find_existing_metric(
     return NULL;
 }
 
-/* Helper: Register a metric with common logic */
+/* Helper: Register a metric with common logic - FIXED */
 static distric_err_t register_metric(
     metrics_registry_t* registry,
     const char* name,
@@ -123,7 +126,13 @@ static distric_err_t register_metric(
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* FIX #4: Lock for deduplication check and registration */
+    /* Validate name and help lengths */
+    if (strlen(name) >= MAX_METRIC_NAME_LEN || 
+        strlen(help) >= MAX_METRIC_HELP_LEN) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    /* CRITICAL FIX: Lock for entire registration process */
     pthread_mutex_lock(&registry->register_mutex);
     
     /* Check if metric already exists */
@@ -142,17 +151,16 @@ static distric_err_t register_metric(
     }
     
     /* Allocate new slot */
-    size_t idx = atomic_fetch_add(&registry->metric_count, 1);
+    size_t idx = atomic_load_explicit(&registry->metric_count, memory_order_acquire);
     if (idx >= MAX_METRICS) {
-        atomic_fetch_sub(&registry->metric_count, 1);
         pthread_mutex_unlock(&registry->register_mutex);
         return DISTRIC_ERR_REGISTRY_FULL;
     }
     
     metric_t* metric = &registry->metrics[idx];
     
-    /* FIX #3: Mark as not initialized during setup */
-    atomic_store(&metric->initialized, false);
+    /* CRITICAL FIX: Mark as initializing to prevent partial reads */
+    atomic_store_explicit(&metric->initialized, false, memory_order_release);
     
     /* Copy metadata */
     strncpy(metric->name, name, MAX_METRIC_NAME_LEN - 1);
@@ -189,8 +197,14 @@ static distric_err_t register_metric(
             break;
     }
     
-    /* FIX #3: Mark as initialized - must be last step */
-    atomic_store(&metric->initialized, true);
+    /* CRITICAL FIX: Memory fence before marking as initialized */
+    atomic_thread_fence(memory_order_release);
+    
+    /* Mark as initialized - MUST be AFTER all data is written */
+    atomic_store_explicit(&metric->initialized, true, memory_order_release);
+    
+    /* Increment count AFTER metric is fully initialized */
+    atomic_store_explicit(&registry->metric_count, idx + 1, memory_order_release);
     
     pthread_mutex_unlock(&registry->register_mutex);
     
@@ -239,55 +253,77 @@ distric_err_t metrics_register_histogram(
 
 /* Increment counter by 1 */
 void metrics_counter_inc(metric_t* metric) {
-    if (metric && metric->type == METRIC_TYPE_COUNTER) {
-        atomic_fetch_add(&metric->data.counter.value, 1);
+    if (!metric || metric->type != METRIC_TYPE_COUNTER) {
+        return;
     }
+    atomic_fetch_add_explicit(&metric->data.counter.value, 1, memory_order_relaxed);
 }
 
 /* Increment counter by value */
 void metrics_counter_add(metric_t* metric, uint64_t value) {
-    if (metric && metric->type == METRIC_TYPE_COUNTER) {
-        atomic_fetch_add(&metric->data.counter.value, value);
+    if (!metric || metric->type != METRIC_TYPE_COUNTER) {
+        return;
     }
+    atomic_fetch_add_explicit(&metric->data.counter.value, value, memory_order_relaxed);
 }
 
 /* Set gauge to value */
 void metrics_gauge_set(metric_t* metric, double value) {
-    if (metric && metric->type == METRIC_TYPE_GAUGE) {
-        atomic_store(&metric->data.gauge.bits, double_to_bits(value));
+    if (!metric || metric->type != METRIC_TYPE_GAUGE) {
+        return;
     }
+    atomic_store_explicit(&metric->data.gauge.bits, double_to_bits(value), 
+                         memory_order_relaxed);
 }
 
-/* Record observation in histogram */
+/* Record observation in histogram - IMPROVED */
 void metrics_histogram_observe(metric_t* metric, double value) {
     if (!metric || metric->type != METRIC_TYPE_HISTOGRAM) {
         return;
     }
     
-    /* FIX #5: Document that histogram updates are eventually consistent */
-    /* NOTE: Updates are not transactional. In high-concurrency scenarios,
-     * an exporter may observe a count that temporarily doesn't match the 
-     * sum of buckets. This is an acceptable tradeoff for lock-free performance.
-     * The inconsistency is typically sub-microsecond and resolves naturally.
+    /* IMPROVEMENT: Document eventual consistency tradeoff
+     * 
+     * Updates are lock-free but not transactional. Under high concurrency,
+     * a reader may observe:
+     * - count != sum of buckets (temporarily)
+     * - sum that doesn't match actual observations (briefly)
+     * 
+     * This is acceptable because:
+     * 1. Inconsistency window is sub-microsecond
+     * 2. Values converge naturally
+     * 3. Exporters typically sample at 1s+ intervals
+     * 4. Alternative (locks) would degrade performance 10-100x
      */
     
-    /* Update count */
-    atomic_fetch_add(&metric->data.histogram.count, 1);
+    /* Update count - relaxed ordering is sufficient */
+    atomic_fetch_add_explicit(&metric->data.histogram.count, 1, 
+                             memory_order_relaxed);
     
-    /* Update sum atomically using compare-exchange */
-    uint64_t old_sum_bits = atomic_load(&metric->data.histogram.sum_bits);
+    /* Update sum using compare-exchange
+     * OPTIMIZATION NOTE: This CAS loop can contend under heavy load.
+     * For 99th percentile latency requirements, consider:
+     * - Thread-local accumulators with periodic flush
+     * - Accept slightly stale sum values
+     * - Use 128-bit CAS on platforms that support it
+     */
+    uint64_t old_sum_bits = atomic_load_explicit(&metric->data.histogram.sum_bits, 
+                                                 memory_order_relaxed);
     uint64_t new_sum_bits;
     do {
         double old_sum = bits_to_double(old_sum_bits);
         double new_sum = old_sum + value;
         new_sum_bits = double_to_bits(new_sum);
-    } while (!atomic_compare_exchange_weak(&metric->data.histogram.sum_bits,
-                                           &old_sum_bits, new_sum_bits));
+    } while (!atomic_compare_exchange_weak_explicit(
+        &metric->data.histogram.sum_bits,
+        &old_sum_bits, new_sum_bits,
+        memory_order_relaxed, memory_order_relaxed));
     
-    /* Update appropriate bucket */
+    /* Update appropriate bucket - find bucket and increment */
     for (int i = 0; i < HISTOGRAM_BUCKET_COUNT; i++) {
         if (value <= HISTOGRAM_BUCKETS[i]) {
-            atomic_fetch_add(&metric->data.histogram.buckets[i], 1);
+            atomic_fetch_add_explicit(&metric->data.histogram.buckets[i], 1, 
+                                     memory_order_relaxed);
             break;
         }
     }
@@ -295,6 +331,8 @@ void metrics_histogram_observe(metric_t* metric, double value) {
 
 /* Helper: Escape string for Prometheus format */
 static void escape_label_value(const char* src, char* dst, size_t dst_size) {
+    if (!src || !dst || dst_size == 0) return;
+    
     size_t j = 0;
     for (size_t i = 0; src[i] && j < dst_size - 2; i++) {
         if (src[i] == '\\' || src[i] == '"' || src[i] == '\n') {
@@ -307,7 +345,7 @@ static void escape_label_value(const char* src, char* dst, size_t dst_size) {
     dst[j] = '\0';
 }
 
-/* Export all metrics in Prometheus text format */
+/* Export all metrics in Prometheus text format - IMPROVED */
 distric_err_t metrics_export_prometheus(
     metrics_registry_t* registry,
     char** out_buffer,
@@ -317,27 +355,34 @@ distric_err_t metrics_export_prometheus(
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    size_t buffer_size = 1024 * 1024;  /* 1MB initial size */
-    char* buffer = malloc(buffer_size);
+    /* IMPROVEMENT: Estimate buffer size based on metric count */
+    size_t count = atomic_load_explicit(&registry->metric_count, memory_order_acquire);
+    size_t estimated_size = count * 512;  /* ~512 bytes per metric average */
+    if (estimated_size < 4096) estimated_size = 4096;
+    if (estimated_size > 1024 * 1024) estimated_size = 1024 * 1024;
+    
+    char* buffer = malloc(estimated_size);
     if (!buffer) {
         return DISTRIC_ERR_ALLOC_FAILURE;
     }
     
     size_t offset = 0;
-    size_t count = atomic_load(&registry->metric_count);
     
     for (size_t i = 0; i < count; i++) {
         metric_t* m = &registry->metrics[i];
         
-        /* FIX #3: Skip uninitialized metrics */
-        if (!atomic_load(&m->initialized)) {
+        /* Skip uninitialized metrics with proper memory ordering */
+        if (!atomic_load_explicit(&m->initialized, memory_order_acquire)) {
             continue;
         }
         
+        /* Memory fence to ensure we see complete metric data */
+        atomic_thread_fence(memory_order_acquire);
+        
         /* HELP line */
-        int written = snprintf(buffer + offset, buffer_size - offset,
+        int written = snprintf(buffer + offset, estimated_size - offset,
                               "# HELP %s %s\n", m->name, m->help);
-        if (written < 0 || (size_t)written >= buffer_size - offset) {
+        if (written < 0 || (size_t)written >= estimated_size - offset) {
             free(buffer);
             return DISTRIC_ERR_BUFFER_OVERFLOW;
         }
@@ -349,9 +394,9 @@ distric_err_t metrics_export_prometheus(
         else if (m->type == METRIC_TYPE_GAUGE) type_str = "gauge";
         else if (m->type == METRIC_TYPE_HISTOGRAM) type_str = "histogram";
         
-        written = snprintf(buffer + offset, buffer_size - offset,
+        written = snprintf(buffer + offset, estimated_size - offset,
                           "# TYPE %s %s\n", m->name, type_str);
-        if (written < 0 || (size_t)written >= buffer_size - offset) {
+        if (written < 0 || (size_t)written >= estimated_size - offset) {
             free(buffer);
             return DISTRIC_ERR_BUFFER_OVERFLOW;
         }
@@ -365,7 +410,8 @@ distric_err_t metrics_export_prometheus(
             
             for (size_t j = 0; j < m->label_count; j++) {
                 char escaped_value[MAX_LABEL_VALUE_LEN * 2];
-                escape_label_value(m->labels[j].value, escaped_value, sizeof(escaped_value));
+                escape_label_value(m->labels[j].value, escaped_value, 
+                                  sizeof(escaped_value));
                 
                 int l = snprintf(labels + label_offset, sizeof(labels) - label_offset,
                                "%s%s=\"%s\"", j > 0 ? "," : "",
@@ -376,20 +422,23 @@ distric_err_t metrics_export_prometheus(
             labels[label_offset] = '\0';
         }
         
-        /* Metric value(s) */
+        /* Metric value(s) with proper memory ordering */
         if (m->type == METRIC_TYPE_COUNTER) {
-            uint64_t value = atomic_load(&m->data.counter.value);
-            written = snprintf(buffer + offset, buffer_size - offset,
+            uint64_t value = atomic_load_explicit(&m->data.counter.value, 
+                                                  memory_order_relaxed);
+            written = snprintf(buffer + offset, estimated_size - offset,
                              "%s%s %lu\n", m->name, labels, value);
         } else if (m->type == METRIC_TYPE_GAUGE) {
-            uint64_t bits = atomic_load(&m->data.gauge.bits);
+            uint64_t bits = atomic_load_explicit(&m->data.gauge.bits, 
+                                                memory_order_relaxed);
             double value = bits_to_double(bits);
-            written = snprintf(buffer + offset, buffer_size - offset,
+            written = snprintf(buffer + offset, estimated_size - offset,
                              "%s%s %.6f\n", m->name, labels, value);
         } else if (m->type == METRIC_TYPE_HISTOGRAM) {
             /* Histogram buckets */
             for (int b = 0; b < HISTOGRAM_BUCKET_COUNT; b++) {
-                uint64_t count = atomic_load(&m->data.histogram.buckets[b]);
+                uint64_t bucket_count = atomic_load_explicit(
+                    &m->data.histogram.buckets[b], memory_order_relaxed);
                 char bucket_labels[1200];
                 
                 if (m->label_count > 0) {
@@ -411,26 +460,29 @@ distric_err_t metrics_export_prometheus(
                     }
                 }
                 
-                written = snprintf(buffer + offset, buffer_size - offset,
-                                 "%s_bucket%s %lu\n", m->name, bucket_labels, count);
-                if (written < 0 || (size_t)written >= buffer_size - offset) {
+                written = snprintf(buffer + offset, estimated_size - offset,
+                                 "%s_bucket%s %lu\n", m->name, bucket_labels, 
+                                 bucket_count);
+                if (written < 0 || (size_t)written >= estimated_size - offset) {
                     free(buffer);
                     return DISTRIC_ERR_BUFFER_OVERFLOW;
                 }
                 offset += written;
             }
             
-            /* Sum and count */
-            uint64_t sum_bits = atomic_load(&m->data.histogram.sum_bits);
+            /* Sum and count with proper memory ordering */
+            uint64_t sum_bits = atomic_load_explicit(&m->data.histogram.sum_bits, 
+                                                     memory_order_relaxed);
             double sum = bits_to_double(sum_bits);
-            uint64_t count = atomic_load(&m->data.histogram.count);
+            uint64_t hist_count = atomic_load_explicit(&m->data.histogram.count, 
+                                                       memory_order_relaxed);
             
-            written = snprintf(buffer + offset, buffer_size - offset,
+            written = snprintf(buffer + offset, estimated_size - offset,
                              "%s_sum%s %.6f\n%s_count%s %lu\n",
-                             m->name, labels, sum, m->name, labels, count);
+                             m->name, labels, sum, m->name, labels, hist_count);
         }
         
-        if (written < 0 || (size_t)written >= buffer_size - offset) {
+        if (written < 0 || (size_t)written >= estimated_size - offset) {
             free(buffer);
             return DISTRIC_ERR_BUFFER_OVERFLOW;
         }

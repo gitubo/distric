@@ -35,7 +35,7 @@ struct metric_s {
     metric_type_t type;
     metric_label_t labels[MAX_METRIC_LABELS];
     size_t label_count;
-    _Atomic bool initialized;  /* NEW: Protects against reading partially initialized metrics */
+    _Atomic bool initialized;  /* Protects against reading partially initialized metrics */
     
     union {
         counter_data_t counter;
@@ -47,7 +47,7 @@ struct metric_s {
 struct metrics_registry_s {
     metric_t metrics[MAX_METRICS];
     _Atomic size_t metric_count;
-    pthread_mutex_t register_mutex;  /* NEW: Protects registration for deduplication */
+    pthread_mutex_t register_mutex;  /* Protects registration for deduplication */
 };
 
 #endif /* DISTRIC_OBS_METRICS_H */
