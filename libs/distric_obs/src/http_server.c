@@ -16,12 +16,80 @@
 
 #define MAX_REQUEST_SIZE 8192
 #define MAX_RESPONSE_SIZE (1024 * 1024)  /* 1MB */
+#define REQUEST_TIMEOUT_MS 5000
 
-/* Parse HTTP request */
+/* IMPROVED: Buffered HTTP request reading */
+static int read_http_request(int client_fd, char* buffer, size_t buffer_size) {
+    size_t total_read = 0;
+    ssize_t bytes_read;
+    
+    /* Set socket timeout */
+    struct timeval tv;
+    tv.tv_sec = REQUEST_TIMEOUT_MS / 1000;
+    tv.tv_usec = (REQUEST_TIMEOUT_MS % 1000) * 1000;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    /* Read until we find \r\n\r\n or buffer is full */
+    while (total_read < buffer_size - 1) {
+        bytes_read = read(client_fd, buffer + total_read, buffer_size - total_read - 1);
+        
+        if (bytes_read < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Timeout or would block */
+                break;
+            }
+            /* Read error */
+            return -1;
+        }
+        
+        if (bytes_read == 0) {
+            /* Connection closed */
+            break;
+        }
+        
+        total_read += bytes_read;
+        buffer[total_read] = '\0';
+        
+        /* Check if we have complete headers (look for \r\n\r\n) */
+        if (strstr(buffer, "\r\n\r\n") != NULL) {
+            break;
+        }
+        
+        /* SECURITY: Prevent infinite loop on malformed requests */
+        if (total_read >= buffer_size - 1) {
+            break;
+        }
+    }
+    
+    return total_read;
+}
+
+/* Parse HTTP request - IMPROVED validation */
 static int parse_request(const char* buffer, http_request_t* request) {
+    if (!buffer || !request) {
+        return -1;
+    }
+    
     /* Parse request line: METHOD PATH VERSION */
-    if (sscanf(buffer, "%15s %255s %15s", 
-               request->method, request->path, request->version) != 3) {
+    int parsed = sscanf(buffer, "%15s %255s %15s", 
+                       request->method, request->path, request->version);
+    
+    if (parsed != 3) {
+        return -1;
+    }
+    
+    /* Validate HTTP version */
+    if (strncmp(request->version, "HTTP/1.", 7) != 0) {
+        return -1;
+    }
+    
+    /* Validate method (only allow GET for observability endpoints) */
+    if (strcmp(request->method, "GET") != 0) {
+        return -1;
+    }
+    
+    /* Sanitize path (prevent directory traversal) */
+    if (strstr(request->path, "..") != NULL) {
         return -1;
     }
     
@@ -30,24 +98,40 @@ static int parse_request(const char* buffer, http_request_t* request) {
 
 /* Send HTTP response */
 static void send_response(int client_fd, const http_response_t* response) {
+    if (!response) return;
+    
     char header[4096];
     int header_len = snprintf(header, sizeof(header),
                              "HTTP/1.1 %d %s\r\n"
                              "Content-Type: %s\r\n"
                              "Content-Length: %zu\r\n"
                              "Connection: close\r\n"
+                             "Server: DistriC-Obs/1.0\r\n"
                              "\r\n",
                              response->status_code,
                              response->status_text,
                              response->content_type,
                              response->body_length);
     
-    if (header_len > 0) {
-        write(client_fd, header, header_len);
-    }
-    
-    if (response->body && response->body_length > 0) {
-        write(client_fd, response->body, response->body_length);
+    if (header_len > 0 && (size_t)header_len < sizeof(header)) {
+        /* Send header */
+        ssize_t sent = 0;
+        while (sent < header_len) {
+            ssize_t n = write(client_fd, header + sent, header_len - sent);
+            if (n <= 0) break;
+            sent += n;
+        }
+        
+        /* Send body */
+        if (response->body && response->body_length > 0) {
+            sent = 0;
+            while (sent < (ssize_t)response->body_length) {
+                ssize_t n = write(client_fd, response->body + sent, 
+                                 response->body_length - sent);
+                if (n <= 0) break;
+                sent += n;
+            }
+        }
     }
 }
 
@@ -60,7 +144,7 @@ static void handle_metrics(obs_server_t* server, int client_fd) {
                                                    &metrics_output, 
                                                    &metrics_size);
     
-    if (err == DISTRIC_OK) {
+    if (err == DISTRIC_OK && metrics_output) {
         http_response_t response = {
             .status_code = 200,
             .status_text = "OK",
@@ -105,7 +189,7 @@ static void handle_health_ready(obs_server_t* server, int client_fd) {
                                            &health_output, 
                                            &health_size);
     
-    if (err == DISTRIC_OK) {
+    if (err == DISTRIC_OK && health_output) {
         health_status_t overall = health_get_overall_status(server->health);
         int status_code = (overall == HEALTH_UP) ? 200 : 503;
         const char* status_text = (overall == HEALTH_UP) ? "OK" : "Service Unavailable";
@@ -132,6 +216,19 @@ static void handle_health_ready(obs_server_t* server, int client_fd) {
     }
 }
 
+/* Handle 400 Bad Request */
+static void handle_bad_request(int client_fd) {
+    const char* body = "Bad Request";
+    http_response_t response = {
+        .status_code = 400,
+        .status_text = "Bad Request",
+        .content_type = "text/plain",
+        .body = body,
+        .body_length = strlen(body)
+    };
+    send_response(client_fd, &response);
+}
+
 /* Handle 404 Not Found */
 static void handle_not_found(int client_fd) {
     const char* body = "Not Found";
@@ -145,20 +242,35 @@ static void handle_not_found(int client_fd) {
     send_response(client_fd, &response);
 }
 
-/* Handle client request */
+/* Handle 405 Method Not Allowed */
+static void handle_method_not_allowed(int client_fd) {
+    const char* body = "Method Not Allowed";
+    http_response_t response = {
+        .status_code = 405,
+        .status_text = "Method Not Allowed",
+        .content_type = "text/plain",
+        .body = body,
+        .body_length = strlen(body)
+    };
+    send_response(client_fd, &response);
+}
+
+/* Handle client request - IMPROVED */
 static void handle_client(obs_server_t* server, int client_fd) {
     char buffer[MAX_REQUEST_SIZE];
-    ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
+    
+    /* Read complete request with timeout */
+    int bytes_read = read_http_request(client_fd, buffer, sizeof(buffer));
     
     if (bytes_read <= 0) {
+        /* Timeout or error - just close */
         close(client_fd);
         return;
     }
     
-    buffer[bytes_read] = '\0';
-    
     http_request_t request;
     if (parse_request(buffer, &request) < 0) {
+        handle_bad_request(client_fd);
         close(client_fd);
         return;
     }
@@ -175,16 +287,7 @@ static void handle_client(obs_server_t* server, int client_fd) {
             handle_not_found(client_fd);
         }
     } else {
-        /* Method not allowed */
-        const char* body = "Method Not Allowed";
-        http_response_t response = {
-            .status_code = 405,
-            .status_text = "Method Not Allowed",
-            .content_type = "text/plain",
-            .body = body,
-            .body_length = strlen(body)
-        };
-        send_response(client_fd, &response);
+        handle_method_not_allowed(client_fd);
     }
     
     close(client_fd);
@@ -215,7 +318,12 @@ static void* server_thread_fn(void* arg) {
             continue;
         }
         
-        /* Handle client request */
+        /* IMPROVED: Set client socket timeouts */
+        struct timeval client_tv = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &client_tv, sizeof(client_tv));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &client_tv, sizeof(client_tv));
+        
+        /* Handle client request (synchronous for now) */
         handle_client(server, client_fd);
     }
     
