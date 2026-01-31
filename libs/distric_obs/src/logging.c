@@ -18,8 +18,17 @@
 #include <errno.h>
 
 /* INSTRUMENTATION: Debug logging to stderr (avoid recursion) */
-#define DEBUG_LOG(fmt, ...) \
-    fprintf(stderr, "[LOGGING_DEBUG] " fmt "\n", ##__VA_ARGS__)
+/* FIXED: Made it a regular function instead of variadic macro to comply with ISO C99 */
+static void debug_log(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "[LOGGING_DEBUG] ");
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+}
+
+#define DEBUG_LOG debug_log
 
 /* Thread-local buffer for log formatting */
 static __thread char tls_buffer[LOG_BUFFER_SIZE];
