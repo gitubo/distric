@@ -3,11 +3,15 @@ cmake_minimum_required(VERSION 3.15)
 # Library: distric_obs
 project(distric_obs VERSION 0.2.0 LANGUAGES C)
 
+# Set C11 standard
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 # Compiler flags
+# Use gnu11 instead of c11 to allow GNU extensions like ##__VA_ARGS__ for variadic macros
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_EXTENSIONS ON)  # Enable GNU extensions
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic -Werror")
 
 # Find dependencies
@@ -25,10 +29,20 @@ set(OBS_SOURCES
 
 # Create static library
 add_library(distric_obs_static STATIC ${OBS_SOURCES})
-set_target_properties(distric_obs_static PROPERTIES OUTPUT_NAME distric_obs)
+set_target_properties(distric_obs_static PROPERTIES 
+    OUTPUT_NAME distric_obs
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    C_EXTENSIONS OFF
+)
 
-# Create shared library (optional, but good practice)
+# Create shared library
 add_library(distric_obs SHARED ${OBS_SOURCES})
+set_target_properties(distric_obs PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    C_EXTENSIONS ON  # Enable GNU extensions
+)
 
 # Include directories for both library variants
 foreach(target distric_obs distric_obs_static)

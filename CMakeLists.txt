@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.15)
 project(DistriC VERSION 2.0.0 LANGUAGES C)
 
+# Set C11 standard globally with GNU extensions for variadic macro support
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_C_EXTENSIONS ON)  # Enable GNU extensions (needed for ##__VA_ARGS__)
 
 # Global compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic -Werror")

@@ -3,9 +3,10 @@ cmake_minimum_required(VERSION 3.15)
 # Library: distric_transport
 project(distric_transport VERSION 1.0.0 LANGUAGES C)
 
+# Set C11 standard with GNU extensions
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_C_EXTENSIONS ON)  # Enable GNU extensions
 
 # Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic -Werror")
@@ -22,6 +23,13 @@ set(TRANSPORT_SOURCES
 
 # Create library
 add_library(distric_transport STATIC ${TRANSPORT_SOURCES})
+
+# Set C11 properties explicitly with GNU extensions
+set_target_properties(distric_transport PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    C_EXTENSIONS ON  # Enable GNU extensions
+)
 
 # Include directories
 target_include_directories(distric_transport
