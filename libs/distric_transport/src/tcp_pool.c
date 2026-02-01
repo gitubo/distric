@@ -1,5 +1,5 @@
 //####################
-// FILE: /libs/distric_transport/src/tcp_pool.c - FIXED VERSION
+// FILE: /libs/distric_transport/src/tcp_pool.c - FIXED VERSION 2
 //####################
 
 /**
@@ -7,10 +7,10 @@
  * @brief TCP Connection Pool Implementation - CRITICAL FIXES
  * 
  * FIXES APPLIED:
- * 1. Validate connection is alive before reusing (send with MSG_NOSIGNAL)
- * 2. Remove invalid connections from pool immediately
+ * 1. Removed broken is_connection_alive() check that was using connection ID instead of FD
+ * 2. Simplified pool logic - connections are assumed valid when acquired
  * 3. Better error handling to prevent use-after-free
- * 4. Mark connections as invalid when pool is full instead of closing immediately
+ * 4. Added defensive checks for NULL connections
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -25,8 +25,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
-#include <sys/socket.h>
-#include <errno.h>
 
 /* ============================================================================
  * INTERNAL STRUCTURES
@@ -70,34 +68,6 @@ static uint64_t get_timestamp_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* CRITICAL FIX: Test if connection is still alive */
-static bool is_connection_alive(tcp_connection_t* conn) {
-    if (!conn) return false;
-    
-    /* Try to peek at the socket to see if it's still connected */
-    char buf[1];
-    ssize_t result = recv(tcp_get_connection_id(conn), buf, sizeof(buf), 
-                         MSG_PEEK | MSG_DONTWAIT);
-    
-    if (result == 0) {
-        /* Connection closed by peer */
-        return false;
-    }
-    
-    if (result < 0) {
-        /* Check error */
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            /* No data available, but connection is alive */
-            return true;
-        }
-        /* Other errors mean connection is dead */
-        return false;
-    }
-    
-    /* Data available, connection is alive */
-    return true;
-}
-
 static pool_entry_t* find_entry(tcp_pool_t* pool, const char* host, uint16_t port) {
     if (!pool || !host) return NULL;
     
@@ -106,15 +76,6 @@ static pool_entry_t* find_entry(tcp_pool_t* pool, const char* host, uint16_t por
         if (entry->valid && !entry->in_use && 
             entry->port == port && 
             strcmp(entry->host, host) == 0) {
-            
-            /* CRITICAL FIX: Validate connection is still alive */
-            if (!is_connection_alive(entry->conn)) {
-                /* Connection is dead, mark invalid */
-                entry->valid = false;
-                entry = entry->next;
-                continue;
-            }
-            
             return entry;
         }
         entry = entry->next;
@@ -123,7 +84,7 @@ static pool_entry_t* find_entry(tcp_pool_t* pool, const char* host, uint16_t por
     return NULL;
 }
 
-/* CRITICAL FIX: Remove invalid entries from pool */
+/* Remove invalid entries from pool */
 static void cleanup_invalid_entries(tcp_pool_t* pool) {
     pool_entry_t** current = &pool->entries;
     
@@ -211,12 +172,12 @@ distric_err_t tcp_pool_acquire(
     
     pthread_mutex_lock(&pool->lock);
     
-    /* CRITICAL FIX: Clean up invalid entries first */
+    /* Clean up invalid entries first */
     cleanup_invalid_entries(pool);
     
     /* Try to find existing valid connection */
     pool_entry_t* entry = find_entry(pool, host, port);
-    if (entry && entry->valid) {
+    if (entry && entry->valid && entry->conn) {
         /* Cache hit */
         entry->in_use = true;
         entry->last_used = get_timestamp_ms();
@@ -313,19 +274,12 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
     
     while (entry) {
         if (entry->conn == conn) {
-            /* CRITICAL FIX: Check if connection is still alive */
-            if (!is_connection_alive(conn)) {
-                /* Connection is dead, mark invalid */
-                entry->valid = false;
-                entry->in_use = false;
-                pthread_mutex_unlock(&pool->lock);
-                return;
-            }
-            
             if (pool->current_size > pool->max_connections) {
-                /* Pool is full, mark as invalid */
+                /* Pool is full, close this connection */
                 entry->valid = false;
                 entry->in_use = false;
+                tcp_close(conn);
+                entry->conn = NULL;
             } else {
                 /* Return to pool */
                 entry->in_use = false;
