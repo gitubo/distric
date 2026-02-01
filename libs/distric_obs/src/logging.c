@@ -1,3 +1,21 @@
+/**
+ * @file logging_fixed.c
+ * @brief FIXED: Thread-safe logger shutdown
+ * 
+ * ROOT CAUSE: Use-after-free during concurrent shutdown
+ * 
+ * PROBLEM:
+ * 1. Integration test destroys logger
+ * 2. Background threads (UDP, TCP, HTTP, tracing) still running
+ * 3. Those threads call LOG_*() macros
+ * 4. Logger already freed → SEGFAULT
+ * 
+ * FIX:
+ * 1. Add shutdown flag to logger (check before writing)
+ * 2. Ensure flush thread exits cleanly
+ * 3. Make log_write() return early if logger is shutting down
+ */
+
 /* Feature test macros must come before any includes */
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
@@ -16,19 +34,6 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <errno.h>
-
-/* INSTRUMENTATION: Debug logging to stderr (avoid recursion) */
-/* FIXED: Made it a regular function instead of variadic macro to comply with ISO C99 */
-static void debug_log(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    fprintf(stderr, "[LOGGING_DEBUG] ");
-    vfprintf(stderr, fmt, args);
-    fprintf(stderr, "\n");
-    va_end(args);
-}
-
-#define DEBUG_LOG debug_log
 
 /* Thread-local buffer for log formatting */
 static __thread char tls_buffer[LOG_BUFFER_SIZE];
@@ -95,31 +100,19 @@ static void json_escape(const char* src, char* dst, size_t dst_size) {
     dst[j] = '\0';
 }
 
-/* Background thread for async logging - INSTRUMENTED */
+/* Background thread for async logging */
 static void* flush_thread_fn(void* arg) {
     logger_t* logger = (logger_t*)arg;
     ring_buffer_t* rb = logger->ring_buffer;
-    
-    DEBUG_LOG("Flush thread started, ring_buffer=%p", (void*)rb);
-    
-    size_t iterations = 0;
-    size_t logs_flushed = 0;
-    size_t timeouts = 0;
     
     while (atomic_load_explicit(&rb->running, memory_order_acquire) || 
            atomic_load_explicit(&rb->read_pos, memory_order_acquire) != 
            atomic_load_explicit(&rb->write_pos, memory_order_acquire)) {
         
-        iterations++;
-        
         size_t read_pos = atomic_load_explicit(&rb->read_pos, memory_order_acquire);
         size_t write_pos = atomic_load_explicit(&rb->write_pos, memory_order_acquire);
         
         if (read_pos == write_pos) {
-            if (iterations % 1000 == 0) {
-                DEBUG_LOG("Flush thread idle, iterations=%zu, read=%zu, write=%zu", 
-                         iterations, read_pos, write_pos);
-            }
             usleep(1000);
             continue;
         }
@@ -137,22 +130,13 @@ static void* flush_thread_fn(void* arg) {
                 sched_yield();
                 spin_count++;
             } else {
-                /* Timeout */
-                timeouts++;
-                
-                DEBUG_LOG("Entry timeout at read_pos=%zu, ready=%d, running=%d, timeouts=%zu",
-                         read_pos, 
-                         atomic_load(&entry->ready),
-                         atomic_load(&rb->running),
-                         timeouts);
-                
+                /* Timeout - skip this entry if shutting down */
                 if (!atomic_load_explicit(&rb->running, memory_order_acquire)) {
-                    DEBUG_LOG("Shutting down, skipping entry");
                     atomic_store_explicit(&rb->read_pos, read_pos + 1, memory_order_release);
                     break;
                 }
                 
-                DEBUG_LOG("Running but entry stuck, skipping");
+                /* Still running but entry stuck - skip it */
                 atomic_store_explicit(&rb->read_pos, read_pos + 1, memory_order_release);
                 break;
             }
@@ -168,17 +152,9 @@ static void* flush_thread_fn(void* arg) {
                                    entry->length - total);
                     if (written < 0) {
                         if (errno == EINTR) continue;
-                        DEBUG_LOG("Write error: %s", strerror(errno));
                         break;
                     }
                     total += written;
-                }
-                
-                logs_flushed++;
-                
-                if (logs_flushed % 1000 == 0) {
-                    DEBUG_LOG("Progress: flushed=%zu, timeouts=%zu, read=%zu, write=%zu",
-                             logs_flushed, timeouts, read_pos, write_pos);
                 }
             }
             
@@ -188,42 +164,31 @@ static void* flush_thread_fn(void* arg) {
         atomic_store_explicit(&rb->read_pos, read_pos + 1, memory_order_release);
     }
     
-    DEBUG_LOG("Flush thread exiting, logs_flushed=%zu, timeouts=%zu, iterations=%zu",
-             logs_flushed, timeouts, iterations);
-    
     return NULL;
 }
 
 /* Initialize logger with output file descriptor and mode */
 distric_err_t log_init(logger_t** logger, int fd, log_mode_t mode) {
-    DEBUG_LOG("log_init called, fd=%d, mode=%s", fd, mode == LOG_MODE_ASYNC ? "ASYNC" : "SYNC");
-    
     if (!logger) {
-        DEBUG_LOG("log_init failed: logger is NULL");
         return DISTRIC_ERR_INVALID_ARG;
     }
     
     if (fd < 0) {
-        DEBUG_LOG("log_init failed: invalid fd=%d", fd);
         return DISTRIC_ERR_INVALID_ARG;
     }
     
     logger_t* log = calloc(1, sizeof(logger_t));
     if (!log) {
-        DEBUG_LOG("log_init failed: calloc returned NULL");
         return DISTRIC_ERR_ALLOC_FAILURE;
     }
     
     log->fd = fd;
     log->mode = mode;
-    atomic_init(&log->shutdown, false);
+    atomic_init(&log->shutdown, false);  /* CRITICAL: Initialize shutdown flag */
     
     if (mode == LOG_MODE_ASYNC) {
-        DEBUG_LOG("Initializing async mode...");
-        
         log->ring_buffer = calloc(1, sizeof(ring_buffer_t));
         if (!log->ring_buffer) {
-            DEBUG_LOG("Failed to allocate ring buffer");
             free(log);
             return DISTRIC_ERR_ALLOC_FAILURE;
         }
@@ -237,76 +202,53 @@ distric_err_t log_init(logger_t** logger, int fd, log_mode_t mode) {
             log->ring_buffer->entries[i].length = 0;
         }
         
-        DEBUG_LOG("Starting flush thread...");
-        
         if (pthread_create(&log->flush_thread, NULL, flush_thread_fn, log) != 0) {
-            DEBUG_LOG("Failed to create flush thread: %s", strerror(errno));
             free(log->ring_buffer);
             free(log);
             return DISTRIC_ERR_INIT_FAILED;
         }
-        
-        DEBUG_LOG("Flush thread started successfully");
     }
     
     *logger = log;
-    DEBUG_LOG("log_init complete, logger=%p", (void*)log);
     return DISTRIC_OK;
 }
 
-/* Destroy logger and flush all pending logs - INSTRUMENTED */
+/* Destroy logger and flush all pending logs - HARDENED */
 void log_destroy(logger_t* logger) {
-    DEBUG_LOG("log_destroy called, logger=%p", (void*)logger);
-    
     if (!logger) {
-        DEBUG_LOG("log_destroy: logger is NULL, returning");
         return;
     }
     
+    /* CRITICAL FIX: Set shutdown flag FIRST to prevent new writes */
+    atomic_store_explicit(&logger->shutdown, true, memory_order_seq_cst);
+    
+    /* Memory barrier to ensure all threads see shutdown flag */
+    atomic_thread_fence(memory_order_seq_cst);
+    
     if (logger->mode == LOG_MODE_ASYNC && logger->ring_buffer) {
-        DEBUG_LOG("Shutting down async logger...");
-        
-        size_t write_pos = atomic_load_explicit(&logger->ring_buffer->write_pos, memory_order_acquire);
-        size_t read_pos = atomic_load_explicit(&logger->ring_buffer->read_pos, memory_order_acquire);
-        size_t remaining = write_pos - read_pos;
-        
-        DEBUG_LOG("Before shutdown: write_pos=%zu, read_pos=%zu, remaining=%zu",
-                 write_pos, read_pos, remaining);
-        
+        /* Stop the ring buffer */
         atomic_store_explicit(&logger->ring_buffer->running, false, memory_order_release);
-        DEBUG_LOG("Set running=false");
         
-        if (remaining > 0) {
-            DEBUG_LOG("Waiting for %zu remaining entries to flush...", remaining);
-            usleep(100000);  // 100ms
-        }
-        
-        DEBUG_LOG("Joining flush thread...");
+        /* Wait for flush thread to exit cleanly */
         pthread_join(logger->flush_thread, NULL);
-        DEBUG_LOG("Flush thread joined successfully");
         
-        write_pos = atomic_load(&logger->ring_buffer->write_pos);
-        read_pos = atomic_load(&logger->ring_buffer->read_pos);
-        DEBUG_LOG("After flush: write_pos=%zu, read_pos=%zu, diff=%zu",
-                 write_pos, read_pos, write_pos - read_pos);
-        
+        /* Now safe to free ring buffer */
         free(logger->ring_buffer);
-        DEBUG_LOG("Ring buffer freed");
     }
     
+    /* Finally free logger struct */
     free(logger);
-    DEBUG_LOG("log_destroy complete");
 }
 
-/* Write a log entry - INSTRUMENTED */
+/* Write a log entry - HARDENED with shutdown check */
 distric_err_t log_write(logger_t* logger, log_level_t level, 
                        const char* component, const char* message, ...) {
-    static _Atomic size_t total_writes = 0;
-    static _Atomic size_t total_overflows = 0;
+    /* CRITICAL FIX: Check shutdown flag BEFORE accessing logger */
+    if (!logger || atomic_load_explicit(&logger->shutdown, memory_order_acquire)) {
+        return DISTRIC_ERR_INVALID_ARG;  /* Silently fail if shutting down */
+    }
     
-    size_t write_count = atomic_fetch_add(&total_writes, 1) + 1;
-    
-    if (!logger || !component || !message) {
+    if (!component || !message) {
         return DISTRIC_ERR_INVALID_ARG;
     }
 
@@ -386,6 +328,11 @@ distric_err_t log_write(logger_t* logger, log_level_t level,
     }
     offset += written;
 
+    /* CRITICAL: Check shutdown again before writing */
+    if (atomic_load_explicit(&logger->shutdown, memory_order_acquire)) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+
     if (logger->mode == LOG_MODE_SYNC) {
         ssize_t total = 0;
         while (total < (ssize_t)offset) {
@@ -401,19 +348,17 @@ distric_err_t log_write(logger_t* logger, log_level_t level,
         /* Async mode */
         ring_buffer_t* rb = logger->ring_buffer;
         
+        /* Check if ring buffer is being shut down */
+        if (!rb || !atomic_load_explicit(&rb->running, memory_order_acquire)) {
+            return DISTRIC_ERR_INVALID_ARG;
+        }
+        
         size_t current_write = atomic_load_explicit(&rb->write_pos, memory_order_acquire);
         size_t current_read = atomic_load_explicit(&rb->read_pos, memory_order_acquire);
         
         size_t used = current_write - current_read;
         
         if (used >= RING_BUFFER_SIZE - 1) {
-            size_t overflow_count = atomic_fetch_add(&total_overflows, 1) + 1;
-            
-            if (overflow_count % 100 == 0) {
-                DEBUG_LOG("OVERFLOW #%zu at write_count=%zu, used=%zu, write=%zu, read=%zu",
-                         overflow_count, write_count, used, current_write, current_read);
-            }
-            
             return DISTRIC_ERR_BUFFER_OVERFLOW;
         }
         
@@ -423,7 +368,6 @@ distric_err_t log_write(logger_t* logger, log_level_t level,
 
         size_t recheck_read = atomic_load_explicit(&rb->read_pos, memory_order_acquire);
         if (write_pos - recheck_read >= RING_BUFFER_SIZE) {
-            DEBUG_LOG("Post-reservation overflow at write=%zu, read=%zu", write_pos, recheck_read);
             entry->length = 0;
             atomic_store_explicit(&entry->ready, true, memory_order_release);
             return DISTRIC_ERR_BUFFER_OVERFLOW;
