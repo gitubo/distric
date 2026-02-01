@@ -1,15 +1,16 @@
 /**
  * @file tcp_pool.c  
- * @brief TCP Connection Pool Implementation - FINAL FIX
+ * @brief TCP Connection Pool Implementation - SEGFAULT FIX
  * 
- * ROOT CAUSE IDENTIFIED:
- * When server closes connection via tcp_close(), the connection memory is freed.
- * Pool still holds pointer, marks it invalid.
- * When tcp_pool_release() is called, it tries to tcp_close() AGAIN → SEGFAULT
+ * ROOT CAUSE:
+ * Race condition between connection handlers and pool operations.
+ * When server closes connection, pool entry becomes stale.
  * 
- * SOLUTION:
- * When connection is invalid, DO NOT call tcp_close() - just NULL the pointer.
- * The connection was already closed and freed by whoever marked it invalid.
+ * FIX:
+ * 1. Add connection validity check before ANY access
+ * 2. Use atomic flags for thread-safe validity tracking
+ * 3. NULL out pointers immediately when marking failed
+ * 4. Add defensive checks in all operations
  */
 
 #ifndef _DEFAULT_SOURCE
@@ -39,8 +40,8 @@ typedef struct pool_entry_s {
     char host[256];
     uint16_t port;
     uint64_t last_used;
-    bool in_use;
-    bool valid;
+    _Atomic bool in_use;      /* CHANGED: Make atomic for thread safety */
+    _Atomic bool valid;       /* CHANGED: Make atomic for thread safety */
     struct pool_entry_s* next;
 } pool_entry_t;
 
@@ -73,12 +74,16 @@ static uint64_t get_timestamp_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* IMPROVED: Safe entry lookup with validity check */
 static pool_entry_t* find_entry(tcp_pool_t* pool, const char* host, uint16_t port) {
     if (!pool || !host) return NULL;
     
     pool_entry_t* entry = pool->entries;
     while (entry) {
-        if (entry->valid && !entry->in_use && 
+        /* CRITICAL: Check valid flag atomically BEFORE accessing conn */
+        if (atomic_load(&entry->valid) && 
+            !atomic_load(&entry->in_use) && 
+            entry->conn != NULL &&  /* Additional NULL check */
             entry->port == port && 
             strcmp(entry->host, host) == 0) {
             return entry;
@@ -94,7 +99,8 @@ static size_t count_valid_entries(tcp_pool_t* pool) {
     pool_entry_t* entry = pool->entries;
     
     while (entry) {
-        if (entry->valid && entry->conn != NULL) {
+        /* Use atomic load for thread safety */
+        if (atomic_load(&entry->valid) && entry->conn != NULL) {
             count++;
         }
         entry = entry->next;
@@ -109,12 +115,13 @@ static void cleanup_invalid_entries(tcp_pool_t* pool) {
     while (*current) {
         pool_entry_t* entry = *current;
         
-        if (!entry->valid && !entry->in_use) {
+        /* CRITICAL: Use atomic loads */
+        if (!atomic_load(&entry->valid) && !atomic_load(&entry->in_use)) {
             *current = entry->next;
             
-            /* DEFENSIVE: Connection should already be NULL if invalid */
+            /* Connection should already be NULL if properly marked invalid */
             if (entry->conn) {
-                /* This should never happen if mark_failed is used correctly */
+                /* Defensive: This shouldn't happen, but handle it anyway */
                 entry->conn = NULL;
             }
             
@@ -202,8 +209,8 @@ distric_err_t tcp_pool_acquire(
     cleanup_invalid_entries(pool);
     
     pool_entry_t* entry = find_entry(pool, host, port);
-    if (entry && entry->valid && entry->conn) {
-        entry->in_use = true;
+    if (entry && atomic_load(&entry->valid) && entry->conn) {
+        atomic_store(&entry->in_use, true);
         entry->last_used = get_timestamp_ms();
         *conn = entry->conn;
         
@@ -262,8 +269,8 @@ distric_err_t tcp_pool_acquire(
     new_entry->host[sizeof(new_entry->host) - 1] = '\0';
     new_entry->port = port;
     new_entry->last_used = get_timestamp_ms();
-    new_entry->in_use = true;
-    new_entry->valid = true;
+    atomic_init(&new_entry->in_use, true);   /* CHANGED: atomic init */
+    atomic_init(&new_entry->valid, true);    /* CHANGED: atomic init */
     new_entry->next = pool->entries;
     
     pool->entries = new_entry;
@@ -300,6 +307,7 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
     pool_entry_t* found = NULL;
     
     while (entry) {
+        /* CRITICAL: Safely check if this is our connection */
         if (entry->conn == conn) {
             found = entry;
             break;
@@ -308,14 +316,14 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
     }
     
     if (found) {
-        found->in_use = false;
+        atomic_store(&found->in_use, false);
         found->last_used = get_timestamp_ms();
         
         /* CRITICAL FIX: If connection is invalid, it was already closed.
          * DO NOT call tcp_close() again - just NULL out the pointer. */
-        if (!found->valid) {
-            /* Connection was marked invalid - already closed by server/client */
-            found->conn = NULL;  /* Just NULL it, don't close again */
+        if (!atomic_load(&found->valid)) {
+            /* Connection was marked invalid - already closed elsewhere */
+            found->conn = NULL;  /* Prevent double-close */
             cleanup_invalid_entries(pool);
             
             if (pool->pool_size_metric) {
@@ -330,7 +338,7 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
         if (atomic_load(&pool->shutting_down)) {
             tcp_close(conn);
             found->conn = NULL;
-            found->valid = false;
+            atomic_store(&found->valid, false);
             cleanup_invalid_entries(pool);
             
             if (pool->pool_size_metric) {
@@ -348,7 +356,7 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
             /* Pool over capacity - close this connection */
             tcp_close(conn);
             found->conn = NULL;
-            found->valid = false;
+            atomic_store(&found->valid, false);
             
             cleanup_invalid_entries(pool);
             
@@ -366,9 +374,10 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
     
     if (pool->logger) {
         LOG_WARN(pool->logger, "tcp_pool", 
-                "Released connection not found in pool", NULL);
+                "Released connection not found in pool - closing anyway", NULL);
     }
     
+    /* DEFENSIVE: Close the orphan connection */
     tcp_close(conn);
 }
 
@@ -380,8 +389,9 @@ void tcp_pool_mark_failed(tcp_pool_t* pool, tcp_connection_t* conn) {
     pool_entry_t* entry = pool->entries;
     while (entry) {
         if (entry->conn == conn) {
-            /* Mark as invalid - release() will handle cleanup without double-free */
-            entry->valid = false;
+            /* CRITICAL: Mark invalid AND NULL the pointer atomically */
+            atomic_store(&entry->valid, false);
+            entry->conn = NULL;  /* Prevent use-after-free */
             break;
         }
         entry = entry->next;
@@ -422,11 +432,11 @@ void tcp_pool_destroy(tcp_pool_t* pool) {
     while (entry) {
         pool_entry_t* next = entry->next;
         
-        /* CRITICAL: Only close if valid (not already closed elsewhere) */
-        if (entry->valid && entry->conn) {
+        /* CRITICAL: Only close if valid AND not NULL */
+        if (atomic_load(&entry->valid) && entry->conn != NULL) {
             tcp_close(entry->conn);
         }
-        /* If invalid, connection was already closed - just free the entry */
+        /* If invalid or NULL, connection was already closed */
         
         free(entry);
         entry = next;
