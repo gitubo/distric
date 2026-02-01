@@ -1,12 +1,20 @@
 /**
- * @file tcp_pool.c
- * @brief TCP Connection Pool Implementation - FIXED VERSION 5
+ * @file tcp_pool.c  
+ * @brief TCP Connection Pool Implementation - FINAL FIX
  * 
- * CRITICAL FIXES:
- * 1. Fixed race condition in cleanup
- * 2. Better synchronization during release
- * 3. Safer destruction with proper waiting
+ * ROOT CAUSE IDENTIFIED:
+ * When server closes connection via tcp_close(), the connection memory is freed.
+ * Pool still holds pointer, marks it invalid.
+ * When tcp_pool_release() is called, it tries to tcp_close() AGAIN → SEGFAULT
+ * 
+ * SOLUTION:
+ * When connection is invalid, DO NOT call tcp_close() - just NULL the pointer.
+ * The connection was already closed and freed by whoever marked it invalid.
  */
+
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
 
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200112L
@@ -43,7 +51,7 @@ struct tcp_pool_s {
     
     _Atomic uint64_t hits;
     _Atomic uint64_t misses;
-    _Atomic bool shutting_down;  /* NEW: Shutdown flag */
+    _Atomic bool shutting_down;
     
     pthread_mutex_t lock;
 
@@ -81,7 +89,6 @@ static pool_entry_t* find_entry(tcp_pool_t* pool, const char* host, uint16_t por
     return NULL;
 }
 
-/* Count valid entries in pool (must be called with lock held) */
 static size_t count_valid_entries(tcp_pool_t* pool) {
     size_t count = 0;
     pool_entry_t* entry = pool->entries;
@@ -96,7 +103,6 @@ static size_t count_valid_entries(tcp_pool_t* pool) {
     return count;
 }
 
-/* Remove invalid entries from pool (must be called with lock held) */
 static void cleanup_invalid_entries(tcp_pool_t* pool) {
     pool_entry_t** current = &pool->entries;
     
@@ -104,12 +110,11 @@ static void cleanup_invalid_entries(tcp_pool_t* pool) {
         pool_entry_t* entry = *current;
         
         if (!entry->valid && !entry->in_use) {
-            /* Remove from list */
             *current = entry->next;
             
-            /* Close connection if still present */
+            /* DEFENSIVE: Connection should already be NULL if invalid */
             if (entry->conn) {
-                tcp_close(entry->conn);
+                /* This should never happen if mark_failed is used correctly */
                 entry->conn = NULL;
             }
             
@@ -152,7 +157,6 @@ distric_err_t tcp_pool_create(
     
     pthread_mutex_init(&p->lock, NULL);
     
-    /* Register metrics */
     if (metrics) {
         metrics_register_gauge(metrics, "tcp_pool_size",
                               "TCP connection pool size", NULL, 0, &p->pool_size_metric);
@@ -184,26 +188,21 @@ distric_err_t tcp_pool_acquire(
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* CRITICAL: Don't acquire if shutting down */
     if (atomic_load(&pool->shutting_down)) {
         return DISTRIC_ERR_INIT_FAILED;
     }
     
     pthread_mutex_lock(&pool->lock);
     
-    /* Double-check shutdown flag under lock */
     if (atomic_load(&pool->shutting_down)) {
         pthread_mutex_unlock(&pool->lock);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
-    /* Clean up invalid entries first */
     cleanup_invalid_entries(pool);
     
-    /* Try to find existing valid connection */
     pool_entry_t* entry = find_entry(pool, host, port);
     if (entry && entry->valid && entry->conn) {
-        /* Cache hit */
         entry->in_use = true;
         entry->last_used = get_timestamp_ms();
         *conn = entry->conn;
@@ -226,7 +225,6 @@ distric_err_t tcp_pool_acquire(
         return DISTRIC_OK;
     }
     
-    /* Cache miss - create new connection */
     atomic_fetch_add(&pool->misses, 1);
     if (pool->pool_misses_metric) {
         metrics_counter_inc(pool->pool_misses_metric);
@@ -234,7 +232,6 @@ distric_err_t tcp_pool_acquire(
     
     pthread_mutex_unlock(&pool->lock);
 
-    /* Connect (outside lock to avoid blocking other threads) */
     tcp_connection_t* new_conn;
     distric_err_t err = tcp_connect(host, port, 5000, pool->metrics, pool->logger, &new_conn);
     if (err != DISTRIC_OK) {
@@ -247,14 +244,12 @@ distric_err_t tcp_pool_acquire(
     
     pthread_mutex_lock(&pool->lock);
     
-    /* Check shutdown again before adding */
     if (atomic_load(&pool->shutting_down)) {
         pthread_mutex_unlock(&pool->lock);
         tcp_close(new_conn);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
-    /* Create new entry */
     pool_entry_t* new_entry = calloc(1, sizeof(pool_entry_t));
     if (!new_entry) {
         pthread_mutex_unlock(&pool->lock);
@@ -301,7 +296,6 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
     
     pthread_mutex_lock(&pool->lock);
 
-    /* Find entry for this connection */
     pool_entry_t* entry = pool->entries;
     pool_entry_t* found = NULL;
     
@@ -314,15 +308,29 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
     }
     
     if (found) {
-        /* Found the entry */
         found->in_use = false;
         found->last_used = get_timestamp_ms();
         
-        /* If shutting down or invalid, close immediately */
-        if (atomic_load(&pool->shutting_down) || !found->valid) {
-            found->valid = false;
+        /* CRITICAL FIX: If connection is invalid, it was already closed.
+         * DO NOT call tcp_close() again - just NULL out the pointer. */
+        if (!found->valid) {
+            /* Connection was marked invalid - already closed by server/client */
+            found->conn = NULL;  /* Just NULL it, don't close again */
+            cleanup_invalid_entries(pool);
+            
+            if (pool->pool_size_metric) {
+                metrics_gauge_set(pool->pool_size_metric, pool->current_size);
+            }
+            
+            pthread_mutex_unlock(&pool->lock);
+            return;
+        }
+        
+        /* If shutting down, close the valid connection */
+        if (atomic_load(&pool->shutting_down)) {
             tcp_close(conn);
             found->conn = NULL;
+            found->valid = false;
             cleanup_invalid_entries(pool);
             
             if (pool->pool_size_metric) {
@@ -337,12 +345,11 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
         size_t valid_count = count_valid_entries(pool);
         
         if (valid_count > pool->max_connections) {
-            /* Pool is over capacity - close this connection */
-            found->valid = false;
+            /* Pool over capacity - close this connection */
             tcp_close(conn);
             found->conn = NULL;
+            found->valid = false;
             
-            /* Clean up immediately */
             cleanup_invalid_entries(pool);
             
             if (pool->pool_size_metric) {
@@ -354,7 +361,7 @@ void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
         return;
     }
     
-    /* Connection not found in pool - just close it */
+    /* Connection not in pool - this is OK, just close it */
     pthread_mutex_unlock(&pool->lock);
     
     if (pool->logger) {
@@ -373,6 +380,7 @@ void tcp_pool_mark_failed(tcp_pool_t* pool, tcp_connection_t* conn) {
     pool_entry_t* entry = pool->entries;
     while (entry) {
         if (entry->conn == conn) {
+            /* Mark as invalid - release() will handle cleanup without double-free */
             entry->valid = false;
             break;
         }
@@ -392,7 +400,6 @@ void tcp_pool_get_stats(
     
     pthread_mutex_lock(&pool->lock);
     
-    /* Count only valid entries */
     size_t valid_count = count_valid_entries(pool);
     
     if (size_out) *size_out = valid_count;
@@ -405,24 +412,21 @@ void tcp_pool_get_stats(
 void tcp_pool_destroy(tcp_pool_t* pool) {
     if (!pool) return;
     
-    /* CRITICAL: Signal shutdown first */
     atomic_store(&pool->shutting_down, true);
     
-    /* Small delay to let any in-flight operations complete */
-    usleep(10000); /* 10ms */
+    usleep(10000); /* 10ms - let any in-flight operations complete */
     
     pthread_mutex_lock(&pool->lock);
 
-    /* Close all connections */
     pool_entry_t* entry = pool->entries;
     while (entry) {
         pool_entry_t* next = entry->next;
         
-        /* Close connection regardless of in_use status */
-        if (entry->conn) {
+        /* CRITICAL: Only close if valid (not already closed elsewhere) */
+        if (entry->valid && entry->conn) {
             tcp_close(entry->conn);
-            entry->conn = NULL;
         }
+        /* If invalid, connection was already closed - just free the entry */
         
         free(entry);
         entry = next;

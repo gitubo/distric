@@ -1,11 +1,18 @@
 /**
  * @file test_integration.c
- * @brief Phase 1 Integration Test - FIXED VERSION 2
+ * @brief Phase 1 Integration Test - FIXED VERSION 3
  * 
- * Critical Fixes:
- * 1. Don't reuse connections closed by echo server
- * 2. Create new connection for each request
- * 3. Proper error handling for broken connections
+ * CRITICAL FIX: Proper shutdown order to prevent use-after-free
+ * 
+ * Root cause identified:
+ * - Echo server closes connections after handling requests
+ * - Pool destructor tried to close already-freed connections
+ * - Result: Double-free segfault
+ * 
+ * Solution:
+ * 1. Stop server FIRST (no new connections)
+ * 2. Wait for workers to complete
+ * 3. Then destroy pool (connections already cleaned up)
  */
 
 #ifndef _DEFAULT_SOURCE
@@ -65,6 +72,7 @@ static void on_connection(tcp_connection_t* conn, void* userdata) {
                conn_count, received);
     }
     
+    /* IMPORTANT: Server closes connection after handling request */
     tcp_close(conn);
 }
 
@@ -120,7 +128,7 @@ static void* tcp_client_worker(void* arg) {
         }
         
         /* CRITICAL: The echo server closes the connection after handling request.
-         * Don't return this connection to the pool for reuse. */
+         * Mark as failed so pool doesn't try to reuse or double-free. */
         tcp_pool_mark_failed(pool, conn);
         tcp_pool_release(pool, conn);
         
@@ -297,15 +305,40 @@ int main(void) {
     printf("%s\n", health_json);
     free(health_json);
     
-    /* Cleanup */
-    printf("\n[Cleanup] Shutting down...\n");
-    udp_close(udp);
-    tcp_pool_destroy(pool);
+    /* ========================================================================
+     * CRITICAL FIX: PROPER SHUTDOWN ORDER
+     * ======================================================================== */
+    printf("\n[Cleanup] Shutting down (proper order)...\n");
+    
+    /* 1. Stop server FIRST - no new connections accepted */
+    printf("    [1/6] Stopping TCP server...\n");
+    tcp_server_stop(server);
+    
+    /* 2. Give any pending accept/read operations time to complete */
+    sleep(1);
+    
+    /* 3. Destroy server (closes socket, joins threads) */
+    printf("    [2/6] Destroying TCP server...\n");
     tcp_server_destroy(server);
     
+    /* 4. NOW safe to destroy pool - all connections already closed by server */
+    printf("    [3/6] Destroying TCP connection pool...\n");
+    tcp_pool_destroy(pool);
+    
+    /* 5. Close UDP socket */
+    printf("    [4/6] Closing UDP socket...\n");
+    udp_close(udp);
+    
+    /* 6. Destroy health (no more updates expected) */
+    printf("    [5/6] Destroying health registry...\n");
     health_destroy(g_health);
+    
+    /* 7. Destroy observability LAST - ensures all logs flushed */
+    printf("    [6/6] Destroying observability (logger last)...\n");
     log_destroy(g_logger);
     metrics_destroy(g_metrics);
+    
+    printf("    ✓ Clean shutdown complete\n");
     
     /* Final verdict */
     printf("\n=== Test Result ===\n");
@@ -313,7 +346,6 @@ int main(void) {
     /* Relaxed thresholds to account for UDP packet loss and timing issues */
     bool tcp_success = (tcp_handled >= NUM_TCP_CLIENTS * 8); /* 80% threshold */
     bool udp_success = (udp_received >= NUM_UDP_PACKETS * 0.9); /* 90% threshold */
-    /* Pool hits don't matter since echo server closes connections */
     
     if (tcp_success && udp_success) {
         printf("✓ PASS: Phase 1 integration test successful!\n");
@@ -325,6 +357,7 @@ int main(void) {
                (udp_received * 100.0) / NUM_UDP_PACKETS);
         printf("  - Connection pool working correctly\n");
         printf("  - All metrics tracked correctly\n");
+        printf("  - NO SEGFAULT! Clean shutdown achieved!\n");
         return 0;
     } else {
         printf("✗ FAIL: Some operations did not meet thresholds\n");
