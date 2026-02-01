@@ -1,6 +1,6 @@
 /**
  * @file test_tcp_pool.c
- * @brief Unit tests for TCP connection pool
+ * @brief Unit tests for TCP connection pool - FIXED VERSION
  */
 
 #include <distric_transport.h>
@@ -106,14 +106,19 @@ void test_pool_max_size(void) {
         ASSERT_OK(tcp_pool_acquire(pool, "127.0.0.1", TEST_PORT + 1, &conns[i]));
     }
     
-    /* Release all */
+    /* Release all - pool should evict excess connections */
     for (int i = 0; i < 5; i++) {
         tcp_pool_release(pool, conns[i]);
     }
     
+    /* Give pool time to clean up */
+    usleep(100000);
+    
     size_t size;
     tcp_pool_get_stats(pool, &size, NULL, NULL);
     printf("    Final pool size: %zu (max: 3)\n", size);
+    
+    /* FIXED: Pool should enforce max size on release */
     assert(size <= 3);
     
     tcp_pool_destroy(pool);

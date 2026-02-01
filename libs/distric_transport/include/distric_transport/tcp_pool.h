@@ -75,6 +75,17 @@ distric_err_t tcp_pool_acquire(
 void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn);
 
 /**
+ * @brief Mark a connection as failed
+ * 
+ * This marks the connection as invalid so it won't be reused.
+ * Should be called when a connection fails during use.
+ * 
+ * @param pool The connection pool
+ * @param conn The failed connection
+ */
+void tcp_pool_mark_failed(tcp_pool_t* pool, tcp_connection_t* conn);
+
+/**
  * @brief Get pool statistics
  * 
  * @param pool The connection pool
