@@ -59,13 +59,13 @@ void test_header_initialization() {
     ASSERT_TRUE(header.flags == MSG_FLAG_NONE);
     ASSERT_TRUE(header.payload_len == 1024);
     ASSERT_TRUE(header.message_id != 0);
-    ASSERT_TRUE(header.timestamp != 0);
+    ASSERT_TRUE(header.timestamp_us != 0);
     ASSERT_TRUE(header.reserved == 0);
     
     printf("  Magic: 0x%08X\n", header.magic);
     printf("  Version: 0x%04X\n", header.version);
     printf("  Message ID: %lu\n", header.message_id);
-    printf("  Timestamp: %u\n", header.timestamp);
+    printf("  Timestamp (us): %u\n", header.timestamp_us);
     
     TEST_PASS();
 }
@@ -113,7 +113,7 @@ void test_serialization_deserialization() {
     ASSERT_TRUE(deserialized.flags == original.flags);
     ASSERT_TRUE(deserialized.payload_len == original.payload_len);
     ASSERT_TRUE(deserialized.message_id == original.message_id);
-    ASSERT_TRUE(deserialized.timestamp == original.timestamp);
+    ASSERT_TRUE(deserialized.timestamp_us == original.timestamp_us);
     ASSERT_TRUE(deserialized.crc32 == original.crc32);
     
     printf("  Round-trip serialization successful\n");

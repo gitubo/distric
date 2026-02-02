@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <arpa/inet.h>  /* For htonl */
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -543,7 +544,7 @@ void test_zero_length_bytes() {
     ASSERT_OK(tlv_decode_next(dec, &field));
     
     size_t data_len;
-    const uint8_t* data = tlv_field_get_bytes(&field, &data_len);
+    tlv_field_get_bytes(&field, &data_len);  /* We only care about length */
     ASSERT_TRUE(data_len == 0);
     
     printf("  Zero-length byte array handled correctly\n");
