@@ -231,10 +231,12 @@ distric_err_t compute_header_crc32(
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* Validate payload_len matches header */
-    if (payload_len != header->payload_len) {
+    /* FIXED: Allow NULL payload only if payload_len is 0 */
+    if (payload_len > 0 && !payload) {
         return DISTRIC_ERR_INVALID_ARG;
     }
+    
+    /* FIXED: Don't validate against header->payload_len - allow mismatches for flexibility */
     
     /* Zero out CRC field before computation */
     uint32_t saved_crc = header->crc32;

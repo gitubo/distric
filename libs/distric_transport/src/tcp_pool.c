@@ -422,9 +422,11 @@ void tcp_pool_get_stats(
 void tcp_pool_destroy(tcp_pool_t* pool) {
     if (!pool) return;
     
+    /* CRITICAL: Set shutdown flag FIRST */
     atomic_store(&pool->shutting_down, true);
     
-    usleep(10000); /* 10ms - let any in-flight operations complete */
+    /* CRITICAL: Wait longer for in-flight operations */
+    usleep(50000); /* 50ms - increased from 10ms */
     
     pthread_mutex_lock(&pool->lock);
 
@@ -432,11 +434,22 @@ void tcp_pool_destroy(tcp_pool_t* pool) {
     while (entry) {
         pool_entry_t* next = entry->next;
         
-        /* CRITICAL: Only close if valid AND not NULL */
-        if (atomic_load(&entry->valid) && entry->conn != NULL) {
+        /* CRITICAL: Wait for entry to be released if in use */
+        int retry_count = 0;
+        while (atomic_load(&entry->in_use) && retry_count < 100) {
+            pthread_mutex_unlock(&pool->lock);
+            usleep(1000); /* 1ms */
+            pthread_mutex_lock(&pool->lock);
+            retry_count++;
+        }
+        
+        /* CRITICAL: Only close if valid AND not NULL AND not in use */
+        if (atomic_load(&entry->valid) && 
+            entry->conn != NULL && 
+            !atomic_load(&entry->in_use)) {
             tcp_close(entry->conn);
         }
-        /* If invalid or NULL, connection was already closed */
+        /* If still in use or invalid, connection was already closed or leaked */
         
         free(entry);
         entry = next;
