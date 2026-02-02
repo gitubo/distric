@@ -153,6 +153,20 @@ extern "C" {
 #include "distric_protocol/messages.h"
 /** @} */
 
+/**
+ * @defgroup rpc RPC Framework
+ * @brief Request-response communication over TCP
+ * 
+ * Provides synchronous RPC with:
+ * - Timeout and retry support
+ * - Automatic metrics tracking
+ * - Distributed tracing
+ * - Connection pooling
+ * @{
+ */
+#include "distric_protocol/rpc.h"
+/** @} */
+
 /* ============================================================================
  * VERSION INFORMATION
  * ========================================================================= */

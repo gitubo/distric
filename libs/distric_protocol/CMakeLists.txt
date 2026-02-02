@@ -20,6 +20,7 @@ set(PROTOCOL_SOURCES
     src/crc32.c
     src/tlv.c
     src/messages.c
+    src/rpc.c
 )
 
 # Create library
@@ -46,6 +47,7 @@ target_include_directories(distric_protocol
 target_link_libraries(distric_protocol
     PUBLIC
         distric_obs
+        distric_transport
         Threads::Threads
 )
 

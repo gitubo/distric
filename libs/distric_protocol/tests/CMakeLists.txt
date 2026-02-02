@@ -14,3 +14,8 @@ add_test(NAME test_tlv COMMAND test_tlv)
 add_executable(test_messages test_messages.c)
 target_link_libraries(test_messages distric_protocol distric_obs Threads::Threads)
 add_test(NAME test_messages COMMAND test_messages)
+
+# Test: RPC Framework
+add_executable(test_rpc test_rpc.c)
+target_link_libraries(test_rpc distric_protocol distric_transport distric_obs Threads::Threads)
+add_test(NAME test_rpc COMMAND test_rpc)
