@@ -18,6 +18,9 @@ add_subdirectory(libs/distric_obs)
 # Add transport library SECOND (depends on distric_obs)
 add_subdirectory(libs/distric_transport)
 
+# Add protocol library THIRD (depends on distric_obs)
+add_subdirectory(libs/distric_protocol)
+
 # Future libraries can be added here
 # add_subdirectory(libs/distric_core)
 # add_subdirectory(libs/distric_net)
