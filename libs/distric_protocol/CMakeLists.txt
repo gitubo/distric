@@ -18,6 +18,8 @@ find_package(Threads REQUIRED)
 set(PROTOCOL_SOURCES
     src/binary.c
     src/crc32.c
+    src/tlv.c
+    src/messages.c
 )
 
 # Create library
