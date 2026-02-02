@@ -3,8 +3,13 @@
  * @brief RPC Framework Implementation
  */
 
+/* Define feature test macros BEFORE any includes */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200112L
+#endif
+
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
 #endif
 
 #include "distric_protocol/rpc.h"
@@ -49,12 +54,13 @@ struct rpc_server {
     pthread_rwlock_t handlers_lock;
     
     _Atomic bool running;
+    _Atomic int64_t active_requests;
     
     /* Metrics */
     metric_t* requests_total;
     metric_t* request_duration;
     metric_t* errors_total;
-    metric_t* active_requests;
+    metric_t* active_requests_metric;
 };
 
 /** RPC Client */
@@ -81,10 +87,6 @@ static uint64_t get_timestamp_us(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-}
-
-static uint64_t get_timestamp_ms(void) {
-    return get_timestamp_us() / 1000;
 }
 
 /* ============================================================================
@@ -186,9 +188,10 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
             trace_add_tag(span, "msg_type", message_type_to_string(header.msg_type));
         }
         
-        /* Update metrics */
-        metrics_gauge_set(server->active_requests, 
-                         metrics_gauge_set(server->active_requests, 0) + 1);
+        /* Increment active requests */
+        atomic_fetch_add(&server->active_requests, 1);
+        metrics_gauge_set(server->active_requests_metric, 
+                         (double)atomic_load(&server->active_requests));
         
         uint64_t start_time = get_timestamp_us();
         
@@ -211,8 +214,11 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
         uint64_t duration_us = get_timestamp_us() - start_time;
         metrics_histogram_observe(server->request_duration, duration_us / 1000000.0);
         metrics_counter_inc(server->requests_total);
-        metrics_gauge_set(server->active_requests,
-                         metrics_gauge_set(server->active_requests, 0) - 1);
+        
+        /* Decrement active requests */
+        atomic_fetch_sub(&server->active_requests, 1);
+        metrics_gauge_set(server->active_requests_metric,
+                         (double)atomic_load(&server->active_requests));
         
         /* Build response header */
         message_header_t resp_header;
@@ -277,6 +283,7 @@ distric_err_t rpc_server_create(
     server->tracer = tracer;
     server->handler_count = 0;
     atomic_store(&server->running, false);
+    atomic_store(&server->active_requests, 0);
     
     pthread_rwlock_init(&server->handlers_lock, NULL);
     
@@ -291,7 +298,7 @@ distric_err_t rpc_server_create(
                             "Total RPC errors", NULL, 0, &server->errors_total);
     
     metrics_register_gauge(metrics, "rpc_server_active_requests",
-                          "Active RPC requests", NULL, 0, &server->active_requests);
+                          "Active RPC requests", NULL, 0, &server->active_requests_metric);
     
     *server_out = server;
     return DISTRIC_OK;
@@ -368,8 +375,7 @@ void rpc_server_stop(rpc_server_t* server) {
     
     /* Wait for active requests to complete (with timeout) */
     for (int i = 0; i < 100; i++) {
-        double active = 0;
-        metrics_gauge_set(server->active_requests, active);  /* Get current value */
+        int64_t active = atomic_load(&server->active_requests);
         if (active == 0) {
             break;
         }

@@ -19,3 +19,8 @@ add_test(NAME test_messages COMMAND test_messages)
 add_executable(test_rpc test_rpc.c)
 target_link_libraries(test_rpc distric_protocol distric_transport distric_obs Threads::Threads)
 add_test(NAME test_rpc COMMAND test_rpc)
+
+# Test: Integration
+add_executable(test_integration test_integration.c)
+target_link_libraries(test_integration distric_protocol distric_transport distric_obs Threads::Threads)
+add_test(NAME test_integration COMMAND test_integration)
