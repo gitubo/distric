@@ -1364,3 +1364,792 @@ const char* task_status_to_string(task_status_t status) {
         default:                    return "UNKNOWN";
     }
 }
+
+/* ============================================================================
+ * GOSSIP INDIRECT PING SERIALIZATION
+ * ========================================================================= */
+
+distric_err_t serialize_gossip_indirect_ping(
+    const gossip_indirect_ping_t* msg,
+    uint8_t** buffer_out,
+    size_t* len_out
+) {
+    if (!msg || !buffer_out || !len_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    tlv_encoder_t* enc = tlv_encoder_create(256);
+    if (!enc) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    tlv_encode_string(enc, FIELD_NODE_ID, msg->sender_id);
+    tlv_encode_string(enc, FIELD_PING_TARGET_ID, msg->target_id);
+    tlv_encode_uint32(enc, FIELD_SEQUENCE_NUMBER, msg->sequence_number);
+    
+    *buffer_out = tlv_encoder_detach(enc, len_out);
+    tlv_encoder_free(enc);
+    
+    return *buffer_out ? DISTRIC_OK : DISTRIC_ERR_NO_MEMORY;
+}
+
+distric_err_t deserialize_gossip_indirect_ping(
+    const uint8_t* buffer,
+    size_t len,
+    gossip_indirect_ping_t* msg_out
+) {
+    if (!buffer || !msg_out || len == 0) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    if (!tlv_validate_buffer(buffer, len)) {
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    memset(msg_out, 0, sizeof(gossip_indirect_ping_t));
+    
+    tlv_decoder_t* dec = tlv_decoder_create(buffer, len);
+    if (!dec) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    tlv_field_t field;
+    while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
+        switch (field.tag) {
+            case FIELD_NODE_ID: {
+                const char* str = tlv_field_get_string(&field);
+                if (str) {
+                    strncpy(msg_out->sender_id, str, sizeof(msg_out->sender_id) - 1);
+                }
+                break;
+            }
+            
+            case FIELD_PING_TARGET_ID: {
+                const char* str = tlv_field_get_string(&field);
+                if (str) {
+                    strncpy(msg_out->target_id, str, sizeof(msg_out->target_id) - 1);
+                }
+                break;
+            }
+            
+            case FIELD_SEQUENCE_NUMBER:
+                tlv_field_get_uint32(&field, &msg_out->sequence_number);
+                break;
+            
+            default:
+                break;
+        }
+    }
+    
+    tlv_decoder_free(dec);
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * UPDATED GOSSIP MEMBERSHIP UPDATE (with load metrics)
+ * ========================================================================= */
+
+distric_err_t serialize_gossip_membership_update(
+    const gossip_membership_update_t* msg,
+    uint8_t** buffer_out,
+    size_t* len_out
+) {
+    if (!msg || !buffer_out || !len_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    tlv_encoder_t* enc = tlv_encoder_create(1024);
+    if (!enc) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    tlv_encode_string(enc, FIELD_NODE_ID, msg->sender_id);
+    
+    /* Encode each node update */
+    if (msg->updates && msg->update_count > 0) {
+        for (size_t i = 0; i < msg->update_count; i++) {
+            const gossip_node_info_t* node = &msg->updates[i];
+            
+            /* Create sub-encoder for node info */
+            tlv_encoder_t* node_enc = tlv_encoder_create(256);
+            tlv_encode_string(node_enc, FIELD_NODE_ID, node->node_id);
+            tlv_encode_string(node_enc, FIELD_NODE_ADDRESS, node->address);
+            tlv_encode_uint16(node_enc, FIELD_NODE_PORT, node->port);
+            tlv_encode_uint32(node_enc, FIELD_NODE_STATE, (uint32_t)node->state);
+            tlv_encode_uint32(node_enc, FIELD_NODE_ROLE, (uint32_t)node->role);
+            tlv_encode_uint64(node_enc, FIELD_INCARNATION, node->incarnation);
+            
+            /* Add load metrics */
+            tlv_encode_uint8(node_enc, FIELD_CPU_USAGE, node->cpu_usage);
+            tlv_encode_uint8(node_enc, FIELD_MEMORY_USAGE, node->memory_usage);
+            
+            size_t node_len;
+            uint8_t* node_buf = tlv_encoder_finalize(node_enc, &node_len);
+            
+            tlv_encode_bytes(enc, FIELD_MEMBERSHIP_UPDATES, node_buf, node_len);
+            
+            tlv_encoder_free(node_enc);
+        }
+    }
+    
+    *buffer_out = tlv_encoder_detach(enc, len_out);
+    tlv_encoder_free(enc);
+    
+    return *buffer_out ? DISTRIC_OK : DISTRIC_ERR_NO_MEMORY;
+}
+
+distric_err_t deserialize_gossip_membership_update(
+    const uint8_t* buffer,
+    size_t len,
+    gossip_membership_update_t* msg_out
+) {
+    if (!buffer || !msg_out || len == 0) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    if (!tlv_validate_buffer(buffer, len)) {
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    memset(msg_out, 0, sizeof(gossip_membership_update_t));
+    
+    gossip_node_info_t* updates = NULL;
+    size_t update_count = 0;
+    size_t update_capacity = 0;
+    
+    tlv_decoder_t* dec = tlv_decoder_create(buffer, len);
+    if (!dec) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    tlv_field_t field;
+    while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
+        switch (field.tag) {
+            case FIELD_NODE_ID: {
+                const char* str = tlv_field_get_string(&field);
+                if (str) {
+                    strncpy(msg_out->sender_id, str, sizeof(msg_out->sender_id) - 1);
+                }
+                break;
+            }
+            
+            case FIELD_MEMBERSHIP_UPDATES: {
+                size_t node_data_len;
+                const uint8_t* node_data = tlv_field_get_bytes(&field, &node_data_len);
+                
+                if (node_data) {
+                    /* Grow array if needed */
+                    if (update_count >= update_capacity) {
+                        update_capacity = update_capacity == 0 ? 4 : update_capacity * 2;
+                        gossip_node_info_t* new_updates = (gossip_node_info_t*)realloc(
+                            updates, update_capacity * sizeof(gossip_node_info_t));
+                        if (!new_updates) {
+                            free(updates);
+                            tlv_decoder_free(dec);
+                            return DISTRIC_ERR_NO_MEMORY;
+                        }
+                        updates = new_updates;
+                    }
+                    
+                    gossip_node_info_t* node = &updates[update_count];
+                    memset(node, 0, sizeof(gossip_node_info_t));
+                    
+                    /* Decode node fields */
+                    tlv_decoder_t* node_dec = tlv_decoder_create(node_data, node_data_len);
+                    tlv_field_t node_field;
+                    
+                    while (tlv_decode_next(node_dec, &node_field) == DISTRIC_OK) {
+                        switch (node_field.tag) {
+                            case FIELD_NODE_ID: {
+                                const char* str = tlv_field_get_string(&node_field);
+                                if (str) {
+                                    strncpy(node->node_id, str, sizeof(node->node_id) - 1);
+                                }
+                                break;
+                            }
+                            
+                            case FIELD_NODE_ADDRESS: {
+                                const char* str = tlv_field_get_string(&node_field);
+                                if (str) {
+                                    strncpy(node->address, str, sizeof(node->address) - 1);
+                                }
+                                break;
+                            }
+                            
+                            case FIELD_NODE_PORT:
+                                tlv_field_get_uint16(&node_field, &node->port);
+                                break;
+                            
+                            case FIELD_NODE_STATE: {
+                                uint32_t state;
+                                tlv_field_get_uint32(&node_field, &state);
+                                node->state = (node_state_t)state;
+                                break;
+                            }
+                            
+                            case FIELD_NODE_ROLE: {
+                                uint32_t role;
+                                tlv_field_get_uint32(&node_field, &role);
+                                node->role = (node_role_t)role;
+                                break;
+                            }
+                            
+                            case FIELD_INCARNATION:
+                                tlv_field_get_uint64(&node_field, &node->incarnation);
+                                break;
+                            
+                            case FIELD_CPU_USAGE:
+                                tlv_field_get_uint8(&node_field, &node->cpu_usage);
+                                break;
+                            
+                            case FIELD_MEMORY_USAGE:
+                                tlv_field_get_uint8(&node_field, &node->memory_usage);
+                                break;
+                        }
+                    }
+                    
+                    tlv_decoder_free(node_dec);
+                    update_count++;
+                }
+                break;
+            }
+            
+            default:
+                break;
+        }
+    }
+    
+    msg_out->updates = updates;
+    msg_out->update_count = update_count;
+    
+    tlv_decoder_free(dec);
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * RAFT CONFIGURATION CHANGE SERIALIZATION
+ * ========================================================================= */
+
+distric_err_t serialize_raft_configuration_change(
+    const raft_configuration_change_t* msg,
+    uint8_t** buffer_out,
+    size_t* len_out
+) {
+    if (!msg || !buffer_out || !len_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    tlv_encoder_t* enc = tlv_encoder_create(1024);
+    if (!enc) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    /* Encode change type */
+    tlv_encode_uint32(enc, FIELD_CONFIG_CHANGE_TYPE, (uint32_t)msg->type);
+    
+    /* For single-node changes */
+    if (msg->type == CONFIG_CHANGE_ADD_NODE || msg->type == CONFIG_CHANGE_REMOVE_NODE) {
+        /* Encode node info */
+        tlv_encoder_t* node_enc = tlv_encoder_create(256);
+        tlv_encode_string(node_enc, FIELD_NODE_ID, msg->node_info.node_id);
+        tlv_encode_string(node_enc, FIELD_NODE_ADDRESS, msg->node_info.address);
+        tlv_encode_uint16(node_enc, FIELD_NODE_PORT, msg->node_info.port);
+        tlv_encode_uint32(node_enc, FIELD_NODE_ROLE, (uint32_t)msg->node_info.role);
+        
+        size_t node_len;
+        uint8_t* node_buf = tlv_encoder_finalize(node_enc, &node_len);
+        
+        if (msg->type == CONFIG_CHANGE_ADD_NODE) {
+            tlv_encode_bytes(enc, FIELD_NODE_TO_ADD, node_buf, node_len);
+        } else {
+            tlv_encode_bytes(enc, FIELD_NODE_TO_REMOVE, node_buf, node_len);
+        }
+        
+        tlv_encoder_free(node_enc);
+    }
+    
+    /* For joint consensus */
+    if (msg->type == CONFIG_CHANGE_REPLACE) {
+        /* Encode old servers */
+        if (msg->old_servers && msg->old_server_count > 0) {
+            for (size_t i = 0; i < msg->old_server_count; i++) {
+                tlv_encoder_t* srv_enc = tlv_encoder_create(256);
+                const raft_server_info_t* srv = &msg->old_servers[i];
+                
+                tlv_encode_string(srv_enc, FIELD_NODE_ID, srv->node_id);
+                tlv_encode_string(srv_enc, FIELD_NODE_ADDRESS, srv->address);
+                tlv_encode_uint16(srv_enc, FIELD_NODE_PORT, srv->port);
+                tlv_encode_uint32(srv_enc, FIELD_NODE_ROLE, (uint32_t)srv->role);
+                
+                size_t srv_len;
+                uint8_t* srv_buf = tlv_encoder_finalize(srv_enc, &srv_len);
+                tlv_encode_bytes(enc, FIELD_OLD_SERVERS, srv_buf, srv_len);
+                tlv_encoder_free(srv_enc);
+            }
+        }
+        
+        /* Encode new servers */
+        if (msg->new_servers && msg->new_server_count > 0) {
+            for (size_t i = 0; i < msg->new_server_count; i++) {
+                tlv_encoder_t* srv_enc = tlv_encoder_create(256);
+                const raft_server_info_t* srv = &msg->new_servers[i];
+                
+                tlv_encode_string(srv_enc, FIELD_NODE_ID, srv->node_id);
+                tlv_encode_string(srv_enc, FIELD_NODE_ADDRESS, srv->address);
+                tlv_encode_uint16(srv_enc, FIELD_NODE_PORT, srv->port);
+                tlv_encode_uint32(srv_enc, FIELD_NODE_ROLE, (uint32_t)srv->role);
+                
+                size_t srv_len;
+                uint8_t* srv_buf = tlv_encoder_finalize(srv_enc, &srv_len);
+                tlv_encode_bytes(enc, FIELD_NEW_SERVERS, srv_buf, srv_len);
+                tlv_encoder_free(srv_enc);
+            }
+        }
+    }
+    
+    *buffer_out = tlv_encoder_detach(enc, len_out);
+    tlv_encoder_free(enc);
+    
+    return *buffer_out ? DISTRIC_OK : DISTRIC_ERR_NO_MEMORY;
+}
+
+distric_err_t deserialize_raft_configuration_change(
+    const uint8_t* buffer,
+    size_t len,
+    raft_configuration_change_t* msg_out
+) {
+    if (!buffer || !msg_out || len == 0) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    if (!tlv_validate_buffer(buffer, len)) {
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    memset(msg_out, 0, sizeof(raft_configuration_change_t));
+    
+    raft_server_info_t* old_servers = NULL;
+    size_t old_count = 0;
+    size_t old_capacity = 0;
+    
+    raft_server_info_t* new_servers = NULL;
+    size_t new_count = 0;
+    size_t new_capacity = 0;
+    
+    tlv_decoder_t* dec = tlv_decoder_create(buffer, len);
+    if (!dec) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    tlv_field_t field;
+    while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
+        switch (field.tag) {
+            case FIELD_CONFIG_CHANGE_TYPE: {
+                uint32_t type;
+                tlv_field_get_uint32(&field, &type);
+                msg_out->type = (config_change_type_t)type;
+                break;
+            }
+            
+            case FIELD_NODE_TO_ADD:
+            case FIELD_NODE_TO_REMOVE: {
+                size_t node_len;
+                const uint8_t* node_data = tlv_field_get_bytes(&field, &node_len);
+                
+                if (node_data) {
+                    tlv_decoder_t* node_dec = tlv_decoder_create(node_data, node_len);
+                    tlv_field_t node_field;
+                    
+                    while (tlv_decode_next(node_dec, &node_field) == DISTRIC_OK) {
+                        switch (node_field.tag) {
+                            case FIELD_NODE_ID: {
+                                const char* str = tlv_field_get_string(&node_field);
+                                if (str) {
+                                    strncpy(msg_out->node_info.node_id, str, 
+                                           sizeof(msg_out->node_info.node_id) - 1);
+                                }
+                                break;
+                            }
+                            
+                            case FIELD_NODE_ADDRESS: {
+                                const char* str = tlv_field_get_string(&node_field);
+                                if (str) {
+                                    strncpy(msg_out->node_info.address, str, 
+                                           sizeof(msg_out->node_info.address) - 1);
+                                }
+                                break;
+                            }
+                            
+                            case FIELD_NODE_PORT:
+                                tlv_field_get_uint16(&node_field, &msg_out->node_info.port);
+                                break;
+                            
+                            case FIELD_NODE_ROLE: {
+                                uint32_t role;
+                                tlv_field_get_uint32(&node_field, &role);
+                                msg_out->node_info.role = (node_role_t)role;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    tlv_decoder_free(node_dec);
+                }
+                break;
+            }
+            
+            case FIELD_OLD_SERVERS: {
+                size_t srv_len;
+                const uint8_t* srv_data = tlv_field_get_bytes(&field, &srv_len);
+                
+                if (srv_data) {
+                    if (old_count >= old_capacity) {
+                        old_capacity = old_capacity == 0 ? 4 : old_capacity * 2;
+                        raft_server_info_t* new_old = (raft_server_info_t*)realloc(
+                            old_servers, old_capacity * sizeof(raft_server_info_t));
+                        if (!new_old) {
+                            free(old_servers);
+                            free(new_servers);
+                            tlv_decoder_free(dec);
+                            return DISTRIC_ERR_NO_MEMORY;
+                        }
+                        old_servers = new_old;
+                    }
+                    
+                    raft_server_info_t* srv = &old_servers[old_count];
+                    memset(srv, 0, sizeof(raft_server_info_t));
+                    
+                    tlv_decoder_t* srv_dec = tlv_decoder_create(srv_data, srv_len);
+                    tlv_field_t srv_field;
+                    
+                    while (tlv_decode_next(srv_dec, &srv_field) == DISTRIC_OK) {
+                        switch (srv_field.tag) {
+                            case FIELD_NODE_ID: {
+                                const char* str = tlv_field_get_string(&srv_field);
+                                if (str) {
+                                    strncpy(srv->node_id, str, sizeof(srv->node_id) - 1);
+                                }
+                                break;
+                            }
+                            
+                            case FIELD_NODE_ADDRESS: {
+                                const char* str = tlv_field_get_string(&srv_field);
+                                if (str) {
+                                    strncpy(srv->address, str, sizeof(srv->address) - 1);
+                                }
+                                break;
+                            }
+                            
+                            case FIELD_NODE_PORT:
+                                tlv_field_get_uint16(&srv_field, &srv->port);
+                                break;
+                            
+                            case FIELD_NODE_ROLE: {
+                                uint32_t role;
+                                tlv_field_get_uint32(&srv_field, &role);
+                                srv->role = (node_role_t)role;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    tlv_decoder_free(srv_dec);
+                    old_count++;
+                }
+                break;
+            }
+            
+            case FIELD_NEW_SERVERS: {
+                size_t srv_len;
+                const uint8_t* srv_data = tlv_field_get_bytes(&field, &srv_len);
+                
+                if (srv_data) {
+                    if (new_count >= new_capacity) {
+                        new_capacity = new_capacity == 0 ? 4 : new_capacity * 2;
+                        raft_server_info_t* new_new = (raft_server_info_t*)realloc(
+                            new_servers, new_capacity * sizeof(raft_server_info_t));
+                        if (!new_new) {
+                            free(old_servers);
+                            free(new_servers);
+                            tlv_decoder_free(dec);
+                            return DISTRIC_ERR_NO_MEMORY;
+                        }
+                        new_servers = new_new;
+                    }
+                    
+                    raft_server_info_t* srv = &new_servers[new_count];
+                    memset(srv, 0, sizeof(raft_server_info_t));
+                    
+                    tlv_decoder_t* srv_dec = tlv_decoder_create(srv_data, srv_len);
+                    tlv_field_t srv_field;
+                    
+                    while (tlv_decode_next(srv_dec, &srv_field) == DISTRIC_OK) {
+                        switch (srv_field.tag) {
+                            case FIELD_NODE_ID: {
+                                const char* str = tlv_field_get_string(&srv_field);
+                                if (str) {
+                                    strncpy(srv->node_id, str, sizeof(srv->node_id) - 1);
+                                }
+                                break;
+                            }
+                            
+                            case FIELD_NODE_ADDRESS: {
+                                const char* str = tlv_field_get_string(&srv_field);
+                                if (str) {
+                                    strncpy(srv->address, str, sizeof(srv->address) - 1);
+                                }
+                                break;
+                            }
+                            
+                            case FIELD_NODE_PORT:
+                                tlv_field_get_uint16(&srv_field, &srv->port);
+                                break;
+                            
+                            case FIELD_NODE_ROLE: {
+                                uint32_t role;
+                                tlv_field_get_uint32(&srv_field, &role);
+                                srv->role = (node_role_t)role;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    tlv_decoder_free(srv_dec);
+                    new_count++;
+                }
+                break;
+            }
+            
+            default:
+                break;
+        }
+    }
+    
+    msg_out->old_servers = old_servers;
+    msg_out->old_server_count = old_count;
+    msg_out->new_servers = new_servers;
+    msg_out->new_server_count = new_count;
+    
+    tlv_decoder_free(dec);
+    return DISTRIC_OK;
+}
+
+void free_raft_configuration_change(raft_configuration_change_t* msg) {
+    if (!msg) {
+        return;
+    }
+    
+    free(msg->old_servers);
+    free(msg->new_servers);
+    
+    msg->old_servers = NULL;
+    msg->new_servers = NULL;
+    msg->old_server_count = 0;
+    msg->new_server_count = 0;
+}
+
+/* ============================================================================
+ * UPDATED RAFT APPEND ENTRIES (with entry type)
+ * ========================================================================= */
+
+distric_err_t serialize_raft_append_entries(
+    const raft_append_entries_t* msg,
+    uint8_t** buffer_out,
+    size_t* len_out
+) {
+    if (!msg || !buffer_out || !len_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    tlv_encoder_t* enc = tlv_encoder_create(1024);
+    if (!enc) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    /* Encode basic fields */
+    tlv_encode_uint32(enc, FIELD_TERM, msg->term);
+    tlv_encode_string(enc, FIELD_LEADER_ID, msg->leader_id);
+    tlv_encode_uint32(enc, FIELD_PREV_LOG_INDEX, msg->prev_log_index);
+    tlv_encode_uint32(enc, FIELD_PREV_LOG_TERM, msg->prev_log_term);
+    tlv_encode_uint32(enc, FIELD_LEADER_COMMIT, msg->leader_commit);
+    
+    /* Encode log entries (if any) */
+    if (msg->entries && msg->entry_count > 0) {
+        for (size_t i = 0; i < msg->entry_count; i++) {
+            const raft_log_entry_t* entry = &msg->entries[i];
+            
+            /* Create sub-encoder for entry */
+            tlv_encoder_t* entry_enc = tlv_encoder_create(256);
+            tlv_encode_uint32(entry_enc, FIELD_ENTRY_INDEX, entry->index);
+            tlv_encode_uint32(entry_enc, FIELD_ENTRY_TERM, entry->term);
+            tlv_encode_uint32(entry_enc, FIELD_ENTRY_TYPE, (uint32_t)entry->entry_type);
+            if (entry->data && entry->data_len > 0) {
+                tlv_encode_bytes(entry_enc, FIELD_ENTRY_DATA, entry->data, entry->data_len);
+            }
+            
+            /* Get encoded entry */
+            size_t entry_len;
+            uint8_t* entry_buf = tlv_encoder_finalize(entry_enc, &entry_len);
+            
+            /* Add as bytes field */
+            tlv_encode_bytes(enc, FIELD_ENTRIES, entry_buf, entry_len);
+            
+            tlv_encoder_free(entry_enc);
+        }
+    }
+    
+    *buffer_out = tlv_encoder_detach(enc, len_out);
+    tlv_encoder_free(enc);
+    
+    return *buffer_out ? DISTRIC_OK : DISTRIC_ERR_NO_MEMORY;
+}
+
+distric_err_t deserialize_raft_append_entries(
+    const uint8_t* buffer,
+    size_t len,
+    raft_append_entries_t* msg_out
+) {
+    if (!buffer || !msg_out || len == 0) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    if (!tlv_validate_buffer(buffer, len)) {
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    memset(msg_out, 0, sizeof(raft_append_entries_t));
+    
+    /* Temporary storage for entries */
+    raft_log_entry_t* entries = NULL;
+    size_t entry_count = 0;
+    size_t entry_capacity = 0;
+    
+    tlv_decoder_t* dec = tlv_decoder_create(buffer, len);
+    if (!dec) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    tlv_field_t field;
+    while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
+        switch (field.tag) {
+            case FIELD_TERM:
+                tlv_field_get_uint32(&field, &msg_out->term);
+                break;
+            
+            case FIELD_LEADER_ID: {
+                const char* str = tlv_field_get_string(&field);
+                if (str) {
+                    strncpy(msg_out->leader_id, str, sizeof(msg_out->leader_id) - 1);
+                }
+                break;
+            }
+            
+            case FIELD_PREV_LOG_INDEX:
+                tlv_field_get_uint32(&field, &msg_out->prev_log_index);
+                break;
+            
+            case FIELD_PREV_LOG_TERM:
+                tlv_field_get_uint32(&field, &msg_out->prev_log_term);
+                break;
+            
+            case FIELD_LEADER_COMMIT:
+                tlv_field_get_uint32(&field, &msg_out->leader_commit);
+                break;
+            
+            case FIELD_ENTRIES: {
+                /* Decode nested entry */
+                size_t entry_data_len;
+                const uint8_t* entry_data = tlv_field_get_bytes(&field, &entry_data_len);
+                
+                if (entry_data) {
+                    /* Grow array if needed */
+                    if (entry_count >= entry_capacity) {
+                        entry_capacity = entry_capacity == 0 ? 4 : entry_capacity * 2;
+                        raft_log_entry_t* new_entries = (raft_log_entry_t*)realloc(
+                            entries, entry_capacity * sizeof(raft_log_entry_t));
+                        if (!new_entries) {
+                            free(entries);
+                            tlv_decoder_free(dec);
+                            return DISTRIC_ERR_NO_MEMORY;
+                        }
+                        entries = new_entries;
+                    }
+                    
+                    /* Decode entry fields */
+                    raft_log_entry_t* entry = &entries[entry_count];
+                    memset(entry, 0, sizeof(raft_log_entry_t));
+                    
+                    tlv_decoder_t* entry_dec = tlv_decoder_create(entry_data, entry_data_len);
+                    tlv_field_t entry_field;
+                    
+                    while (tlv_decode_next(entry_dec, &entry_field) == DISTRIC_OK) {
+                        switch (entry_field.tag) {
+                            case FIELD_ENTRY_INDEX:
+                                tlv_field_get_uint32(&entry_field, &entry->index);
+                                break;
+                            
+                            case FIELD_ENTRY_TERM:
+                                tlv_field_get_uint32(&entry_field, &entry->term);
+                                break;
+                            
+                            case FIELD_ENTRY_TYPE: {
+                                uint32_t type;
+                                tlv_field_get_uint32(&entry_field, &type);
+                                entry->entry_type = (raft_entry_type_t)type;
+                                break;
+                            }
+                            
+                            case FIELD_ENTRY_DATA: {
+                                size_t data_len;
+                                const uint8_t* data = tlv_field_get_bytes(&entry_field, &data_len);
+                                if (data && data_len > 0) {
+                                    entry->data = (uint8_t*)malloc(data_len);
+                                    if (entry->data) {
+                                        memcpy(entry->data, data, data_len);
+                                        entry->data_len = data_len;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    
+                    tlv_decoder_free(entry_dec);
+                    entry_count++;
+                }
+                break;
+            }
+            
+            default:
+                break;
+        }
+    }
+    
+    msg_out->entries = entries;
+    msg_out->entry_count = entry_count;
+    
+    tlv_decoder_free(dec);
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * UTILITY FUNCTIONS (additions)
+ * ========================================================================= */
+
+const char* raft_entry_type_to_string(raft_entry_type_t type) {
+    switch (type) {
+        case RAFT_ENTRY_NORMAL: return "NORMAL";
+        case RAFT_ENTRY_CONFIG: return "CONFIG";
+        case RAFT_ENTRY_NOOP:   return "NOOP";
+        default:                return "UNKNOWN";
+    }
+}
+
+const char* config_change_type_to_string(config_change_type_t type) {
+    switch (type) {
+        case CONFIG_CHANGE_ADD_NODE:    return "ADD_NODE";
+        case CONFIG_CHANGE_REMOVE_NODE: return "REMOVE_NODE";
+        case CONFIG_CHANGE_REPLACE:     return "REPLACE";
+        default:                        return "UNKNOWN";
+    }
+}

@@ -15,7 +15,7 @@
  * │  10     | 2    | Reserved               │
  * │  12     | 4    | Payload Length         │
  * │  16     | 8    | Message ID             │
- * │  24     | 4    | Timestamp (seconds)    │
+ * │  24     | 4    | Timestamp (microsec)   │  <-- UPDATED
  * │  28     | 4    | CRC32                  │
  * └─────────────────────────────────────────┘
  * 
@@ -121,7 +121,7 @@ typedef struct __attribute__((packed)) {
     uint16_t reserved;      /**< Reserved for future use (must be 0) */
     uint32_t payload_len;   /**< Payload length in bytes */
     uint64_t message_id;    /**< Unique message identifier */
-    uint32_t timestamp;     /**< Unix timestamp (seconds since epoch) */
+    uint32_t timestamp_us;  /**< Timestamp in microseconds (lower 32 bits) */
     uint32_t crc32;         /**< CRC32 checksum (header + payload) */
 } message_header_t;
 
@@ -137,7 +137,7 @@ _Static_assert(sizeof(message_header_t) == MESSAGE_HEADER_SIZE,
  * @brief Initialize a message header with defaults
  * 
  * Sets magic, version, and generates a unique message_id.
- * Sets timestamp to current time.
+ * Sets timestamp to current time in microseconds.
  * CRC32 is computed separately via compute_header_crc32().
  * 
  * @param header Pointer to header to initialize

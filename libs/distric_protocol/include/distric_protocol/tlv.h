@@ -104,6 +104,64 @@ typedef struct {
     const uint8_t* value;   /**< Pointer to value data (in original buffer) */
 } tlv_field_t;
 
+/**
+ * @section memory_ownership Memory Ownership Semantics
+ * 
+ * ENCODER:
+ * - tlv_encoder_create() allocates internal buffer (caller must free encoder)
+ * - tlv_encoder_finalize() returns pointer to INTERNAL buffer
+ *   → Valid until encoder is freed or reset
+ *   → Caller does NOT own this memory
+ * - tlv_encoder_detach() returns buffer and transfers ownership to CALLER
+ *   → Caller MUST free() the returned buffer
+ *   → Encoder is reset after detach
+ * 
+ * DECODER:
+ * - tlv_decoder_create() does NOT copy buffer
+ *   → Original buffer must remain valid for decoder lifetime
+ *   → Caller retains ownership of input buffer
+ * - tlv_field_t.value points DIRECTLY into original buffer (zero-copy)
+ *   → Valid only while original buffer exists
+ *   → Do NOT free() field.value
+ * - tlv_decoder_free() only frees decoder struct, NOT the buffer
+ * 
+ * EXAMPLE - Encoder:
+ * @code
+ * tlv_encoder_t* enc = tlv_encoder_create(256);
+ * tlv_encode_uint32(enc, TAG, 42);
+ * 
+ * // Option 1: Use internal buffer (no ownership transfer)
+ * size_t len;
+ * uint8_t* buf = tlv_encoder_finalize(enc, &len);
+ * send(socket, buf, len, 0);  // OK: buffer still owned by encoder
+ * tlv_encoder_free(enc);      // Buffer freed here
+ * 
+ * // Option 2: Detach buffer (ownership transfer)
+ * uint8_t* buf = tlv_encoder_detach(enc, &len);
+ * tlv_encoder_free(enc);      // Safe: buffer already detached
+ * // ...use buf later...
+ * free(buf);                  // Caller must free
+ * @endcode
+ * 
+ * EXAMPLE - Decoder:
+ * @code
+ * uint8_t buffer[1024];
+ * recv(socket, buffer, 1024, 0);
+ * 
+ * tlv_decoder_t* dec = tlv_decoder_create(buffer, 1024);
+ * tlv_field_t field;
+ * 
+ * while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
+ *     const char* str = tlv_field_get_string(&field);
+ *     // str points INTO buffer (zero-copy)
+ *     printf("%s\n", str);  // OK: buffer still valid
+ * }
+ * 
+ * tlv_decoder_free(dec);  // Only frees decoder, NOT buffer
+ * // buffer still valid here
+ * @endcode
+ */
+
 /* ============================================================================
  * TLV ENCODER
  * ========================================================================= */

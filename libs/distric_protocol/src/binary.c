@@ -14,6 +14,7 @@
 #include "distric_protocol/crc32.h"
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include <stdatomic.h>
 #include <arpa/inet.h>  /* htonl, htons, ntohl, ntohs */
 
@@ -42,6 +43,19 @@ static inline uint64_t ntohll(uint64_t value) {
 }
 
 /* ============================================================================
+ * TIMESTAMP HELPERS
+ * ========================================================================= */
+
+/**
+ * @brief Get current timestamp in microseconds
+ */
+static uint64_t get_timestamp_us(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
+/* ============================================================================
  * MESSAGE ID GENERATION
  * ========================================================================= */
 
@@ -55,7 +69,7 @@ static _Atomic uint64_t message_id_counter = 0;
  * to ensure uniqueness even across restarts.
  */
 static uint64_t generate_message_id(void) {
-    uint64_t timestamp = (uint64_t)time(NULL);
+    uint64_t timestamp = get_timestamp_us() / 1000000ULL;  /* Convert to seconds for ID */
     uint64_t counter = atomic_fetch_add(&message_id_counter, 1);
     
     /* Combine: [timestamp:32][counter:32] */
@@ -84,7 +98,11 @@ distric_err_t message_header_init(
     header->reserved = 0;
     header->payload_len = payload_len;
     header->message_id = generate_message_id();
-    header->timestamp = (uint32_t)time(NULL);
+    
+    /* Store lower 32 bits of microsecond timestamp */
+    uint64_t now_us = get_timestamp_us();
+    header->timestamp_us = (uint32_t)(now_us & 0xFFFFFFFF);
+    
     header->crc32 = 0;  /* Computed separately */
     
     return DISTRIC_OK;
@@ -128,8 +146,8 @@ distric_err_t serialize_header(
     /* Offset 16: message_id (8 bytes) */
     buf64[2] = htonll(header->message_id);
     
-    /* Offset 24: timestamp (4 bytes) */
-    buf32[6] = htonl(header->timestamp);
+    /* Offset 24: timestamp_us (4 bytes) */
+    buf32[6] = htonl(header->timestamp_us);
     
     /* Offset 28: crc32 (4 bytes) */
     buf32[7] = htonl(header->crc32);
@@ -157,7 +175,7 @@ distric_err_t deserialize_header(
     header->reserved = ntohs(buf16[5]);
     header->payload_len = ntohl(buf32[3]);
     header->message_id = ntohll(buf64[2]);
-    header->timestamp = ntohl(buf32[6]);
+    header->timestamp_us = ntohl(buf32[6]);
     header->crc32 = ntohl(buf32[7]);
     
     return DISTRIC_OK;

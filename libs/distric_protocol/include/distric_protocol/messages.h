@@ -634,6 +634,202 @@ const char* node_role_to_string(node_role_t role);
  */
 const char* task_status_to_string(task_status_t status);
 
+/* ============================================================================
+ * ADDITIONAL FIELD TAG DEFINITIONS
+ * ========================================================================= */
+
+/* Load metrics (0x0220-0x022F) */
+#define FIELD_CPU_USAGE             0x0220  /**< CPU usage percentage (0-100) */
+#define FIELD_MEMORY_USAGE          0x0221  /**< Memory usage percentage (0-100) */
+
+/* Raft entry typing (0x0114-0x011F) */
+#define FIELD_ENTRY_TYPE            0x0114  /**< Entry type (normal/config) */
+
+/* Configuration change (0x0120-0x012F) */
+#define FIELD_CONFIG_CHANGE_TYPE    0x0120  /**< Config change type */
+#define FIELD_NODE_TO_ADD           0x0121  /**< Node being added */
+#define FIELD_NODE_TO_REMOVE        0x0122  /**< Node being removed */
+#define FIELD_NEW_SERVERS           0x0123  /**< New server list (C_new) */
+#define FIELD_OLD_SERVERS           0x0124  /**< Old server list (C_old) */
+
+/* ============================================================================
+ * RAFT LOG ENTRY TYPES
+ * ========================================================================= */
+
+/**
+ * @brief Raft log entry type
+ */
+typedef enum {
+    RAFT_ENTRY_NORMAL = 0,      /**< Normal application command */
+    RAFT_ENTRY_CONFIG = 1,      /**< Configuration change */
+    RAFT_ENTRY_NOOP = 2         /**< No-op (for leader election) */
+} raft_entry_type_t;
+
+/* ============================================================================
+ * RAFT CONFIGURATION CHANGE
+ * ========================================================================= */
+
+/**
+ * @brief Configuration change type
+ */
+typedef enum {
+    CONFIG_CHANGE_ADD_NODE = 0,     /**< Add single node */
+    CONFIG_CHANGE_REMOVE_NODE = 1,  /**< Remove single node */
+    CONFIG_CHANGE_REPLACE = 2       /**< Joint consensus (C_old,new) */
+} config_change_type_t;
+
+/**
+ * @brief Node information for configuration
+ */
+typedef struct {
+    char node_id[64];           /**< Node identifier */
+    char address[256];          /**< Node address */
+    uint16_t port;              /**< Node port */
+    node_role_t role;           /**< Node role */
+} raft_server_info_t;
+
+/**
+ * @brief Raft configuration change entry
+ * 
+ * Supports REQ-RAFT-005 and REQ-RAFT-006 (dynamic membership).
+ * 
+ * For single-server changes (add/remove):
+ *   - Set type to ADD_NODE or REMOVE_NODE
+ *   - Fill node_info with the node being added/removed
+ * 
+ * For joint consensus (replace entire configuration):
+ *   - Set type to REPLACE
+ *   - Fill old_servers[] and new_servers[]
+ */
+typedef struct {
+    config_change_type_t type;  /**< Change type */
+    
+    /* Single node change */
+    raft_server_info_t node_info;  /**< Node being added/removed */
+    
+    /* Joint consensus (for REPLACE type) */
+    raft_server_info_t* old_servers;  /**< C_old configuration */
+    size_t old_server_count;
+    
+    raft_server_info_t* new_servers;  /**< C_new configuration */
+    size_t new_server_count;
+} raft_configuration_change_t;
+
+/* ============================================================================
+ * UPDATED RAFT LOG ENTRY (with entry type)
+ * ========================================================================= */
+
+/**
+ * @brief Raft log entry (UPDATED with entry_type field)
+ * 
+ * Now includes entry_type to distinguish normal commands from
+ * configuration changes (REQ-RAFT-005).
+ */
+typedef struct {
+    uint32_t index;                 /**< Log entry index */
+    uint32_t term;                  /**< Term when entry was received */
+    raft_entry_type_t entry_type;   /**< Entry type (normal/config/noop) */
+    uint8_t* data;                  /**< Entry data */
+    size_t data_len;                /**< Data length */
+} raft_log_entry_t;
+
+/* ============================================================================
+ * UPDATED GOSSIP NODE INFO (with load metrics)
+ * ========================================================================= */
+
+/**
+ * @brief Node information for gossip (UPDATED with load metrics)
+ * 
+ * Now includes cpu_usage and memory_usage for load-aware task distribution
+ * (REQ-DIST-002).
+ */
+typedef struct {
+    char node_id[64];               /**< Node identifier */
+    char address[256];              /**< IP address or hostname */
+    uint16_t port;                  /**< Port number */
+    node_state_t state;             /**< Node state */
+    node_role_t role;               /**< Node role */
+    uint64_t incarnation;           /**< Incarnation number (for refutation) */
+    
+    /* Load metrics (0-100) */
+    uint8_t cpu_usage;              /**< CPU usage percentage */
+    uint8_t memory_usage;           /**< Memory usage percentage */
+} gossip_node_info_t;
+
+/* ============================================================================
+ * GOSSIP INDIRECT PING (NEW)
+ * ========================================================================= */
+
+/**
+ * @brief Gossip Indirect Ping message
+ * 
+ * Sent when direct ping fails. Asks intermediary to ping target.
+ */
+typedef struct {
+    char sender_id[64];             /**< Original ping sender */
+    char target_id[64];             /**< Target to ping indirectly */
+    uint32_t sequence_number;       /**< Ping sequence number */
+} gossip_indirect_ping_t;
+
+/* ============================================================================
+ * SERIALIZATION FUNCTIONS - RAFT CONFIGURATION CHANGE
+ * ========================================================================= */
+
+/**
+ * @brief Serialize Raft Configuration Change
+ */
+distric_err_t serialize_raft_configuration_change(
+    const raft_configuration_change_t* msg,
+    uint8_t** buffer_out,
+    size_t* len_out
+);
+
+/**
+ * @brief Deserialize Raft Configuration Change
+ */
+distric_err_t deserialize_raft_configuration_change(
+    const uint8_t* buffer,
+    size_t len,
+    raft_configuration_change_t* msg_out
+);
+
+/**
+ * @brief Free Raft Configuration Change (for allocated arrays)
+ */
+void free_raft_configuration_change(raft_configuration_change_t* msg);
+
+/* ============================================================================
+ * SERIALIZATION FUNCTIONS - GOSSIP INDIRECT PING
+ * ========================================================================= */
+
+/**
+ * @brief Serialize Gossip Indirect Ping
+ */
+distric_err_t serialize_gossip_indirect_ping(
+    const gossip_indirect_ping_t* msg,
+    uint8_t** buffer_out,
+    size_t* len_out
+);
+
+/**
+ * @brief Deserialize Gossip Indirect Ping
+ */
+distric_err_t deserialize_gossip_indirect_ping(
+    const uint8_t* buffer,
+    size_t len,
+    gossip_indirect_ping_t* msg_out
+);
+
+/**
+ * @brief Get string representation of entry type
+ */
+const char* raft_entry_type_to_string(raft_entry_type_t type);
+
+/**
+ * @brief Get string representation of config change type
+ */
+const char* config_change_type_to_string(config_change_type_t type);
+
 #ifdef __cplusplus
 }
 #endif

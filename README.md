@@ -1,4 +1,4 @@
-# DistriC 2.0
+# DistriC
 
 **DistriC** is a distributed coordination and task execution platform built for systems that need **strong consistency where it matters**, **fast failure detection**, and **horizontal scalability**.
 

@@ -497,33 +497,288 @@ void test_utility_functions() {
 }
 
 /* ============================================================================
- * MAIN
+ * NEW MESSAGE TESTS
  * ========================================================================= */
 
+void test_gossip_indirect_ping() {
+    TEST_START();
+    
+    gossip_indirect_ping_t msg = {
+        .sequence_number = 456
+    };
+    strncpy(msg.sender_id, "node-1", sizeof(msg.sender_id) - 1);
+    strncpy(msg.target_id, "node-3", sizeof(msg.target_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_gossip_indirect_ping(&msg, &buffer, &len));
+    
+    gossip_indirect_ping_t decoded;
+    ASSERT_OK(deserialize_gossip_indirect_ping(buffer, len, &decoded));
+    
+    ASSERT_STR_EQ(decoded.sender_id, "node-1");
+    ASSERT_STR_EQ(decoded.target_id, "node-3");
+    ASSERT_EQ(decoded.sequence_number, 456);
+    
+    free(buffer);
+    TEST_PASS();
+}
+
+void test_gossip_membership_with_load_metrics() {
+    TEST_START();
+    
+    gossip_node_info_t updates[2];
+    
+    strncpy(updates[0].node_id, "worker-1", sizeof(updates[0].node_id) - 1);
+    strncpy(updates[0].address, "10.0.2.1", sizeof(updates[0].address) - 1);
+    updates[0].port = 9001;
+    updates[0].state = NODE_STATE_ALIVE;
+    updates[0].role = NODE_ROLE_WORKER;
+    updates[0].incarnation = 100;
+    updates[0].cpu_usage = 45;      /* 45% CPU */
+    updates[0].memory_usage = 67;   /* 67% memory */
+    
+    strncpy(updates[1].node_id, "worker-2", sizeof(updates[1].node_id) - 1);
+    strncpy(updates[1].address, "10.0.2.2", sizeof(updates[1].address) - 1);
+    updates[1].port = 9001;
+    updates[1].state = NODE_STATE_ALIVE;
+    updates[1].role = NODE_ROLE_WORKER;
+    updates[1].incarnation = 101;
+    updates[1].cpu_usage = 12;      /* 12% CPU */
+    updates[1].memory_usage = 34;   /* 34% memory */
+    
+    gossip_membership_update_t msg = {
+        .updates = updates,
+        .update_count = 2
+    };
+    strncpy(msg.sender_id, "coordinator-1", sizeof(msg.sender_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_gossip_membership_update(&msg, &buffer, &len));
+    
+    gossip_membership_update_t decoded;
+    ASSERT_OK(deserialize_gossip_membership_update(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.update_count, 2);
+    
+    /* Verify first worker */
+    ASSERT_STR_EQ(decoded.updates[0].node_id, "worker-1");
+    ASSERT_EQ(decoded.updates[0].cpu_usage, 45);
+    ASSERT_EQ(decoded.updates[0].memory_usage, 67);
+    
+    /* Verify second worker */
+    ASSERT_STR_EQ(decoded.updates[1].node_id, "worker-2");
+    ASSERT_EQ(decoded.updates[1].cpu_usage, 12);
+    ASSERT_EQ(decoded.updates[1].memory_usage, 34);
+    
+    printf("  Load metrics: worker-1 (CPU=%u%%, MEM=%u%%), worker-2 (CPU=%u%%, MEM=%u%%)\n",
+           decoded.updates[0].cpu_usage, decoded.updates[0].memory_usage,
+           decoded.updates[1].cpu_usage, decoded.updates[1].memory_usage);
+    
+    free_gossip_membership_update(&decoded);
+    free(buffer);
+    TEST_PASS();
+}
+
+void test_raft_configuration_change_add_node() {
+    TEST_START();
+    
+    raft_configuration_change_t msg = {
+        .type = CONFIG_CHANGE_ADD_NODE
+    };
+    strncpy(msg.node_info.node_id, "coordinator-4", sizeof(msg.node_info.node_id) - 1);
+    strncpy(msg.node_info.address, "10.0.1.4", sizeof(msg.node_info.address) - 1);
+    msg.node_info.port = 9000;
+    msg.node_info.role = NODE_ROLE_COORDINATOR;
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_configuration_change(&msg, &buffer, &len));
+    
+    raft_configuration_change_t decoded;
+    ASSERT_OK(deserialize_raft_configuration_change(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.type, CONFIG_CHANGE_ADD_NODE);
+    ASSERT_STR_EQ(decoded.node_info.node_id, "coordinator-4");
+    ASSERT_STR_EQ(decoded.node_info.address, "10.0.1.4");
+    ASSERT_EQ(decoded.node_info.port, 9000);
+    ASSERT_EQ(decoded.node_info.role, NODE_ROLE_COORDINATOR);
+    
+    free_raft_configuration_change(&decoded);
+    free(buffer);
+    TEST_PASS();
+}
+
+void test_raft_configuration_change_joint_consensus() {
+    TEST_START();
+    
+    /* Old configuration: 3 coordinators */
+    raft_server_info_t old_servers[3];
+    strncpy(old_servers[0].node_id, "coord-1", sizeof(old_servers[0].node_id) - 1);
+    strncpy(old_servers[0].address, "10.0.1.1", sizeof(old_servers[0].address) - 1);
+    old_servers[0].port = 9000;
+    old_servers[0].role = NODE_ROLE_COORDINATOR;
+    
+    strncpy(old_servers[1].node_id, "coord-2", sizeof(old_servers[1].node_id) - 1);
+    strncpy(old_servers[1].address, "10.0.1.2", sizeof(old_servers[1].address) - 1);
+    old_servers[1].port = 9000;
+    old_servers[1].role = NODE_ROLE_COORDINATOR;
+    
+    strncpy(old_servers[2].node_id, "coord-3", sizeof(old_servers[2].node_id) - 1);
+    strncpy(old_servers[2].address, "10.0.1.3", sizeof(old_servers[2].address) - 1);
+    old_servers[2].port = 9000;
+    old_servers[2].role = NODE_ROLE_COORDINATOR;
+    
+    /* New configuration: 5 coordinators (replace coord-1 with coord-4 and coord-5) */
+    raft_server_info_t new_servers[5];
+    memcpy(&new_servers[0], &old_servers[1], sizeof(raft_server_info_t));
+    memcpy(&new_servers[1], &old_servers[2], sizeof(raft_server_info_t));
+    
+    strncpy(new_servers[2].node_id, "coord-4", sizeof(new_servers[2].node_id) - 1);
+    strncpy(new_servers[2].address, "10.0.1.4", sizeof(new_servers[2].address) - 1);
+    new_servers[2].port = 9000;
+    new_servers[2].role = NODE_ROLE_COORDINATOR;
+    
+    strncpy(new_servers[3].node_id, "coord-5", sizeof(new_servers[3].node_id) - 1);
+    strncpy(new_servers[3].address, "10.0.1.5", sizeof(new_servers[3].address) - 1);
+    new_servers[3].port = 9000;
+    new_servers[3].role = NODE_ROLE_COORDINATOR;
+    
+    strncpy(new_servers[4].node_id, "coord-6", sizeof(new_servers[4].node_id) - 1);
+    strncpy(new_servers[4].address, "10.0.1.6", sizeof(new_servers[4].address) - 1);
+    new_servers[4].port = 9000;
+    new_servers[4].role = NODE_ROLE_COORDINATOR;
+    
+    raft_configuration_change_t msg = {
+        .type = CONFIG_CHANGE_REPLACE,
+        .old_servers = old_servers,
+        .old_server_count = 3,
+        .new_servers = new_servers,
+        .new_server_count = 5
+    };
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_configuration_change(&msg, &buffer, &len));
+    
+    printf("  Joint consensus size: %zu bytes\n", len);
+    
+    raft_configuration_change_t decoded;
+    ASSERT_OK(deserialize_raft_configuration_change(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.type, CONFIG_CHANGE_REPLACE);
+    ASSERT_EQ(decoded.old_server_count, 3);
+    ASSERT_EQ(decoded.new_server_count, 5);
+    
+    /* Verify old servers */
+    ASSERT_STR_EQ(decoded.old_servers[0].node_id, "coord-1");
+    ASSERT_STR_EQ(decoded.old_servers[1].node_id, "coord-2");
+    ASSERT_STR_EQ(decoded.old_servers[2].node_id, "coord-3");
+    
+    /* Verify new servers */
+    ASSERT_STR_EQ(decoded.new_servers[2].node_id, "coord-4");
+    ASSERT_STR_EQ(decoded.new_servers[3].node_id, "coord-5");
+    ASSERT_STR_EQ(decoded.new_servers[4].node_id, "coord-6");
+    
+    printf("  Joint consensus: C_old (3 nodes) → C_new (5 nodes)\n");
+    
+    free_raft_configuration_change(&decoded);
+    free(buffer);
+    TEST_PASS();
+}
+
+void test_raft_append_entries_with_entry_type() {
+    TEST_START();
+    
+    /* Create log entries with different types */
+    raft_log_entry_t entries[3];
+    
+    /* Normal command */
+    entries[0].index = 100;
+    entries[0].term = 5;
+    entries[0].entry_type = RAFT_ENTRY_NORMAL;
+    entries[0].data = (uint8_t*)"SET key=value";
+    entries[0].data_len = 13;
+    
+    /* Configuration change */
+    entries[1].index = 101;
+    entries[1].term = 5;
+    entries[1].entry_type = RAFT_ENTRY_CONFIG;
+    entries[1].data = (uint8_t*)"ADD coord-4";
+    entries[1].data_len = 11;
+    
+    /* No-op */
+    entries[2].index = 102;
+    entries[2].term = 6;
+    entries[2].entry_type = RAFT_ENTRY_NOOP;
+    entries[2].data = NULL;
+    entries[2].data_len = 0;
+    
+    raft_append_entries_t msg = {
+        .term = 6,
+        .prev_log_index = 99,
+        .prev_log_term = 5,
+        .leader_commit = 95,
+        .entries = entries,
+        .entry_count = 3
+    };
+    strncpy(msg.leader_id, "leader-1", sizeof(msg.leader_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_append_entries(&msg, &buffer, &len));
+    
+    raft_append_entries_t decoded;
+    ASSERT_OK(deserialize_raft_append_entries(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.entry_count, 3);
+    
+    /* Verify entry types */
+    ASSERT_EQ(decoded.entries[0].entry_type, RAFT_ENTRY_NORMAL);
+    ASSERT_EQ(decoded.entries[1].entry_type, RAFT_ENTRY_CONFIG);
+    ASSERT_EQ(decoded.entries[2].entry_type, RAFT_ENTRY_NOOP);
+    
+    printf("  Entry types: %s, %s, %s\n",
+           raft_entry_type_to_string(decoded.entries[0].entry_type),
+           raft_entry_type_to_string(decoded.entries[1].entry_type),
+           raft_entry_type_to_string(decoded.entries[2].entry_type));
+    
+    free_raft_append_entries(&decoded);
+    free(buffer);
+    TEST_PASS();
+}
+
+/* ============================================================================
+ * MAIN
+ * ========================================================================= */
 int main(void) {
     printf("=== DistriC Protocol - Message Serialization Tests ===\n");
     
-    /* Raft messages */
+    /* Existing tests... */
     test_raft_request_vote();
     test_raft_request_vote_response();
     test_raft_append_entries_empty();
     test_raft_append_entries_with_entries();
     
-    /* Gossip messages */
     test_gossip_ping();
     test_gossip_ack();
     test_gossip_membership_update();
     
-    /* Task messages */
     test_task_assignment();
     test_task_result();
     
-    /* Client messages */
     test_client_submit();
     test_client_response();
     
-    /* Utilities */
     test_utility_functions();
+    
+    /* NEW TESTS */
+    test_gossip_indirect_ping();
+    test_gossip_membership_with_load_metrics();
+    test_raft_configuration_change_add_node();
+    test_raft_configuration_change_joint_consensus();
+    test_raft_append_entries_with_entry_type();
     
     printf("\n=== Test Results ===\n");
     printf("Passed: %d\n", tests_passed);
@@ -531,13 +786,8 @@ int main(void) {
     
     if (tests_failed == 0) {
         printf("\n✓ All message serialization tests passed!\n");
-        printf("✓ Session 2.3 COMPLETE - Ready for Session 2.4 (RPC Framework)\n");
-        printf("\nMessage Types Tested:\n");
-        printf("  - Raft: RequestVote, AppendEntries (with/without entries)\n");
-        printf("  - Gossip: Ping, Ack, MembershipUpdate\n");
-        printf("  - Task: Assignment, Result\n");
-        printf("  - Client: Submit, Response\n");
-        printf("\nAll messages use TLV encoding for forward compatibility!\n");
+        printf("✓ NEW: Indirect ping, load metrics, config changes, entry typing\n");
+        printf("✓ Phase 2 improvements COMPLETE - Ready for Phase 3 (Consensus)\n");
     }
     
     return tests_failed > 0 ? 1 : 0;

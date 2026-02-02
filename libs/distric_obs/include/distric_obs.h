@@ -42,6 +42,10 @@ typedef enum {
     DISTRIC_ERR_REGISTRY_FULL = -4,
     DISTRIC_ERR_NOT_FOUND = -5,
     DISTRIC_ERR_INIT_FAILED = -6,
+    DISTRIC_ERR_NO_MEMORY = -7,           
+    DISTRIC_ERR_EOF = -8,                 
+    DISTRIC_ERR_INVALID_FORMAT = -9,      
+    DISTRIC_ERR_TYPE_MISMATCH = -10        
 } distric_err_t;
 
 const char* distric_strerror(distric_err_t err);
