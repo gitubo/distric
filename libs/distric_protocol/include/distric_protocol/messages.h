@@ -636,6 +636,143 @@ const char* task_status_to_string(task_status_t status);
 const char* raft_entry_type_to_string(raft_entry_type_t type);
 const char* config_change_type_to_string(config_change_type_t type);
 
+/* ============================================================================
+ * Raft Wire Format - Protocol-Level Types
+ * ========================================================================= */
+
+/* Wire format for log entry - neutral serialization format */
+typedef struct {
+    uint32_t term;
+    uint32_t index;
+    uint8_t entry_type;  // 0=command, 1=config, 2=noop
+    uint8_t* data;
+    size_t data_len;
+} raft_log_entry_wire_t;
+
+/* Raft Message Structures */
+
+typedef struct {
+    uint32_t term;
+    char candidate_id[64];
+    uint32_t last_log_index;
+    uint32_t last_log_term;
+} raft_request_vote_t;
+
+typedef struct {
+    uint32_t term;
+    bool vote_granted;
+} raft_request_vote_response_t;
+
+typedef struct {
+    uint32_t term;
+    char leader_id[64];
+    uint32_t prev_log_index;
+    uint32_t prev_log_term;
+    raft_log_entry_wire_t* entries;  // Wire format, NOT internal format
+    size_t entry_count;
+    uint32_t leader_commit;
+} raft_append_entries_t;
+
+typedef struct {
+    uint32_t term;
+    bool success;
+    uint32_t match_index;
+} raft_append_entries_response_t;
+
+typedef struct {
+    uint32_t term;
+    char leader_id[64];
+    uint32_t last_included_index;
+    uint32_t last_included_term;
+    uint8_t* data;
+    size_t data_len;
+} raft_install_snapshot_t;
+
+typedef struct {
+    uint32_t term;
+    bool success;
+} raft_install_snapshot_response_t;
+
+/* Serialization Functions */
+
+distric_err_t serialize_raft_request_vote(
+    const raft_request_vote_t* req,
+    uint8_t** buffer_out,
+    size_t* len_out
+);
+
+distric_err_t deserialize_raft_request_vote(
+    const uint8_t* buffer,
+    size_t len,
+    raft_request_vote_t* req_out
+);
+
+distric_err_t serialize_raft_request_vote_response(
+    const raft_request_vote_response_t* resp,
+    uint8_t** buffer_out,
+    size_t* len_out
+);
+
+distric_err_t deserialize_raft_request_vote_response(
+    const uint8_t* buffer,
+    size_t len,
+    raft_request_vote_response_t* resp_out
+);
+
+distric_err_t serialize_raft_append_entries(
+    const raft_append_entries_t* req,
+    uint8_t** buffer_out,
+    size_t* len_out
+);
+
+distric_err_t deserialize_raft_append_entries(
+    const uint8_t* buffer,
+    size_t len,
+    raft_append_entries_t* req_out
+);
+
+distric_err_t serialize_raft_append_entries_response(
+    const raft_append_entries_response_t* resp,
+    uint8_t** buffer_out,
+    size_t* len_out
+);
+
+distric_err_t deserialize_raft_append_entries_response(
+    const uint8_t* buffer,
+    size_t len,
+    raft_append_entries_response_t* resp_out
+);
+
+distric_err_t serialize_raft_install_snapshot(
+    const raft_install_snapshot_t* req,
+    uint8_t** buffer_out,
+    size_t* len_out
+);
+
+distric_err_t deserialize_raft_install_snapshot(
+    const uint8_t* buffer,
+    size_t len,
+    raft_install_snapshot_t* req_out
+);
+
+distric_err_t serialize_raft_install_snapshot_response(
+    const raft_install_snapshot_response_t* resp,
+    uint8_t** buffer_out,
+    size_t* len_out
+);
+
+distric_err_t deserialize_raft_install_snapshot_response(
+    const uint8_t* buffer,
+    size_t len,
+    raft_install_snapshot_response_t* resp_out
+);
+
+/* Cleanup Functions */
+
+void free_raft_request_vote(raft_request_vote_t* req);
+void free_raft_append_entries(raft_append_entries_t* req);
+void free_raft_install_snapshot(raft_install_snapshot_t* req);
+
 #ifdef __cplusplus
 }
 #endif

@@ -78,6 +78,8 @@ extern "C" {
 #include "distric_raft/raft_core.h"
 /** @} */
 
+#include "distric_raft/raft_rpc.h"
+
 /* Future modules will be added here:
  * - raft_persistence: Durable storage for log and state
  * - raft_snapshot: Log compaction

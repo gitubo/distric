@@ -757,3 +757,155 @@ const char* raft_state_to_string(raft_state_t state) {
         default:                   return "UNKNOWN";
     }
 }
+
+/* ============================================================================
+ * RPC HELPER FUNCTIONS (Add to end of raft_core.c)
+ * ========================================================================= */
+
+const raft_config_t* raft_get_config(const raft_node_t* node) {
+    return node ? &node->config : NULL;
+}
+
+const char* raft_get_node_id(const raft_node_t* node) {
+    return node ? node->config.node_id : "";
+}
+
+uint32_t raft_get_last_log_term(const raft_node_t* node) {
+    if (!node) return 0;
+    
+    pthread_rwlock_rdlock((pthread_rwlock_t*)&node->lock);
+    uint32_t term = log_last_term(&node->log);
+    pthread_rwlock_unlock((pthread_rwlock_t*)&node->lock);
+    
+    return term;
+}
+
+uint32_t raft_get_log_term(const raft_node_t* node, uint32_t index) {
+    if (!node) return 0;
+    
+    pthread_rwlock_rdlock((pthread_rwlock_t*)&node->lock);
+    
+    raft_log_entry_t* entry = log_get(&node->log, index);
+    uint32_t term = entry ? entry->term : 0;
+    
+    pthread_rwlock_unlock((pthread_rwlock_t*)&node->lock);
+    
+    return term;
+}
+
+distric_err_t raft_get_log_entries(
+    const raft_node_t* node,
+    uint32_t start_index,
+    uint32_t end_index,
+    raft_log_entry_t** entries_out,
+    size_t* count_out
+) {
+    if (!node || !entries_out || !count_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    pthread_rwlock_rdlock((pthread_rwlock_t*)&node->lock);
+    
+    size_t count = (end_index > start_index) ? (end_index - start_index) : 0;
+    if (count == 0) {
+        *entries_out = NULL;
+        *count_out = 0;
+        pthread_rwlock_unlock((pthread_rwlock_t*)&node->lock);
+        return DISTRIC_OK;
+    }
+    
+    raft_log_entry_t* entries = (raft_log_entry_t*)calloc(count, sizeof(raft_log_entry_t));
+    if (!entries) {
+        pthread_rwlock_unlock((pthread_rwlock_t*)&node->lock);
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    size_t actual_count = 0;
+    for (uint32_t i = start_index; i < end_index; i++) {
+        raft_log_entry_t* entry = log_get(&node->log, i);
+        if (entry) {
+            entries[actual_count] = *entry;
+            
+            /* Copy data */
+            if (entry->data && entry->data_len > 0) {
+                entries[actual_count].data = (uint8_t*)malloc(entry->data_len);
+                if (entries[actual_count].data) {
+                    memcpy(entries[actual_count].data, entry->data, entry->data_len);
+                }
+            }
+            
+            actual_count++;
+        }
+    }
+    
+    pthread_rwlock_unlock((pthread_rwlock_t*)&node->lock);
+    
+    *entries_out = entries;
+    *count_out = actual_count;
+    
+    return DISTRIC_OK;
+}
+
+uint32_t raft_get_peer_next_index(const raft_node_t* node, size_t peer_index) {
+    if (!node || peer_index >= node->config.peer_count) {
+        return 0;
+    }
+    
+    pthread_rwlock_rdlock((pthread_rwlock_t*)&node->lock);
+    uint32_t next_index = node->next_index[peer_index];
+    pthread_rwlock_unlock((pthread_rwlock_t*)&node->lock);
+    
+    return next_index;
+}
+
+distric_err_t raft_update_peer_indices(
+    raft_node_t* node,
+    size_t peer_index,
+    uint32_t next_index,
+    uint32_t match_index
+) {
+    if (!node || peer_index >= node->config.peer_count) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    pthread_rwlock_wrlock(&node->lock);
+    
+    node->next_index[peer_index] = next_index;
+    node->match_index[peer_index] = match_index;
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    return DISTRIC_OK;
+}
+
+distric_err_t raft_decrement_peer_next_index(raft_node_t* node, size_t peer_index) {
+    if (!node || peer_index >= node->config.peer_count) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    pthread_rwlock_wrlock(&node->lock);
+    
+    if (node->next_index[peer_index] > 1) {
+        node->next_index[peer_index]--;
+    }
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    return DISTRIC_OK;
+}
+
+distric_err_t raft_step_down(raft_node_t* node, uint32_t term) {
+    if (!node) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    pthread_rwlock_wrlock(&node->lock);
+    
+    if (term > node->current_term) {
+        transition_to_follower(node, term);
+    }
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    return DISTRIC_OK;
+}

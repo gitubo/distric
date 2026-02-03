@@ -17,6 +17,7 @@ find_package(Threads REQUIRED)
 # Source files
 set(RAFT_SOURCES
     src/raft_core.c
+    src/raft_rpc.c
 )
 
 # Create library

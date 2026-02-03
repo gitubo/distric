@@ -132,118 +132,27 @@ struct raft_config {
  * RAFT NODE API
  * ========================================================================= */
 
-/**
- * @brief Create a new Raft node
- * 
- * @param config Raft configuration
- * @param node_out Output: created node
- * @return DISTRIC_OK on success
- */
 distric_err_t raft_create(const raft_config_t* config, raft_node_t** node_out);
-
-/**
- * @brief Destroy Raft node and free all resources
- * 
- * @param node Raft node
- */
 void raft_destroy(raft_node_t* node);
-
-/**
- * @brief Start Raft node (begin election timer)
- * 
- * @param node Raft node
- * @return DISTRIC_OK on success
- */
 distric_err_t raft_start(raft_node_t* node);
-
-/**
- * @brief Stop Raft node gracefully
- * 
- * @param node Raft node
- * @return DISTRIC_OK on success
- */
 distric_err_t raft_stop(raft_node_t* node);
-
-/**
- * @brief Periodic tick (drives timers and heartbeats)
- * 
- * Should be called at regular intervals (e.g., every 10ms).
- * Handles election timeouts, heartbeats, and log replication.
- * 
- * @param node Raft node
- * @return DISTRIC_OK on success
- */
 distric_err_t raft_tick(raft_node_t* node);
 
 /* ============================================================================
  * STATE QUERIES
  * ========================================================================= */
 
-/**
- * @brief Get current Raft state
- * 
- * @param node Raft node
- * @return Current state (FOLLOWER/CANDIDATE/LEADER)
- */
 raft_state_t raft_get_state(const raft_node_t* node);
-
-/**
- * @brief Check if this node is the leader
- * 
- * @param node Raft node
- * @return true if leader
- */
 bool raft_is_leader(const raft_node_t* node);
-
-/**
- * @brief Get current term
- * 
- * @param node Raft node
- * @return Current term
- */
 uint32_t raft_get_term(const raft_node_t* node);
-
-/**
- * @brief Get current leader ID
- * 
- * @param node Raft node
- * @param leader_id_out Output buffer for leader ID (64 bytes)
- * @return DISTRIC_OK if leader is known, DISTRIC_ERR_NOT_FOUND otherwise
- */
 distric_err_t raft_get_leader(const raft_node_t* node, char* leader_id_out);
-
-/**
- * @brief Get commit index
- * 
- * @param node Raft node
- * @return Commit index
- */
 uint32_t raft_get_commit_index(const raft_node_t* node);
-
-/**
- * @brief Get last log index
- * 
- * @param node Raft node
- * @return Last log index (0 if empty)
- */
 uint32_t raft_get_last_log_index(const raft_node_t* node);
 
 /* ============================================================================
  * LOG OPERATIONS (Leader Only)
  * ========================================================================= */
 
-/**
- * @brief Append entry to log (leader only)
- * 
- * The entry is appended to the local log and will be replicated
- * to followers. The entry is committed when replicated to a majority.
- * 
- * @param node Raft node (must be leader)
- * @param data Entry data (will be copied)
- * @param data_len Data length
- * @param index_out Output: index of appended entry
- * @return DISTRIC_OK on success, DISTRIC_ERR_NOT_FOUND if not leader
- */
 distric_err_t raft_append_entry(
     raft_node_t* node,
     const uint8_t* data,
@@ -251,16 +160,6 @@ distric_err_t raft_append_entry(
     uint32_t* index_out
 );
 
-/**
- * @brief Wait for entry to be committed
- * 
- * Blocks until the entry at the given index is committed or timeout expires.
- * 
- * @param node Raft node
- * @param index Log index to wait for
- * @param timeout_ms Timeout in milliseconds (0 = no wait)
- * @return DISTRIC_OK if committed, DISTRIC_ERR_TIMEOUT if timeout
- */
 distric_err_t raft_wait_committed(
     raft_node_t* node,
     uint32_t index,
@@ -271,18 +170,6 @@ distric_err_t raft_wait_committed(
  * RPC HANDLERS (Called by network layer)
  * ========================================================================= */
 
-/**
- * @brief Handle RequestVote RPC
- * 
- * @param node Raft node
- * @param candidate_id Candidate's node ID
- * @param term Candidate's term
- * @param last_log_index Candidate's last log index
- * @param last_log_term Candidate's last log term
- * @param vote_granted_out Output: vote granted
- * @param term_out Output: current term
- * @return DISTRIC_OK on success
- */
 distric_err_t raft_handle_request_vote(
     raft_node_t* node,
     const char* candidate_id,
@@ -293,22 +180,6 @@ distric_err_t raft_handle_request_vote(
     uint32_t* term_out
 );
 
-/**
- * @brief Handle AppendEntries RPC
- * 
- * @param node Raft node
- * @param leader_id Leader's node ID
- * @param term Leader's term
- * @param prev_log_index Previous log index
- * @param prev_log_term Previous log term
- * @param entries Log entries (NULL for heartbeat)
- * @param entry_count Number of entries
- * @param leader_commit Leader's commit index
- * @param success_out Output: true if follower contained matching prev_log
- * @param term_out Output: current term
- * @param last_log_index_out Output: follower's last log index
- * @return DISTRIC_OK on success
- */
 distric_err_t raft_handle_append_entries(
     raft_node_t* node,
     const char* leader_id,
@@ -327,30 +198,12 @@ distric_err_t raft_handle_append_entries(
  * SNAPSHOT API
  * ========================================================================= */
 
-/**
- * @brief Create snapshot of current state
- * 
- * @param node Raft node
- * @param snapshot_data Snapshot data
- * @param snapshot_len Snapshot length
- * @return DISTRIC_OK on success
- */
 distric_err_t raft_create_snapshot(
     raft_node_t* node,
     const uint8_t* snapshot_data,
     size_t snapshot_len
 );
 
-/**
- * @brief Install snapshot (received from leader)
- * 
- * @param node Raft node
- * @param last_included_index Last index in snapshot
- * @param last_included_term Last term in snapshot
- * @param snapshot_data Snapshot data
- * @param snapshot_len Snapshot length
- * @return DISTRIC_OK on success
- */
 distric_err_t raft_install_snapshot(
     raft_node_t* node,
     uint32_t last_included_index,
@@ -363,13 +216,36 @@ distric_err_t raft_install_snapshot(
  * UTILITY FUNCTIONS
  * ========================================================================= */
 
-/**
- * @brief Get string representation of Raft state
- * 
- * @param state Raft state
- * @return State string ("FOLLOWER"/"CANDIDATE"/"LEADER")
- */
 const char* raft_state_to_string(raft_state_t state);
+
+/* ============================================================================
+ * RPC HELPER FUNCTIONS (Added in Session 3.2)
+ * ========================================================================= */
+
+const raft_config_t* raft_get_config(const raft_node_t* node);
+const char* raft_get_node_id(const raft_node_t* node);
+uint32_t raft_get_last_log_term(const raft_node_t* node);
+uint32_t raft_get_log_term(const raft_node_t* node, uint32_t index);
+
+distric_err_t raft_get_log_entries(
+    const raft_node_t* node,
+    uint32_t start_index,
+    uint32_t end_index,
+    raft_log_entry_t** entries_out,
+    size_t* count_out
+);
+
+uint32_t raft_get_peer_next_index(const raft_node_t* node, size_t peer_index);
+
+distric_err_t raft_update_peer_indices(
+    raft_node_t* node,
+    size_t peer_index,
+    uint32_t next_index,
+    uint32_t match_index
+);
+
+distric_err_t raft_decrement_peer_next_index(raft_node_t* node, size_t peer_index);
+distric_err_t raft_step_down(raft_node_t* node, uint32_t term);
 
 #ifdef __cplusplus
 }
