@@ -1,16 +1,19 @@
 /**
  * @file messages.h
- * @brief Protocol Message Definitions
+ * @brief Protocol Message Definitions - Wire Format Only
+ * 
+ * IMPORTANT: This file defines WIRE FORMATS for network transmission.
+ * It does NOT define internal application data structures.
  * 
  * Defines all message structures used in the DistriC protocol:
- * - Raft consensus messages
+ * - Raft consensus messages (wire format)
  * - Gossip protocol messages
  * - Task execution messages
  * - Client API messages
  * 
  * Each message type has:
  * - Field tag constants
- * - C struct definition
+ * - C struct definition (WIRE FORMAT)
  * - Serialization function
  * - Deserialization function
  * - Free function (if needed)
@@ -121,33 +124,11 @@ extern "C" {
 #define FIELD_QUERY_PARAMS          0x040A  /**< Query parameters */
 
 /* ============================================================================
- * RAFT ENTRY TYPES
+ * WIRE FORMAT ENUMS - Protocol Level Only
  * ========================================================================= */
 
 /**
- * @brief Raft log entry type
- */
-typedef enum {
-    RAFT_ENTRY_NORMAL = 0,      /**< Normal application command */
-    RAFT_ENTRY_CONFIG = 1,      /**< Configuration change */
-    RAFT_ENTRY_NOOP = 2         /**< No-op (for leader election) */
-} raft_entry_type_t;
-
-/* ============================================================================
- * RAFT CONFIGURATION CHANGE
- * ========================================================================= */
-
-/**
- * @brief Configuration change type
- */
-typedef enum {
-    CONFIG_CHANGE_ADD_NODE = 0,     /**< Add single node */
-    CONFIG_CHANGE_REMOVE_NODE = 1,  /**< Remove single node */
-    CONFIG_CHANGE_REPLACE = 2       /**< Joint consensus (C_old,new) */
-} config_change_type_t;
-
-/**
- * @brief Node state in gossip protocol
+ * @brief Node state in gossip protocol (wire format)
  */
 typedef enum {
     NODE_STATE_ALIVE = 0,
@@ -157,7 +138,7 @@ typedef enum {
 } node_state_t;
 
 /**
- * @brief Node role
+ * @brief Node role (wire format)
  */
 typedef enum {
     NODE_ROLE_COORDINATOR = 0,
@@ -165,7 +146,7 @@ typedef enum {
 } node_role_t;
 
 /**
- * @brief Task status
+ * @brief Task status (wire format)
  */
 typedef enum {
     TASK_STATUS_PENDING = 0,
@@ -176,272 +157,249 @@ typedef enum {
     TASK_STATUS_CANCELLED = 5
 } task_status_t;
 
+/**
+ * @brief Configuration change type (wire format)
+ */
+typedef enum {
+    CONFIG_CHANGE_ADD_NODE = 0,
+    CONFIG_CHANGE_REMOVE_NODE = 1,
+    CONFIG_CHANGE_REPLACE = 2
+} config_change_type_t;
+
+/**
+ * @brief Raft entry type (wire format)
+ */
+typedef enum {
+    RAFT_ENTRY_NORMAL = 0,
+    RAFT_ENTRY_CONFIG = 1,
+    RAFT_ENTRY_NOOP = 2
+} raft_entry_type_t;
+
 /* ============================================================================
- * RAFT MESSAGE STRUCTURES
+ * RAFT WIRE FORMAT MESSAGES
+ * 
+ * These are PURE WIRE FORMATS for network transmission.
+ * They use uint8_t for entry_type to ensure unambiguous serialization.
+ * Applications should convert to/from their internal types.
  * ========================================================================= */
 
 /**
- * @brief Raft RequestVote RPC
+ * @brief Raft log entry - WIRE FORMAT ONLY
  * 
- * Sent by candidates to gather votes during leader election.
+ * This is the protocol-level representation.
+ * Applications (like distric_raft) maintain their own internal types.
  */
 typedef struct {
-    uint32_t term;                  /**< Candidate's term */
-    char candidate_id[64];          /**< Candidate requesting vote */
-    uint32_t last_log_index;        /**< Index of candidate's last log entry */
-    uint32_t last_log_term;         /**< Term of candidate's last log entry */
+    uint32_t term;              /**< Entry term */
+    uint32_t index;             /**< Entry index */
+    uint8_t entry_type;         /**< Entry type: 0=normal, 1=config, 2=noop */
+    uint8_t* data;              /**< Entry data */
+    size_t data_len;            /**< Data length */
+} raft_log_entry_wire_t;
+
+/**
+ * @brief Raft RequestVote RPC - WIRE FORMAT
+ */
+typedef struct {
+    uint32_t term;
+    char candidate_id[64];
+    uint32_t last_log_index;
+    uint32_t last_log_term;
 } raft_request_vote_t;
 
 /**
- * @brief Raft RequestVote Response
+ * @brief Raft RequestVote Response - WIRE FORMAT
  */
 typedef struct {
-    uint32_t term;                  /**< Current term, for candidate to update itself */
-    bool vote_granted;              /**< True if candidate received vote */
-    char node_id[64];               /**< Responder's node ID */
+    uint32_t term;
+    bool vote_granted;
+    char node_id[64];
 } raft_request_vote_response_t;
 
 /**
- * @brief Raft log entry (with entry_type field)
+ * @brief Raft AppendEntries RPC - WIRE FORMAT
  */
 typedef struct {
-    uint32_t index;                 /**< Log entry index */
-    uint32_t term;                  /**< Term when entry was received */
-    raft_entry_type_t entry_type;   /**< Entry type (normal/config/noop) */
-    uint8_t* data;                  /**< Entry data */
-    size_t data_len;                /**< Data length */
-} raft_log_entry_t;
-
-/**
- * @brief Raft AppendEntries RPC
- * 
- * Sent by leader to replicate log entries and heartbeat.
- */
-typedef struct {
-    uint32_t term;                  /**< Leader's term */
-    char leader_id[64];             /**< Leader's ID */
-    uint32_t prev_log_index;        /**< Index of log entry preceding new ones */
-    uint32_t prev_log_term;         /**< Term of prev_log_index entry */
-    raft_log_entry_t* entries;      /**< Log entries to store (NULL for heartbeat) */
-    size_t entry_count;             /**< Number of entries */
-    uint32_t leader_commit;         /**< Leader's commit index */
+    uint32_t term;
+    char leader_id[64];
+    uint32_t prev_log_index;
+    uint32_t prev_log_term;
+    raft_log_entry_wire_t* entries;  /**< WIRE FORMAT entries */
+    size_t entry_count;
+    uint32_t leader_commit;
 } raft_append_entries_t;
 
 /**
- * @brief Raft AppendEntries Response
+ * @brief Raft AppendEntries Response - WIRE FORMAT
  */
 typedef struct {
-    uint32_t term;                  /**< Current term, for leader to update itself */
-    bool success;                   /**< True if follower contained entry matching prev_log_* */
-    char node_id[64];               /**< Responder's node ID */
-    uint32_t last_log_index;        /**< Follower's last log index (for optimization) */
+    uint32_t term;
+    bool success;
+    char node_id[64];
+    uint32_t match_index;
 } raft_append_entries_response_t;
 
 /**
- * @brief Raft InstallSnapshot RPC
- * 
- * Sent by leader to bring slow followers up to date.
+ * @brief Raft InstallSnapshot RPC - WIRE FORMAT
  */
 typedef struct {
-    uint32_t term;                  /**< Leader's term */
-    char leader_id[64];             /**< Leader's ID */
-    uint32_t last_included_index;   /**< Snapshot replaces all entries up through this index */
-    uint32_t last_included_term;    /**< Term of last_included_index */
-    uint32_t offset;                /**< Byte offset where chunk is positioned */
-    uint8_t* data;                  /**< Raw bytes of snapshot chunk */
-    size_t data_len;                /**< Data length */
-    bool done;                      /**< True if this is the last chunk */
+    uint32_t term;
+    char leader_id[64];
+    uint32_t last_included_index;
+    uint32_t last_included_term;
+    uint8_t* data;
+    size_t data_len;
 } raft_install_snapshot_t;
 
 /**
- * @brief Raft InstallSnapshot Response
+ * @brief Raft InstallSnapshot Response - WIRE FORMAT
  */
 typedef struct {
-    uint32_t term;                  /**< Current term, for leader to update itself */
-    char node_id[64];               /**< Responder's node ID */
-    bool success;                   /**< True if snapshot accepted */
+    uint32_t term;
+    char node_id[64];
+    bool success;
 } raft_install_snapshot_response_t;
 
 /**
- * @brief Node information for configuration
+ * @brief Server info for configuration - WIRE FORMAT
  */
 typedef struct {
-    char node_id[64];           /**< Node identifier */
-    char address[256];          /**< Node address */
-    uint16_t port;              /**< Node port */
-    node_role_t role;           /**< Node role */
+    char node_id[64];
+    char address[256];
+    uint16_t port;
+    uint32_t role;  /**< Wire format: uint32_t */
 } raft_server_info_t;
 
 /**
- * @brief Raft configuration change entry
+ * @brief Raft configuration change - WIRE FORMAT
  */
 typedef struct {
-    config_change_type_t type;  /**< Change type */
+    uint32_t type;  /**< Wire format: uint32_t */
     
     /* Single node change */
-    raft_server_info_t node_info;  /**< Node being added/removed */
+    raft_server_info_t node_info;
     
-    /* Joint consensus (for REPLACE type) */
-    raft_server_info_t* old_servers;  /**< C_old configuration */
+    /* Joint consensus */
+    raft_server_info_t* old_servers;
     size_t old_server_count;
-    
-    raft_server_info_t* new_servers;  /**< C_new configuration */
+    raft_server_info_t* new_servers;
     size_t new_server_count;
 } raft_configuration_change_t;
 
 /* ============================================================================
- * GOSSIP MESSAGE STRUCTURES
+ * GOSSIP WIRE FORMAT MESSAGES
  * ========================================================================= */
 
 /**
- * @brief Node information for gossip (with load metrics)
+ * @brief Gossip node info - WIRE FORMAT
  */
 typedef struct {
-    char node_id[64];               /**< Node identifier */
-    char address[256];              /**< IP address or hostname */
-    uint16_t port;                  /**< Port number */
-    node_state_t state;             /**< Node state */
-    node_role_t role;               /**< Node role */
-    uint64_t incarnation;           /**< Incarnation number (for refutation) */
-    
-    /* Load metrics (0-100) */
-    uint8_t cpu_usage;              /**< CPU usage percentage */
-    uint8_t memory_usage;           /**< Memory usage percentage */
+    char node_id[64];
+    char address[256];
+    uint16_t port;
+    uint32_t state;        /**< Wire: uint32_t */
+    uint32_t role;         /**< Wire: uint32_t */
+    uint64_t incarnation;
+    uint8_t cpu_usage;
+    uint8_t memory_usage;
 } gossip_node_info_t;
 
 /**
- * @brief Gossip Ping message
+ * @brief Gossip Ping - WIRE FORMAT
  */
 typedef struct {
-    char sender_id[64];             /**< Sender's node ID */
-    uint64_t incarnation;           /**< Sender's incarnation */
-    uint32_t sequence_number;       /**< Ping sequence number */
+    char sender_id[64];
+    uint64_t incarnation;
+    uint32_t sequence_number;
 } gossip_ping_t;
 
 /**
- * @brief Gossip Ack message
+ * @brief Gossip Ack - WIRE FORMAT
  */
 typedef struct {
-    char sender_id[64];             /**< Responder's node ID */
-    uint64_t incarnation;           /**< Responder's incarnation */
-    uint32_t sequence_number;       /**< Ping sequence being acked */
+    char sender_id[64];
+    uint64_t incarnation;
+    uint32_t sequence_number;
 } gossip_ack_t;
 
 /**
- * @brief Gossip Indirect Ping message
+ * @brief Gossip Indirect Ping - WIRE FORMAT
  */
 typedef struct {
-    char sender_id[64];             /**< Original ping sender */
-    char target_id[64];             /**< Target to ping */
-    uint32_t sequence_number;       /**< Ping sequence number */
+    char sender_id[64];
+    char target_id[64];
+    uint32_t sequence_number;
 } gossip_indirect_ping_t;
 
 /**
- * @brief Gossip Membership Update message
+ * @brief Gossip Membership Update - WIRE FORMAT
  */
 typedef struct {
-    char sender_id[64];             /**< Sender's node ID */
-    gossip_node_info_t* updates;    /**< Array of node updates */
-    size_t update_count;            /**< Number of updates */
+    char sender_id[64];
+    gossip_node_info_t* updates;
+    size_t update_count;
 } gossip_membership_update_t;
 
 /* ============================================================================
- * TASK MESSAGE STRUCTURES
+ * TASK WIRE FORMAT MESSAGES
  * ========================================================================= */
 
 /**
- * @brief Task Assignment message
- * 
- * Sent from coordinator to worker to assign a task.
+ * @brief Task Assignment - WIRE FORMAT
  */
 typedef struct {
-    char task_id[128];              /**< Task identifier */
-    char workflow_id[128];          /**< Workflow identifier */
-    char task_type[64];             /**< Task type/plugin name */
-    char* config_json;              /**< Task configuration (JSON string) */
-    uint8_t* input_data;            /**< Task input data */
-    size_t input_data_len;          /**< Input data length */
-    uint32_t timeout_sec;           /**< Timeout in seconds */
-    uint32_t retry_count;           /**< Number of retries allowed */
+    char task_id[128];
+    char workflow_id[128];
+    char task_type[64];
+    char* config_json;
+    uint8_t* input_data;
+    size_t input_data_len;
+    uint32_t timeout_sec;
+    uint32_t retry_count;
 } task_assignment_t;
 
 /**
- * @brief Task Result message
- * 
- * Sent from worker to coordinator with task results.
+ * @brief Task Result - WIRE FORMAT
  */
 typedef struct {
-    char task_id[128];              /**< Task identifier */
-    char worker_id[64];             /**< Worker that executed task */
-    task_status_t status;           /**< Final task status */
-    uint8_t* output_data;           /**< Task output data */
-    size_t output_data_len;         /**< Output data length */
-    char* error_message;            /**< Error message (if failed) */
-    int32_t exit_code;              /**< Task exit code */
-    uint64_t started_at;            /**< Start timestamp (ms) */
-    uint64_t completed_at;          /**< Completion timestamp (ms) */
+    char task_id[128];
+    char worker_id[64];
+    uint32_t status;  /**< Wire: uint32_t */
+    uint8_t* output_data;
+    size_t output_data_len;
+    char* error_message;
+    int32_t exit_code;
+    uint64_t started_at;
+    uint64_t completed_at;
 } task_result_t;
 
-/**
- * @brief Task Status message
- * 
- * Query or update for task status.
- */
-typedef struct {
-    char task_id[128];              /**< Task identifier */
-    task_status_t status;           /**< Current status */
-    uint32_t retry_count;           /**< Current retry count */
-    char* status_message;           /**< Status message */
-} task_status_msg_t;
-
 /* ============================================================================
- * CLIENT MESSAGE STRUCTURES
+ * CLIENT WIRE FORMAT MESSAGES
  * ========================================================================= */
 
 /**
- * @brief Client Submit message
- * 
- * Submit a message for processing.
+ * @brief Client Submit - WIRE FORMAT
  */
 typedef struct {
-    char message_id[128];           /**< Message identifier */
-    char event_type[64];            /**< Event type */
-    char* payload_json;             /**< Message payload (JSON) */
-    uint64_t timestamp;             /**< Submission timestamp */
+    char message_id[128];
+    char event_type[64];
+    char* payload_json;
+    uint64_t timestamp;
 } client_submit_t;
 
 /**
- * @brief Client Response message
+ * @brief Client Response - WIRE FORMAT
  */
 typedef struct {
-    char message_id[128];           /**< Original message ID */
-    uint32_t response_code;         /**< Response code (200=success, etc.) */
-    char* response_message;         /**< Human-readable message */
-    char** workflows_triggered;     /**< Array of triggered workflow IDs */
-    size_t workflow_count;          /**< Number of workflows triggered */
+    char message_id[128];
+    uint32_t response_code;
+    char* response_message;
+    char** workflows_triggered;
+    size_t workflow_count;
 } client_response_t;
 
-/**
- * @brief Client Query message
- */
-typedef struct {
-    char query_id[128];             /**< Query identifier */
-    char query_type[64];            /**< Type of query */
-    char* query_params_json;        /**< Query parameters (JSON) */
-} client_query_t;
-
-/**
- * @brief Client Error message
- */
-typedef struct {
-    char message_id[128];           /**< Related message ID */
-    uint32_t error_code;            /**< Error code */
-    char* error_message;            /**< Error description */
-    char* error_details;            /**< Detailed error info */
-} client_error_t;
-
 /* ============================================================================
- * SERIALIZATION FUNCTIONS - RAFT
+ * RAFT SERIALIZATION FUNCTIONS
  * ========================================================================= */
 
 distric_err_t serialize_raft_request_vote(
@@ -455,6 +413,8 @@ distric_err_t deserialize_raft_request_vote(
     size_t len,
     raft_request_vote_t* msg_out
 );
+
+void free_raft_request_vote(raft_request_vote_t* msg);
 
 distric_err_t serialize_raft_request_vote_response(
     const raft_request_vote_response_t* msg,
@@ -494,6 +454,32 @@ distric_err_t deserialize_raft_append_entries_response(
     raft_append_entries_response_t* msg_out
 );
 
+distric_err_t serialize_raft_install_snapshot(
+    const raft_install_snapshot_t* msg,
+    uint8_t** buffer_out,
+    size_t* len_out
+);
+
+distric_err_t deserialize_raft_install_snapshot(
+    const uint8_t* buffer,
+    size_t len,
+    raft_install_snapshot_t* msg_out
+);
+
+void free_raft_install_snapshot(raft_install_snapshot_t* msg);
+
+distric_err_t serialize_raft_install_snapshot_response(
+    const raft_install_snapshot_response_t* msg,
+    uint8_t** buffer_out,
+    size_t* len_out
+);
+
+distric_err_t deserialize_raft_install_snapshot_response(
+    const uint8_t* buffer,
+    size_t len,
+    raft_install_snapshot_response_t* msg_out
+);
+
 distric_err_t serialize_raft_configuration_change(
     const raft_configuration_change_t* msg,
     uint8_t** buffer_out,
@@ -509,7 +495,7 @@ distric_err_t deserialize_raft_configuration_change(
 void free_raft_configuration_change(raft_configuration_change_t* msg);
 
 /* ============================================================================
- * SERIALIZATION FUNCTIONS - GOSSIP
+ * GOSSIP SERIALIZATION FUNCTIONS
  * ========================================================================= */
 
 distric_err_t serialize_gossip_ping(
@@ -563,7 +549,7 @@ distric_err_t deserialize_gossip_membership_update(
 void free_gossip_membership_update(gossip_membership_update_t* msg);
 
 /* ============================================================================
- * SERIALIZATION FUNCTIONS - TASK
+ * TASK SERIALIZATION FUNCTIONS
  * ========================================================================= */
 
 distric_err_t serialize_task_assignment(
@@ -595,7 +581,7 @@ distric_err_t deserialize_task_result(
 void free_task_result(task_result_t* msg);
 
 /* ============================================================================
- * SERIALIZATION FUNCTIONS - CLIENT
+ * CLIENT SERIALIZATION FUNCTIONS
  * ========================================================================= */
 
 distric_err_t serialize_client_submit(
@@ -635,143 +621,6 @@ const char* node_role_to_string(node_role_t role);
 const char* task_status_to_string(task_status_t status);
 const char* raft_entry_type_to_string(raft_entry_type_t type);
 const char* config_change_type_to_string(config_change_type_t type);
-
-/* ============================================================================
- * Raft Wire Format - Protocol-Level Types
- * ========================================================================= */
-
-/* Wire format for log entry - neutral serialization format */
-typedef struct {
-    uint32_t term;
-    uint32_t index;
-    uint8_t entry_type;  // 0=command, 1=config, 2=noop
-    uint8_t* data;
-    size_t data_len;
-} raft_log_entry_wire_t;
-
-/* Raft Message Structures */
-
-typedef struct {
-    uint32_t term;
-    char candidate_id[64];
-    uint32_t last_log_index;
-    uint32_t last_log_term;
-} raft_request_vote_t;
-
-typedef struct {
-    uint32_t term;
-    bool vote_granted;
-} raft_request_vote_response_t;
-
-typedef struct {
-    uint32_t term;
-    char leader_id[64];
-    uint32_t prev_log_index;
-    uint32_t prev_log_term;
-    raft_log_entry_wire_t* entries;  // Wire format, NOT internal format
-    size_t entry_count;
-    uint32_t leader_commit;
-} raft_append_entries_t;
-
-typedef struct {
-    uint32_t term;
-    bool success;
-    uint32_t match_index;
-} raft_append_entries_response_t;
-
-typedef struct {
-    uint32_t term;
-    char leader_id[64];
-    uint32_t last_included_index;
-    uint32_t last_included_term;
-    uint8_t* data;
-    size_t data_len;
-} raft_install_snapshot_t;
-
-typedef struct {
-    uint32_t term;
-    bool success;
-} raft_install_snapshot_response_t;
-
-/* Serialization Functions */
-
-distric_err_t serialize_raft_request_vote(
-    const raft_request_vote_t* req,
-    uint8_t** buffer_out,
-    size_t* len_out
-);
-
-distric_err_t deserialize_raft_request_vote(
-    const uint8_t* buffer,
-    size_t len,
-    raft_request_vote_t* req_out
-);
-
-distric_err_t serialize_raft_request_vote_response(
-    const raft_request_vote_response_t* resp,
-    uint8_t** buffer_out,
-    size_t* len_out
-);
-
-distric_err_t deserialize_raft_request_vote_response(
-    const uint8_t* buffer,
-    size_t len,
-    raft_request_vote_response_t* resp_out
-);
-
-distric_err_t serialize_raft_append_entries(
-    const raft_append_entries_t* req,
-    uint8_t** buffer_out,
-    size_t* len_out
-);
-
-distric_err_t deserialize_raft_append_entries(
-    const uint8_t* buffer,
-    size_t len,
-    raft_append_entries_t* req_out
-);
-
-distric_err_t serialize_raft_append_entries_response(
-    const raft_append_entries_response_t* resp,
-    uint8_t** buffer_out,
-    size_t* len_out
-);
-
-distric_err_t deserialize_raft_append_entries_response(
-    const uint8_t* buffer,
-    size_t len,
-    raft_append_entries_response_t* resp_out
-);
-
-distric_err_t serialize_raft_install_snapshot(
-    const raft_install_snapshot_t* req,
-    uint8_t** buffer_out,
-    size_t* len_out
-);
-
-distric_err_t deserialize_raft_install_snapshot(
-    const uint8_t* buffer,
-    size_t len,
-    raft_install_snapshot_t* req_out
-);
-
-distric_err_t serialize_raft_install_snapshot_response(
-    const raft_install_snapshot_response_t* resp,
-    uint8_t** buffer_out,
-    size_t* len_out
-);
-
-distric_err_t deserialize_raft_install_snapshot_response(
-    const uint8_t* buffer,
-    size_t len,
-    raft_install_snapshot_response_t* resp_out
-);
-
-/* Cleanup Functions */
-
-void free_raft_request_vote(raft_request_vote_t* req);
-void free_raft_append_entries(raft_append_entries_t* req);
-void free_raft_install_snapshot(raft_install_snapshot_t* req);
 
 #ifdef __cplusplus
 }

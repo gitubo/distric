@@ -226,7 +226,7 @@ distric_err_t serialize_raft_append_entries(
     /* Encode log entries (if any) */
     if (msg->entries && msg->entry_count > 0) {
         for (size_t i = 0; i < msg->entry_count; i++) {
-            const raft_log_entry_t* entry = &msg->entries[i];
+            const raft_log_entry_wire_t* entry = &msg->entries[i];
             
             /* Create sub-encoder for entry */
             tlv_encoder_t* entry_enc = tlv_encoder_create(256);
@@ -270,7 +270,7 @@ distric_err_t deserialize_raft_append_entries(
     memset(msg_out, 0, sizeof(raft_append_entries_t));
     
     /* Temporary storage for entries */
-    raft_log_entry_t* entries = NULL;
+    raft_log_entry_wire_t* entries = NULL;
     size_t entry_count = 0;
     size_t entry_capacity = 0;
     
@@ -315,8 +315,8 @@ distric_err_t deserialize_raft_append_entries(
                     /* Grow array if needed */
                     if (entry_count >= entry_capacity) {
                         entry_capacity = entry_capacity == 0 ? 4 : entry_capacity * 2;
-                        raft_log_entry_t* new_entries = (raft_log_entry_t*)realloc(
-                            entries, entry_capacity * sizeof(raft_log_entry_t));
+                        raft_log_entry_wire_t* new_entries = (raft_log_entry_wire_t*)realloc(
+                            entries, entry_capacity * sizeof(raft_log_entry_wire_t));
                         if (!new_entries) {
                             free(entries);
                             tlv_decoder_free(dec);
@@ -326,8 +326,8 @@ distric_err_t deserialize_raft_append_entries(
                     }
                     
                     /* Decode entry fields */
-                    raft_log_entry_t* entry = &entries[entry_count];
-                    memset(entry, 0, sizeof(raft_log_entry_t));
+                    raft_log_entry_wire_t* entry = &entries[entry_count];
+                    memset(entry, 0, sizeof(raft_log_entry_wire_t));
                     
                     tlv_decoder_t* entry_dec = tlv_decoder_create(entry_data, entry_data_len);
                     tlv_field_t entry_field;
@@ -419,7 +419,7 @@ distric_err_t serialize_raft_append_entries_response(
     tlv_encode_uint32(enc, FIELD_TERM, msg->term);
     tlv_encode_bool(enc, FIELD_SUCCESS, msg->success);
     tlv_encode_string(enc, FIELD_NODE_ID, msg->node_id);
-    tlv_encode_uint32(enc, FIELD_LAST_LOG_INDEX, msg->last_log_index);
+    tlv_encode_uint32(enc, FIELD_LAST_LOG_INDEX, msg->match_index);
     
     *buffer_out = tlv_encoder_detach(enc, len_out);
     tlv_encoder_free(enc);
@@ -467,7 +467,7 @@ distric_err_t deserialize_raft_append_entries_response(
             }
             
             case FIELD_LAST_LOG_INDEX:
-                tlv_field_get_uint32(&field, &msg_out->last_log_index);
+                tlv_field_get_uint32(&field, &msg_out->match_index);
                 break;
             
             default:
