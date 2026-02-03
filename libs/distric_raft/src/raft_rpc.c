@@ -169,7 +169,7 @@ static int handle_append_entries_rpc(
         for (size_t i = 0; i < append_entries_wire.entry_count; i++) {
             entries_internal[i].index = append_entries_wire.entries[i].index;
             entries_internal[i].term = append_entries_wire.entries[i].term;
-            entries_internal[i].type = (raft_entry_type_t)append_entries_wire.entries[i].entry_type;
+            entries_internal[i].type = (raft_entry_type_t)(uint8_t)append_entries_wire.entries[i].entry_type;
             entries_internal[i].data = append_entries_wire.entries[i].data;
             entries_internal[i].data_len = append_entries_wire.entries[i].data_len;
         }
@@ -331,7 +331,7 @@ distric_err_t raft_rpc_create(
     }
     
     /* Create RPC server */
-    err = rpc_server_create(context->tcp_server, config->metrics, config->logger, &context->rpc_server);
+    err = rpc_server_create(context->tcp_server, config->metrics, config->logger, NULL &context->rpc_server);
     if (err != DISTRIC_OK) {
         tcp_pool_destroy(context->tcp_pool);
         tcp_server_destroy(context->tcp_server);
@@ -340,7 +340,7 @@ distric_err_t raft_rpc_create(
     }
     
     /* Create RPC client */
-    err = rpc_client_create(context->tcp_pool, config->metrics, config->logger, &context->rpc_client);
+    err = rpc_client_create(context->tcp_pool, config->metrics, config->logger, NULL, &context->rpc_client);
     if (err != DISTRIC_OK) {
         rpc_server_destroy(context->rpc_server);
         tcp_pool_destroy(context->tcp_pool);
@@ -350,7 +350,7 @@ distric_err_t raft_rpc_create(
     }
     
     /* Register RPC handlers */
-    err = rpc_register_handler(
+    err = rpc_server_register_handler(
         context->rpc_server,
         MSG_RAFT_REQUEST_VOTE,
         handle_request_vote_rpc,
@@ -358,7 +358,7 @@ distric_err_t raft_rpc_create(
     );
     
     if (err == DISTRIC_OK) {
-        err = rpc_register_handler(
+        err = rpc_server_register_handler(
             context->rpc_server,
             MSG_RAFT_APPEND_ENTRIES,
             handle_append_entries_rpc,
@@ -367,7 +367,7 @@ distric_err_t raft_rpc_create(
     }
     
     if (err == DISTRIC_OK) {
-        err = rpc_register_handler(
+        err = rpc_server_register_handler(
             context->rpc_server,
             MSG_RAFT_INSTALL_SNAPSHOT,
             handle_install_snapshot_rpc,
@@ -805,7 +805,7 @@ distric_err_t raft_rpc_broadcast_request_vote(
     }
     
     /* Get node configuration */
-    raft_config_t* config = raft_get_config(raft_node);
+    const raft_config_t* config = raft_get_config(raft_node);
     if (!config) {
         return DISTRIC_ERR_INVALID_ARG;
     }
@@ -966,7 +966,7 @@ distric_err_t raft_rpc_broadcast_append_entries(
     }
     
     /* Get node configuration */
-    raft_config_t* config = raft_get_config(raft_node);
+    const raft_config_t* config = raft_get_config(raft_node);
     if (!config) {
         return DISTRIC_ERR_INVALID_ARG;
     }

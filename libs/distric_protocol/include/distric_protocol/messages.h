@@ -169,11 +169,9 @@ typedef enum {
 /**
  * @brief Raft entry type (wire format)
  */
-typedef enum {
-    RAFT_ENTRY_NORMAL = 0,
-    RAFT_ENTRY_CONFIG = 1,
-    RAFT_ENTRY_NOOP = 2
-} raft_entry_type_t;
+#define RAFT_ENTRY_NORMAL 0
+#define RAFT_ENTRY_CONFIG 1
+#define RAFT_ENTRY_NOOP   2
 
 /* ============================================================================
  * RAFT WIRE FORMAT MESSAGES
@@ -619,7 +617,7 @@ void free_client_response(client_response_t* msg);
 const char* node_state_to_string(node_state_t state);
 const char* node_role_to_string(node_role_t role);
 const char* task_status_to_string(task_status_t status);
-const char* raft_entry_type_to_string(raft_entry_type_t type);
+const char* raft_entry_type_to_string(uint8_t type);
 const char* config_change_type_to_string(config_change_type_t type);
 
 #ifdef __cplusplus

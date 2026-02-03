@@ -152,60 +152,6 @@ void test_raft_append_entries_empty() {
     TEST_PASS();
 }
 
-void test_raft_append_entries_with_entries() {
-    TEST_START();
-    
-    /* Create log entries */
-    raft_log_entry_t entries[3];
-    
-    entries[0].index = 1000;
-    entries[0].term = 42;
-    entries[0].data = (uint8_t*)"command1";
-    entries[0].data_len = 8;
-    
-    entries[1].index = 1001;
-    entries[1].term = 42;
-    entries[1].data = (uint8_t*)"command2";
-    entries[1].data_len = 8;
-    
-    entries[2].index = 1002;
-    entries[2].term = 42;
-    entries[2].data = (uint8_t*)"command3";
-    entries[2].data_len = 8;
-    
-    raft_append_entries_t msg = {
-        .term = 42,
-        .prev_log_index = 999,
-        .prev_log_term = 41,
-        .leader_commit = 950,
-        .entries = entries,
-        .entry_count = 3
-    };
-    strncpy(msg.leader_id, "leader-1", sizeof(msg.leader_id) - 1);
-    
-    uint8_t* buffer = NULL;
-    size_t len = 0;
-    ASSERT_OK(serialize_raft_append_entries(&msg, &buffer, &len));
-    
-    printf("  With 3 entries size: %zu bytes\n", len);
-    
-    raft_append_entries_t decoded;
-    ASSERT_OK(deserialize_raft_append_entries(buffer, len, &decoded));
-    
-    ASSERT_EQ(decoded.entry_count, 3);
-    ASSERT_EQ(decoded.entries[0].index, 1000);
-    ASSERT_EQ(decoded.entries[1].index, 1001);
-    ASSERT_EQ(decoded.entries[2].index, 1002);
-    
-    /* Verify data */
-    ASSERT_TRUE(memcmp(decoded.entries[0].data, "command1", 8) == 0);
-    ASSERT_TRUE(memcmp(decoded.entries[1].data, "command2", 8) == 0);
-    ASSERT_TRUE(memcmp(decoded.entries[2].data, "command3", 8) == 0);
-    
-    free_raft_append_entries(&decoded);
-    free(buffer);
-    TEST_PASS();
-}
 
 /* ============================================================================
  * GOSSIP MESSAGE TESTS
@@ -688,11 +634,69 @@ void test_raft_configuration_change_joint_consensus() {
     TEST_PASS();
 }
 
+void test_raft_append_entries_with_entries() {
+    TEST_START();
+    
+    /* Create log entries (WIRE FORMAT) */
+    raft_log_entry_wire_t entries[3];
+    
+    entries[0].index = 1000;
+    entries[0].term = 42;
+    entries[0].entry_type = RAFT_ENTRY_NORMAL; 
+    entries[0].data = (uint8_t*)"command1";
+    entries[0].data_len = 8;
+    
+    entries[1].index = 1001;
+    entries[1].term = 42;
+    entries[1].entry_type = RAFT_ENTRY_NORMAL;  
+    entries[1].data = (uint8_t*)"command2";
+    entries[1].data_len = 8;
+    
+    entries[2].index = 1002;
+    entries[2].term = 42;
+    entries[2].entry_type = RAFT_ENTRY_NORMAL;  // ADDED: wire format type
+    entries[2].data = (uint8_t*)"command3";
+    entries[2].data_len = 8;
+    
+    raft_append_entries_t msg = {
+        .term = 42,
+        .prev_log_index = 999,
+        .prev_log_term = 41,
+        .leader_commit = 950,
+        .entries = entries,
+        .entry_count = 3
+    };
+    strncpy(msg.leader_id, "leader-1", sizeof(msg.leader_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_append_entries(&msg, &buffer, &len));
+    
+    printf("  With 3 entries size: %zu bytes\n", len);
+    
+    raft_append_entries_t decoded;
+    ASSERT_OK(deserialize_raft_append_entries(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.entry_count, 3);
+    ASSERT_EQ(decoded.entries[0].index, 1000);
+    ASSERT_EQ(decoded.entries[1].index, 1001);
+    ASSERT_EQ(decoded.entries[2].index, 1002);
+    
+    /* Verify data */
+    ASSERT_TRUE(memcmp(decoded.entries[0].data, "command1", 8) == 0);
+    ASSERT_TRUE(memcmp(decoded.entries[1].data, "command2", 8) == 0);
+    ASSERT_TRUE(memcmp(decoded.entries[2].data, "command3", 8) == 0);
+    
+    free_raft_append_entries(&decoded);
+    free(buffer);
+    TEST_PASS();
+}
+
 void test_raft_append_entries_with_entry_type() {
     TEST_START();
     
-    /* Create log entries with different types */
-    raft_log_entry_t entries[3];
+    /* Create log entries with different types (WIRE FORMAT) */
+    raft_log_entry_wire_t entries[3];
     
     /* Normal command */
     entries[0].index = 100;

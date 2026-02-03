@@ -282,18 +282,6 @@ void rpc_client_destroy(rpc_client_t* client);
  * - rpc_client_retries_total (counter, labels: msg_type)
  */
 
- /* RPC Server */
-distric_err_t rpc_server_start(rpc_server_t* server);
-distric_err_t rpc_server_stop(rpc_server_t* server);
-
-/* These already exist per the implementation document */
-distric_err_t rpc_server_create(tcp_server_t* tcp, metrics_registry_t* metrics, logger_t* logger, rpc_server_t** server_out);
-void rpc_server_destroy(rpc_server_t* server);
-distric_err_t rpc_register_handler(rpc_server_t* server, message_type_t msg_type, rpc_handler_t handler, void* userdata);
-distric_err_t rpc_client_create(tcp_pool_t* pool, metrics_registry_t* metrics, logger_t* logger, rpc_client_t** client_out);
-void rpc_client_destroy(rpc_client_t* client);
-distric_err_t rpc_call(rpc_client_t* client, const char* host, uint16_t port, message_type_t msg_type, const uint8_t* request, size_t req_len, uint8_t** response, size_t* resp_len, int timeout_ms);
-
 #ifdef __cplusplus
 }
 #endif

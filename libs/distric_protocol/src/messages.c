@@ -345,7 +345,7 @@ distric_err_t deserialize_raft_append_entries(
                             case FIELD_ENTRY_TYPE: {
                                 uint32_t type;
                                 tlv_field_get_uint32(&entry_field, &type);
-                                entry->entry_type = (raft_entry_type_t)type;
+                                entry->entry_type = (uint8_t)type;
                                 break;
                             }
                             
@@ -1780,7 +1780,7 @@ const char* task_status_to_string(task_status_t status) {
     }
 }
 
-const char* raft_entry_type_to_string(raft_entry_type_t type) {
+const char* raft_entry_type_to_string(uint8_t type) {
     switch (type) {
         case RAFT_ENTRY_NORMAL: return "NORMAL";
         case RAFT_ENTRY_CONFIG: return "CONFIG";
