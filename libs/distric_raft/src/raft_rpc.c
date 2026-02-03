@@ -9,6 +9,10 @@
 #define _POSIX_C_SOURCE 200112L
 #endif
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include "distric_raft/raft_rpc.h"
 #include <stdlib.h>
 #include <string.h>
@@ -169,7 +173,7 @@ static int handle_append_entries_rpc(
         for (size_t i = 0; i < append_entries_wire.entry_count; i++) {
             entries_internal[i].index = append_entries_wire.entries[i].index;
             entries_internal[i].term = append_entries_wire.entries[i].term;
-            entries_internal[i].type = (raft_entry_type_t)(uint8_t)append_entries_wire.entries[i].entry_type;
+            entries_internal[i].type = (raft_entry_type_t)append_entries_wire.entries[i].entry_type;
             entries_internal[i].data = append_entries_wire.entries[i].data;
             entries_internal[i].data_len = append_entries_wire.entries[i].data_len;
         }
@@ -331,7 +335,7 @@ distric_err_t raft_rpc_create(
     }
     
     /* Create RPC server */
-    err = rpc_server_create(context->tcp_server, config->metrics, config->logger, NULL &context->rpc_server);
+    err = rpc_server_create(context->tcp_server, config->metrics, config->logger, NULL, &context->rpc_server);
     if (err != DISTRIC_OK) {
         tcp_pool_destroy(context->tcp_pool);
         tcp_server_destroy(context->tcp_server);
