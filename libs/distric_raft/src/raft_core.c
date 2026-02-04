@@ -14,6 +14,10 @@
 #define _POSIX_C_SOURCE 200112L
 #endif
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include "distric_raft/raft_core.h"
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +26,11 @@
 #include <sys/time.h>
 #include <stdatomic.h>
 #include <unistd.h>
+
+/* Define DISTRIC_ERR_TIMEOUT if not already defined in distric_obs.h */
+#ifndef DISTRIC_ERR_TIMEOUT
+#define DISTRIC_ERR_TIMEOUT -11
+#endif
 
 /* ============================================================================
  * INTERNAL STRUCTURES
