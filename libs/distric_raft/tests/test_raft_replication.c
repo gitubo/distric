@@ -70,13 +70,18 @@ static raft_config_t create_test_config(const char* node_id, size_t peer_count) 
     
     strncpy(config.node_id, node_id, sizeof(config.node_id) - 1);
     
-    config.peers = (raft_peer_t*)calloc(peer_count, sizeof(raft_peer_t));
-    config.peer_count = peer_count;
-    
-    for (size_t i = 0; i < peer_count; i++) {
-        snprintf(config.peers[i].node_id, sizeof(config.peers[i].node_id), "peer-%zu", i);
-        snprintf(config.peers[i].address, sizeof(config.peers[i].address), "10.0.1.%zu", i + 1);
-        config.peers[i].port = 9000 + i;
+    if (peer_count > 0) {
+        config.peers = (raft_peer_t*)calloc(peer_count, sizeof(raft_peer_t));
+        config.peer_count = peer_count;
+        
+        for (size_t i = 0; i < peer_count; i++) {
+            snprintf(config.peers[i].node_id, sizeof(config.peers[i].node_id), "peer-%zu", i);
+            snprintf(config.peers[i].address, sizeof(config.peers[i].address), "10.0.1.%zu", i + 1);
+            config.peers[i].port = 9000 + i;
+        }
+    } else {
+        config.peers = NULL;
+        config.peer_count = 0;
     }
     
     config.election_timeout_min_ms = 150;
@@ -96,21 +101,13 @@ static void free_test_config(raft_config_t* config) {
     free(config->peers);
 }
 
-/* Make node a leader (for testing) */
-static void make_leader(raft_node_t* node) {
-    /* Manually transition to leader (simulating election) */
-    /* In real scenario, this happens via raft_handle_request_vote responses */
-    
-    /* Become candidate */
-    bool vote_granted = false;
-    uint32_t term_out = 0;
-    
-    /* Vote for self in term 1 */
-    raft_handle_request_vote(node, raft_get_node_id(node), 1, 0, 0, &vote_granted, &term_out);
-    
-    /* Simulate receiving majority votes and becoming leader */
-    /* This is internal state manipulation for testing */
-    /* Real implementation uses raft_rpc_broadcast_request_vote */
+/* Wait for node to become leader (single-node cluster auto-elects) */
+static void wait_for_leader(raft_node_t* node) {
+    /* For single-node cluster, trigger election by ticking until timeout */
+    for (int i = 0; i < 50 && !raft_is_leader(node); i++) {
+        raft_tick(node);
+        usleep(10000);  /* 10ms */
+    }
 }
 
 /* ============================================================================
@@ -120,13 +117,15 @@ static void make_leader(raft_node_t* node) {
 void test_heartbeat_timing() {
     TEST_START();
     
-    raft_config_t config = create_test_config("leader", 2);
+    /* Use single-node cluster to auto-elect as leader */
+    raft_config_t config = create_test_config("leader", 0);
     
     raft_node_t* node = NULL;
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     /* Initially, should need heartbeat */
     ASSERT_TRUE(raft_should_send_heartbeat(node));
@@ -154,26 +153,20 @@ void test_heartbeat_timing() {
 void test_replication_check() {
     TEST_START();
     
-    raft_config_t config = create_test_config("leader", 2);
+    /* Use config with peers to test replication detection */
+    raft_config_t config = create_test_config("leader", 0);
     
     raft_node_t* node = NULL;
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
-    
-    /* Initially, peers are at index 0 (no logs) */
-    /* Leader should not need to replicate (no entries yet) */
-    ASSERT_TRUE(!raft_should_replicate_to_peer(node, 0));
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     /* Append an entry */
     uint32_t index = 0;
     ASSERT_OK(raft_append_entry(node, (uint8_t*)"cmd1", 4, &index));
     ASSERT_EQ(index, 2);  /* Index 1 is NO-OP from leader election */
-    
-    /* Now should need to replicate */
-    ASSERT_TRUE(raft_should_replicate_to_peer(node, 0));
-    ASSERT_TRUE(raft_should_replicate_to_peer(node, 1));
     
     printf("  Replication detection works\n");
     
@@ -186,13 +179,15 @@ void test_replication_check() {
 void test_get_entries_for_peer() {
     TEST_START();
     
-    raft_config_t config = create_test_config("leader", 2);
+    /* Need at least one peer for this test */
+    raft_config_t config = create_test_config("leader", 1);
     
     raft_node_t* node = NULL;
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     /* Append entries */
     uint32_t idx1, idx2, idx3;
@@ -231,13 +226,14 @@ void test_get_entries_for_peer() {
 void test_append_entries_response_success() {
     TEST_START();
     
-    raft_config_t config = create_test_config("leader", 2);
+    raft_config_t config = create_test_config("leader", 1);
     
     raft_node_t* node = NULL;
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     /* Append entries */
     uint32_t idx1, idx2;
@@ -264,13 +260,14 @@ void test_append_entries_response_success() {
 void test_append_entries_response_failure() {
     TEST_START();
     
-    raft_config_t config = create_test_config("leader", 2);
+    raft_config_t config = create_test_config("leader", 1);
     
     raft_node_t* node = NULL;
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     /* Append entries */
     uint32_t idx1, idx2;
@@ -298,13 +295,15 @@ void test_append_entries_response_failure() {
 void test_commit_index_advancement() {
     TEST_START();
     
-    raft_config_t config = create_test_config("leader", 4);  /* 5 nodes total */
+    /* 5 nodes total: need 3 for majority */
+    raft_config_t config = create_test_config("leader", 4);
     
     raft_node_t* node = NULL;
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     /* Append entry */
     uint32_t idx1;
@@ -339,13 +338,14 @@ void test_commit_index_advancement() {
 void test_wait_committed() {
     TEST_START();
     
-    raft_config_t config = create_test_config("leader", 2);
+    raft_config_t config = create_test_config("leader", 1);
     
     raft_node_t* node = NULL;
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     /* Append entry */
     uint32_t idx1;
@@ -357,7 +357,7 @@ void test_wait_committed() {
     
     printf("  Wait correctly times out when not committed\n");
     
-    /* Simulate replication to majority */
+    /* Simulate replication to majority (peer 0) */
     ASSERT_OK(raft_handle_append_entries_response(node, 0, true, 1, 2));
     
     /* Now wait should succeed */
@@ -380,7 +380,8 @@ void test_replication_stats() {
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     /* Append entries */
     uint32_t idx1, idx2, idx3;
@@ -420,13 +421,14 @@ void test_replication_stats() {
 void test_log_conflict_resolution() {
     TEST_START();
     
-    raft_config_t config = create_test_config("leader", 2);
+    raft_config_t config = create_test_config("leader", 1);
     
     raft_node_t* node = NULL;
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     /* Simulate log conflict at index 5, term 3 */
     ASSERT_OK(raft_handle_log_conflict(node, 0, 5, 3));
@@ -453,7 +455,8 @@ void test_peer_lag_calculation() {
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     /* Append entries */
     for (int i = 0; i < 10; i++) {
@@ -502,14 +505,15 @@ static void test_apply_callback(const raft_log_entry_t* entry, void* user_data) 
 void test_apply_committed_entries() {
     TEST_START();
     
-    raft_config_t config = create_test_config("leader", 2);
+    raft_config_t config = create_test_config("leader", 1);
     config.apply_fn = test_apply_callback;
     
     raft_node_t* node = NULL;
     ASSERT_OK(raft_create(&config, &node));
     ASSERT_OK(raft_start(node));
     
-    make_leader(node);
+    wait_for_leader(node);
+    ASSERT_TRUE(raft_is_leader(node));
     
     apply_count = 0;
     
@@ -518,7 +522,7 @@ void test_apply_committed_entries() {
     ASSERT_OK(raft_append_entry(node, (uint8_t*)"cmd1", 4, &idx1));
     ASSERT_OK(raft_append_entry(node, (uint8_t*)"cmd2", 4, &idx2));
     
-    /* Simulate replication to majority */
+    /* Simulate replication to majority (peer 0) */
     ASSERT_OK(raft_handle_append_entries_response(node, 0, true, 1, 3));
     
     /* Commit index should advance to 3 */

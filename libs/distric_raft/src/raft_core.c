@@ -19,6 +19,7 @@
 #endif
 
 #include "distric_raft/raft_core.h"
+#include "distric_raft/raft_replication.h"
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -26,11 +27,8 @@
 #include <sys/time.h>
 #include <stdatomic.h>
 #include <unistd.h>
-
-/* Define DISTRIC_ERR_TIMEOUT if not already defined in distric_obs.h */
-#ifndef DISTRIC_ERR_TIMEOUT
-#define DISTRIC_ERR_TIMEOUT -11
-#endif
+#include <stdint.h>
+#include <stdbool.h>
 
 /* ============================================================================
  * INTERNAL STRUCTURES
@@ -270,11 +268,13 @@ static void transition_to_leader(raft_node_t* node) {
     node->state = RAFT_STATE_LEADER;
     strncpy(node->current_leader, node->config.node_id, sizeof(node->current_leader) - 1);
     
-    /* Initialize leader state */
+    /* Initialize leader state (if we have peers) */
     uint32_t last_index = log_last_index(&node->log);
-    for (size_t i = 0; i < node->config.peer_count; i++) {
-        node->next_index[i] = last_index + 1;
-        node->match_index[i] = 0;
+    if (node->config.peer_count > 0 && node->next_index && node->match_index) {
+        for (size_t i = 0; i < node->config.peer_count; i++) {
+            node->next_index[i] = last_index + 1;
+            node->match_index[i] = 0;
+        }
     }
     
     /* Append no-op entry to commit entries from previous terms */
@@ -352,7 +352,7 @@ static void apply_committed_entries(raft_node_t* node) {
  * 
  * Leader advances commit_index to highest N where:
  * - N > commit_index
- * - Majority of match_index[i] >= N
+ * - Majority of match_index[i] >= N (or single-node cluster)
  * - log[N].term == current_term
  */
 static void update_commit_index(raft_node_t* node) {
@@ -364,6 +364,19 @@ static void update_commit_index(raft_node_t* node) {
     
     uint32_t old_commit = atomic_load(&node->commit_index);
     uint32_t last_log_index = log_last_index(&node->log);
+    
+    /* For single-node cluster, auto-commit everything */
+    if (node->config.peer_count == 0) {
+        if (last_log_index > old_commit) {
+            atomic_store(&node->commit_index, last_log_index);
+            
+            LOG_INFO(node->config.logger, "raft", "Advanced commit index (single-node)",
+                    "old", &(int){old_commit},
+                    "new", &(int){last_log_index});
+        }
+        pthread_rwlock_unlock(&node->lock);
+        return;
+    }
     
     /* Try each index from commit_index+1 to last_log_index */
     for (uint32_t n = old_commit + 1; n <= last_log_index; n++) {
@@ -401,6 +414,14 @@ static void update_commit_index(raft_node_t* node) {
     pthread_rwlock_unlock(&node->lock);
 }
 
+/**
+ * @brief Get optimal batch size for log replication
+ */
+static size_t get_replication_batch_size(raft_node_t* node) {
+    (void)node;
+    return 100;  /* Default: 100 entries max */
+}
+
 /* ============================================================================
  * RAFT NODE LIFECYCLE
  * ========================================================================= */
@@ -410,9 +431,7 @@ distric_err_t raft_create(const raft_config_t* config, raft_node_t** node_out) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    if (config->peer_count == 0) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
+    /* Allow peer_count=0 for single-node clusters (testing/development) */
     
     raft_node_t* node = (raft_node_t*)calloc(1, sizeof(raft_node_t));
     if (!node) {
@@ -423,12 +442,16 @@ distric_err_t raft_create(const raft_config_t* config, raft_node_t** node_out) {
     memcpy(&node->config, config, sizeof(raft_config_t));
     
     /* Allocate peer arrays */
-    node->config.peers = (raft_peer_t*)calloc(config->peer_count, sizeof(raft_peer_t));
-    if (!node->config.peers) {
-        free(node);
-        return DISTRIC_ERR_NO_MEMORY;
+    if (config->peer_count > 0) {
+        node->config.peers = (raft_peer_t*)calloc(config->peer_count, sizeof(raft_peer_t));
+        if (!node->config.peers) {
+            free(node);
+            return DISTRIC_ERR_NO_MEMORY;
+        }
+        memcpy(node->config.peers, config->peers, config->peer_count * sizeof(raft_peer_t));
+    } else {
+        node->config.peers = NULL;
     }
-    memcpy(node->config.peers, config->peers, config->peer_count * sizeof(raft_peer_t));
     
     /* Initialize log */
     distric_err_t err = raft_log_init(&node->log);
@@ -439,16 +462,21 @@ distric_err_t raft_create(const raft_config_t* config, raft_node_t** node_out) {
     }
     
     /* Initialize leader state arrays */
-    node->next_index = (uint32_t*)calloc(config->peer_count, sizeof(uint32_t));
-    node->match_index = (uint32_t*)calloc(config->peer_count, sizeof(uint32_t));
-    
-    if (!node->next_index || !node->match_index) {
-        raft_log_destroy(&node->log);
-        free(node->config.peers);
-        free(node->next_index);
-        free(node->match_index);
-        free(node);
-        return DISTRIC_ERR_NO_MEMORY;
+    if (config->peer_count > 0) {
+        node->next_index = (uint32_t*)calloc(config->peer_count, sizeof(uint32_t));
+        node->match_index = (uint32_t*)calloc(config->peer_count, sizeof(uint32_t));
+        
+        if (!node->next_index || !node->match_index) {
+            raft_log_destroy(&node->log);
+            free(node->config.peers);
+            free(node->next_index);
+            free(node->match_index);
+            free(node);
+            return DISTRIC_ERR_NO_MEMORY;
+        }
+    } else {
+        node->next_index = NULL;
+        node->match_index = NULL;
     }
     
     /* Initialize state */
@@ -551,10 +579,6 @@ static void start_election(raft_node_t* node) {
             "last_log_index", &(int){last_log_index},
             "last_log_term", &(int){last_log_term});
     
-    /* Note: votes_received = 1 (self vote) is implicit in vote counting */
-    /* TODO: Send RequestVote RPCs to all peers (done in RPC layer integration) */
-    /* For now, this is just the state transition logic */
-    
     /* If cluster size is 1, immediately become leader */
     if (votes_needed == 1) {
         pthread_rwlock_wrlock(&node->lock);
@@ -614,9 +638,6 @@ distric_err_t raft_tick(raft_node_t* node) {
         }
         
         case RAFT_STATE_LEADER: {
-            /* Heartbeat/replication handled by RPC layer via raft_rpc_broadcast_append_entries() */
-            /* This keeps raft_core independent of RPC implementation */
-            
             /* Apply committed entries (leader) */
             apply_committed_entries(node);
             
@@ -819,8 +840,6 @@ distric_err_t raft_append_entry(
     }
     
     pthread_rwlock_unlock(&node->lock);
-    
-    /* TODO: Replicate to followers */
     
     return DISTRIC_OK;
 }
@@ -1066,6 +1085,276 @@ distric_err_t raft_step_down(raft_node_t* node, uint32_t term) {
     
     if (term > node->current_term) {
         transition_to_follower(node, term);
+    }
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * REPLICATION API (Session 3.3)
+ * ========================================================================= */
+
+bool raft_should_replicate_to_peer(raft_node_t* node, size_t peer_index) {
+    if (!node || peer_index >= node->config.peer_count) {
+        return false;
+    }
+    
+    if (node->state != RAFT_STATE_LEADER) {
+        return false;
+    }
+    
+    pthread_rwlock_rdlock(&node->lock);
+    
+    uint32_t next_index = node->next_index[peer_index];
+    uint32_t last_log_index = log_last_index(&node->log);
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    return (next_index <= last_log_index);
+}
+
+bool raft_should_send_heartbeat(raft_node_t* node) {
+    if (!node || node->state != RAFT_STATE_LEADER) {
+        return false;
+    }
+    
+    pthread_rwlock_rdlock(&node->lock);
+    
+    uint64_t now = get_time_ms();
+    uint64_t elapsed = now - node->last_heartbeat_sent_ms;
+    uint64_t interval = node->config.heartbeat_interval_ms;
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    return (elapsed >= interval);
+}
+
+void raft_mark_heartbeat_sent(raft_node_t* node) {
+    if (!node) return;
+    
+    pthread_rwlock_wrlock(&node->lock);
+    node->last_heartbeat_sent_ms = get_time_ms();
+    pthread_rwlock_unlock(&node->lock);
+}
+
+distric_err_t raft_handle_append_entries_response(
+    raft_node_t* node,
+    size_t peer_index,
+    bool success,
+    uint32_t peer_term,
+    uint32_t match_index
+) {
+    if (!node || peer_index >= node->config.peer_count) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    pthread_rwlock_wrlock(&node->lock);
+    
+    /* Check if we've been deposed */
+    if (peer_term > node->current_term) {
+        pthread_rwlock_unlock(&node->lock);
+        
+        LOG_INFO(node->config.logger, "raft", "Stepping down due to higher term in AppendEntries response",
+                "our_term", &(int){node->current_term},
+                "peer_term", &(int){peer_term});
+        
+        return raft_step_down(node, peer_term);
+    }
+    
+    /* Ignore stale responses */
+    if (peer_term < node->current_term) {
+        pthread_rwlock_unlock(&node->lock);
+        return DISTRIC_OK;
+    }
+    
+    if (success) {
+        /* Update next_index and match_index */
+        node->next_index[peer_index] = match_index + 1;
+        node->match_index[peer_index] = match_index;
+        
+        LOG_DEBUG(node->config.logger, "raft", "Replication succeeded",
+                 "peer_index", &(int){peer_index},
+                 "match_index", &(int){match_index});
+    } else {
+        /* Decrement next_index and retry */
+        if (node->next_index[peer_index] > 1) {
+            node->next_index[peer_index]--;
+        }
+        
+        LOG_DEBUG(node->config.logger, "raft", "Replication failed, decrementing next_index",
+                 "peer_index", &(int){peer_index},
+                 "next_index", &(int){node->next_index[peer_index]});
+    }
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    /* Update commit index if needed */
+    update_commit_index(node);
+    
+    return DISTRIC_OK;
+}
+
+distric_err_t raft_get_entries_for_peer(
+    raft_node_t* node,
+    size_t peer_index,
+    raft_log_entry_t** entries_out,
+    size_t* count_out,
+    uint32_t* prev_log_index_out,
+    uint32_t* prev_log_term_out
+) {
+    if (!node || peer_index >= node->config.peer_count || 
+        !entries_out || !count_out || !prev_log_index_out || !prev_log_term_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    pthread_rwlock_rdlock(&node->lock);
+    
+    uint32_t next_index = node->next_index[peer_index];
+    uint32_t last_log_index = log_last_index(&node->log);
+    
+    /* Calculate prev_log info */
+    *prev_log_index_out = (next_index > 1) ? next_index - 1 : 0;
+    *prev_log_term_out = 0;
+    
+    if (*prev_log_index_out > 0) {
+        raft_log_entry_t* prev_entry = log_get(&node->log, *prev_log_index_out);
+        if (prev_entry) {
+            *prev_log_term_out = prev_entry->term;
+        } else {
+            *prev_log_term_out = node->log.base_term;
+        }
+    }
+    
+    /* Calculate entries to send */
+    if (next_index > last_log_index) {
+        /* Peer is up-to-date, send empty AppendEntries (heartbeat) */
+        *entries_out = NULL;
+        *count_out = 0;
+        pthread_rwlock_unlock(&node->lock);
+        return DISTRIC_OK;
+    }
+    
+    /* Limit batch size */
+    size_t batch_size = get_replication_batch_size(node);
+    uint32_t end_index = next_index + batch_size;
+    if (end_index > last_log_index + 1) {
+        end_index = last_log_index + 1;
+    }
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    /* Get entries */
+    return raft_get_log_entries(node, next_index, end_index, entries_out, count_out);
+}
+
+void raft_free_log_entries(raft_log_entry_t* entries, size_t count) {
+    if (!entries) return;
+    
+    for (size_t i = 0; i < count; i++) {
+        free(entries[i].data);
+    }
+    
+    free(entries);
+}
+
+distric_err_t raft_handle_log_conflict(
+    raft_node_t* node,
+    size_t peer_index,
+    uint32_t conflict_index,
+    uint32_t conflict_term
+) {
+    if (!node || peer_index >= node->config.peer_count) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    pthread_rwlock_wrlock(&node->lock);
+    
+    uint32_t new_next_index = 1;
+    
+    if (conflict_term > 0) {
+        /* Find last entry of conflict_term */
+        for (uint32_t i = conflict_index; i >= 1; i--) {
+            raft_log_entry_t* entry = log_get(&node->log, i);
+            if (entry && entry->term == conflict_term) {
+                new_next_index = i + 1;
+                break;
+            }
+            if (i == 1) break;
+        }
+    } else {
+        new_next_index = conflict_index;
+    }
+    
+    node->next_index[peer_index] = new_next_index;
+    
+    LOG_INFO(node->config.logger, "raft", "Handled log conflict",
+            "peer_index", &(int){peer_index},
+            "conflict_index", &(int){conflict_index},
+            "conflict_term", &(int){conflict_term},
+            "new_next_index", &(int){new_next_index});
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    return DISTRIC_OK;
+}
+
+uint32_t raft_get_peer_lag(raft_node_t* node, size_t peer_index) {
+    if (!node || peer_index >= node->config.peer_count) {
+        return 0;
+    }
+    
+    pthread_rwlock_rdlock(&node->lock);
+    
+    uint32_t last_log_index = log_last_index(&node->log);
+    uint32_t match_index = node->match_index[peer_index];
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    return (last_log_index > match_index) ? (last_log_index - match_index) : 0;
+}
+
+distric_err_t raft_get_replication_stats(
+    raft_node_t* node,
+    replication_stats_t* stats_out
+) {
+    if (!node || !stats_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    if (node->state != RAFT_STATE_LEADER) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    pthread_rwlock_rdlock(&node->lock);
+    
+    stats_out->last_log_index = log_last_index(&node->log);
+    stats_out->commit_index = atomic_load(&node->commit_index);
+    stats_out->min_match_index = UINT32_MAX;
+    stats_out->max_match_index = 0;
+    stats_out->peers_up_to_date = 0;
+    stats_out->peers_lagging = 0;
+    
+    for (size_t i = 0; i < node->config.peer_count; i++) {
+        uint32_t match = node->match_index[i];
+        
+        if (match < stats_out->min_match_index) {
+            stats_out->min_match_index = match;
+        }
+        if (match > stats_out->max_match_index) {
+            stats_out->max_match_index = match;
+        }
+        
+        if (match == stats_out->last_log_index) {
+            stats_out->peers_up_to_date++;
+        } else {
+            stats_out->peers_lagging++;
+        }
+    }
+    
+    if (node->config.peer_count == 0) {
+        stats_out->min_match_index = 0;
     }
     
     pthread_rwlock_unlock(&node->lock);
