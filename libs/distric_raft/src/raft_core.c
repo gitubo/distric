@@ -3,6 +3,11 @@
  * @brief Raft Consensus Core Implementation
  * 
  * Implements leader election, log replication, and safety guarantees.
+ * 
+ * Integrates:
+ * - Session 3.1: Leader election foundation
+ * - Session 3.2: RPC integration helpers
+ * - Session 3.3: Log replication mechanism
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -16,6 +21,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <stdatomic.h>
+#include <unistd.h>
 
 /* ============================================================================
  * INTERNAL STRUCTURES
@@ -60,6 +66,7 @@ struct raft_node {
     uint64_t election_timeout_ms;   /**< Current election timeout */
     uint64_t last_heartbeat_ms;     /**< Last time we received heartbeat */
     uint64_t last_election_ms;      /**< Last time we started election */
+    uint64_t last_heartbeat_sent_ms; /**< Last time we sent heartbeat (leader only) */
     
     /* Metrics */
     metric_t* state_metric;
@@ -264,6 +271,9 @@ static void transition_to_leader(raft_node_t* node) {
     /* Append no-op entry to commit entries from previous terms */
     log_append(&node->log, node->current_term, RAFT_ENTRY_NOOP, NULL, 0);
     
+    /* Initialize heartbeat timestamp */
+    node->last_heartbeat_sent_ms = get_time_ms();
+    
     LOG_INFO(node->config.logger, "raft", "Became LEADER",
             "term", &(int){node->current_term},
             "last_log_index", &(int){last_index});
@@ -273,7 +283,113 @@ static void transition_to_leader(raft_node_t* node) {
     }
     
     /* Update metrics */
-    metrics_counter_inc(node->leader_changes_metric);
+    if (node->leader_changes_metric) {
+        metrics_counter_inc(node->leader_changes_metric);
+    }
+}
+
+/* ============================================================================
+ * LOG REPLICATION HELPERS (Session 3.3)
+ * ========================================================================= */
+
+/**
+ * @brief Apply committed entries to state machine
+ * 
+ * Applies all entries from last_applied+1 to commit_index.
+ * This is called by both leaders and followers.
+ */
+static void apply_committed_entries(raft_node_t* node) {
+    if (!node || !node->config.apply_fn) {
+        return;
+    }
+    
+    pthread_rwlock_wrlock(&node->lock);
+    
+    uint32_t commit_index = atomic_load(&node->commit_index);
+    
+    while (node->last_applied < commit_index) {
+        node->last_applied++;
+        
+        /* Get entry */
+        raft_log_entry_t* entry = log_get(&node->log, node->last_applied);
+        if (!entry) {
+            LOG_ERROR(node->config.logger, "raft", "Missing log entry",
+                     "index", &(int){node->last_applied});
+            break;
+        }
+        
+        /* Skip NO-OP entries */
+        if (entry->type == RAFT_ENTRY_NOOP) {
+            LOG_DEBUG(node->config.logger, "raft", "Skipping NO-OP entry",
+                     "index", &(int){node->last_applied});
+            continue;
+        }
+        
+        /* Apply to state machine */
+        pthread_rwlock_unlock(&node->lock);
+        node->config.apply_fn(entry, node->config.user_data);
+        pthread_rwlock_wrlock(&node->lock);
+        
+        LOG_DEBUG(node->config.logger, "raft", "Applied entry to state machine",
+                 "index", &(int){node->last_applied},
+                 "term", &(int){entry->term});
+    }
+    
+    pthread_rwlock_unlock(&node->lock);
+}
+
+/**
+ * @brief Update commit index based on match_index
+ * 
+ * Leader advances commit_index to highest N where:
+ * - N > commit_index
+ * - Majority of match_index[i] >= N
+ * - log[N].term == current_term
+ */
+static void update_commit_index(raft_node_t* node) {
+    if (!node || node->state != RAFT_STATE_LEADER) {
+        return;
+    }
+    
+    pthread_rwlock_wrlock(&node->lock);
+    
+    uint32_t old_commit = atomic_load(&node->commit_index);
+    uint32_t last_log_index = log_last_index(&node->log);
+    
+    /* Try each index from commit_index+1 to last_log_index */
+    for (uint32_t n = old_commit + 1; n <= last_log_index; n++) {
+        /* Check if entry is from current term */
+        raft_log_entry_t* entry = log_get(&node->log, n);
+        if (!entry || entry->term != node->current_term) {
+            continue;
+        }
+        
+        /* Count replicas (including self) */
+        uint32_t replicas = 1;  /* Self */
+        
+        for (size_t i = 0; i < node->config.peer_count; i++) {
+            if (node->match_index[i] >= n) {
+                replicas++;
+            }
+        }
+        
+        /* Check if majority */
+        uint32_t majority = (node->config.peer_count + 1) / 2 + 1;
+        
+        if (replicas >= majority) {
+            atomic_store(&node->commit_index, n);
+            
+            LOG_INFO(node->config.logger, "raft", "Advanced commit index",
+                    "old", &(int){old_commit},
+                    "new", &(int){n},
+                    "replicas", &(int){replicas},
+                    "majority", &(int){majority});
+            
+            old_commit = n;
+        }
+    }
+    
+    pthread_rwlock_unlock(&node->lock);
 }
 
 /* ============================================================================
@@ -332,6 +448,7 @@ distric_err_t raft_create(const raft_config_t* config, raft_node_t** node_out) {
     atomic_store(&node->commit_index, 0);
     node->last_applied = 0;
     node->last_heartbeat_ms = get_time_ms();
+    node->last_heartbeat_sent_ms = get_time_ms();
     node->election_timeout_ms = random_election_timeout(
         config->election_timeout_min_ms,
         config->election_timeout_max_ms);
@@ -480,19 +597,23 @@ distric_err_t raft_tick(raft_node_t* node) {
             if (elapsed > timeout) {
                 start_election(node);
             }
+            
+            /* Apply committed entries (follower) */
+            apply_committed_entries(node);
+            
             break;
         }
         
         case RAFT_STATE_LEADER: {
-            /* Send heartbeats */
-            pthread_rwlock_rdlock(&node->lock);
-            uint64_t heartbeat_interval = node->config.heartbeat_interval_ms;
-            pthread_rwlock_unlock(&node->lock);
+            /* Heartbeat/replication handled by RPC layer via raft_rpc_broadcast_append_entries() */
+            /* This keeps raft_core independent of RPC implementation */
             
-            /* TODO: Send AppendEntries RPCs (heartbeats) to all peers */
-            /* This will be implemented in RPC integration */
+            /* Apply committed entries (leader) */
+            apply_committed_entries(node);
             
-            (void)heartbeat_interval;  /* Suppress unused warning for now */
+            /* Update commit index based on match_index */
+            update_commit_index(node);
+            
             break;
         }
     }
@@ -695,6 +816,39 @@ distric_err_t raft_append_entry(
     return DISTRIC_OK;
 }
 
+distric_err_t raft_wait_committed(
+    raft_node_t* node,
+    uint32_t index,
+    uint32_t timeout_ms
+) {
+    if (!node) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    uint64_t start = get_time_ms();
+    
+    while (1) {
+        uint32_t commit_index = atomic_load(&node->commit_index);
+        
+        if (commit_index >= index) {
+            return DISTRIC_OK;
+        }
+        
+        /* Check timeout */
+        uint64_t elapsed = get_time_ms() - start;
+        if (elapsed >= timeout_ms) {
+            LOG_WARN(node->config.logger, "raft", "Wait for commit timed out",
+                    "index", &(int){index},
+                    "commit_index", &(int){commit_index},
+                    "timeout_ms", &(int){timeout_ms});
+            return DISTRIC_ERR_TIMEOUT;
+        }
+        
+        /* Sleep briefly */
+        usleep(10000);  /* 10ms */
+    }
+}
+
 /* ============================================================================
  * STATE QUERIES
  * ========================================================================= */
@@ -759,7 +913,7 @@ const char* raft_state_to_string(raft_state_t state) {
 }
 
 /* ============================================================================
- * RPC HELPER FUNCTIONS (Add to end of raft_core.c)
+ * RPC HELPER FUNCTIONS (Session 3.2)
  * ========================================================================= */
 
 const raft_config_t* raft_get_config(const raft_node_t* node) {
@@ -908,4 +1062,38 @@ distric_err_t raft_step_down(raft_node_t* node, uint32_t term) {
     pthread_rwlock_unlock(&node->lock);
     
     return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * SNAPSHOT API (Stubs for Session 3.5)
+ * ========================================================================= */
+
+distric_err_t raft_create_snapshot(
+    raft_node_t* node,
+    const uint8_t* snapshot_data,
+    size_t snapshot_len
+) {
+    (void)node;
+    (void)snapshot_data;
+    (void)snapshot_len;
+    
+    /* TODO: Implement in Session 3.5 */
+    return DISTRIC_ERR_INVALID_ARG;
+}
+
+distric_err_t raft_install_snapshot(
+    raft_node_t* node,
+    uint32_t last_included_index,
+    uint32_t last_included_term,
+    const uint8_t* snapshot_data,
+    size_t snapshot_len
+) {
+    (void)node;
+    (void)last_included_index;
+    (void)last_included_term;
+    (void)snapshot_data;
+    (void)snapshot_len;
+    
+    /* TODO: Implement in Session 3.5 */
+    return DISTRIC_ERR_INVALID_ARG;
 }
