@@ -8,6 +8,7 @@
  * - Session 3.1: Leader election foundation
  * - Session 3.2: RPC integration helpers
  * - Session 3.3: Log replication mechanism
+ * - Session 3.4: Persistence layer
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -20,6 +21,7 @@
 
 #include "distric_raft/raft_core.h"
 #include "distric_raft/raft_replication.h"
+#include "distric_raft/raft_persistence.h"
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -75,6 +77,9 @@ struct raft_node {
     uint64_t last_election_ms;      /**< Last time we started election */
     uint64_t last_heartbeat_sent_ms; /**< Last time we sent heartbeat (leader only) */
     
+    /* Persistence (Session 3.4) */
+    raft_persistence_context_t* persistence;
+    
     /* Metrics */
     metric_t* state_metric;
     metric_t* term_metric;
@@ -102,6 +107,41 @@ static uint64_t get_time_ms(void) {
 static uint64_t random_election_timeout(uint32_t min_ms, uint32_t max_ms) {
     uint32_t range = max_ms - min_ms;
     return min_ms + (rand() % range);
+}
+
+/* ============================================================================
+ * PERSISTENCE HELPERS (Session 3.4)
+ * ========================================================================= */
+
+/**
+ * @brief Persist current state to disk
+ */
+static void persist_state(raft_node_t* node) {
+    if (!node->persistence) {
+        return;
+    }
+    
+    raft_persistent_state_t pstate = {
+        .current_term = node->current_term,
+    };
+    strncpy(pstate.voted_for, node->voted_for, sizeof(pstate.voted_for) - 1);
+    
+    distric_err_t err = raft_persistence_save_state(node->persistence, &pstate);
+    if (err != DISTRIC_OK) {
+        LOG_ERROR(node->config.logger, "raft", "Failed to persist state",
+                 "term", &(int){node->current_term});
+    }
+}
+
+/**
+ * @brief Persist log entry to disk
+ */
+static distric_err_t persist_entry(raft_node_t* node, const raft_log_entry_t* entry) {
+    if (!node->persistence) {
+        return DISTRIC_OK;
+    }
+    
+    return raft_persistence_append_entry(node->persistence, entry);
 }
 
 /* ============================================================================
@@ -136,7 +176,8 @@ static void raft_log_destroy(raft_log_t* log) {
 }
 
 static distric_err_t log_append(raft_log_t* log, uint32_t term, raft_entry_type_t type,
-                                 const uint8_t* data, size_t data_len) {
+                                 const uint8_t* data, size_t data_len,
+                                 raft_node_t* node) {
     /* Grow if needed */
     if (log->count >= log->capacity) {
         size_t new_capacity = log->capacity * 2;
@@ -169,6 +210,20 @@ static distric_err_t log_append(raft_log_t* log, uint32_t term, raft_entry_type_
     }
     
     log->count++;
+    
+    /* Persist to disk (Session 3.4) */
+    if (node && node->persistence) {
+        distric_err_t err = persist_entry(node, entry);
+        if (err != DISTRIC_OK) {
+            LOG_ERROR(node->config.logger, "raft", "Failed to persist log entry",
+                     "index", &(int){entry->index});
+            /* Rollback in-memory append */
+            free(entry->data);
+            log->count--;
+            return err;
+        }
+    }
+    
     return DISTRIC_OK;
 }
 
@@ -199,7 +254,7 @@ static uint32_t log_last_term(const raft_log_t* log) {
     return log->entries[log->count - 1].term;
 }
 
-static distric_err_t log_truncate(raft_log_t* log, uint32_t from_index) {
+static distric_err_t log_truncate(raft_log_t* log, uint32_t from_index, raft_node_t* node) {
     if (from_index <= log->base_index) {
         return DISTRIC_OK;  /* Already in snapshot */
     }
@@ -215,6 +270,12 @@ static distric_err_t log_truncate(raft_log_t* log, uint32_t from_index) {
     }
     
     log->count = offset;
+    
+    /* Persist truncation (Session 3.4) */
+    if (node && node->persistence) {
+        raft_persistence_truncate_log(node->persistence, from_index);
+    }
+    
     return DISTRIC_OK;
 }
 
@@ -230,6 +291,9 @@ static void transition_to_follower(raft_node_t* node, uint32_t term) {
     memset(node->voted_for, 0, sizeof(node->voted_for));
     memset(node->current_leader, 0, sizeof(node->current_leader));
     node->last_heartbeat_ms = get_time_ms();
+    
+    /* Persist state change (Session 3.4) */
+    persist_state(node);
     
     if (old_state != RAFT_STATE_FOLLOWER) {
         LOG_INFO(node->config.logger, "raft", "Became FOLLOWER",
@@ -252,6 +316,9 @@ static void transition_to_candidate(raft_node_t* node) {
     node->election_timeout_ms = random_election_timeout(
         node->config.election_timeout_min_ms,
         node->config.election_timeout_max_ms);
+    
+    /* Persist state change (Session 3.4) */
+    persist_state(node);
     
     LOG_INFO(node->config.logger, "raft", "Became CANDIDATE",
             "term", &(int){node->current_term},
@@ -278,7 +345,7 @@ static void transition_to_leader(raft_node_t* node) {
     }
     
     /* Append no-op entry to commit entries from previous terms */
-    log_append(&node->log, node->current_term, RAFT_ENTRY_NOOP, NULL, 0);
+    log_append(&node->log, node->current_term, RAFT_ENTRY_NOOP, NULL, 0, node);
     
     /* Initialize heartbeat timestamp */
     node->last_heartbeat_sent_ms = get_time_ms();
@@ -493,6 +560,77 @@ distric_err_t raft_create(const raft_config_t* config, raft_node_t** node_out) {
     /* Initialize lock */
     pthread_rwlock_init(&node->lock, NULL);
     
+    /* Initialize persistence (Session 3.4) */
+    node->persistence = NULL;
+    if (config->persistence_data_dir) {
+        raft_persistence_config_t persist_config = {
+            .data_dir = config->persistence_data_dir,
+            .max_db_size_mb = 1024,
+            .sync_on_write = true,
+            .logger = config->logger
+        };
+        
+        err = raft_persistence_create(&persist_config, &node->persistence);
+        if (err != DISTRIC_OK) {
+            LOG_ERROR(config->logger, "raft", "Failed to initialize persistence",
+                     "data_dir", config->persistence_data_dir);
+            pthread_rwlock_destroy(&node->lock);
+            raft_log_destroy(&node->log);
+            free(node->config.peers);
+            free(node->next_index);
+            free(node->match_index);
+            free(node);
+            return err;
+        }
+        
+        /* Load persistent state */
+        raft_persistent_state_t pstate;
+        err = raft_persistence_load_state(node->persistence, &pstate);
+        if (err == DISTRIC_OK) {
+            node->current_term = pstate.current_term;
+            strncpy(node->voted_for, pstate.voted_for, sizeof(node->voted_for) - 1);
+            
+            LOG_INFO(config->logger, "raft", "Loaded persistent state",
+                    "term", &(int){pstate.current_term},
+                    "voted_for", pstate.voted_for);
+        } else if (err != DISTRIC_ERR_NOT_FOUND) {
+            LOG_ERROR(config->logger, "raft", "Failed to load persistent state");
+        }
+        
+        /* Load log entries */
+        raft_log_entry_t* entries = NULL;
+        size_t count = 0;
+        err = raft_persistence_load_all_entries(node->persistence, &entries, &count);
+        if (err == DISTRIC_OK && count > 0) {
+            /* Restore log from persistence */
+            for (size_t i = 0; i < count; i++) {
+                log_append(&node->log, entries[i].term, entries[i].type, 
+                          entries[i].data, entries[i].data_len, NULL);  /* NULL = don't re-persist */
+                free(entries[i].data);
+            }
+            free(entries);
+            
+            LOG_INFO(config->logger, "raft", "Loaded log from persistence",
+                    "entries", &(int){count});
+        } else if (err != DISTRIC_ERR_NOT_FOUND && err != DISTRIC_OK) {
+            LOG_ERROR(config->logger, "raft", "Failed to load log entries");
+        }
+        
+        /* Load snapshot metadata if exists */
+        raft_snapshot_metadata_t snapshot_meta;
+        err = raft_persistence_load_snapshot_metadata(node->persistence, &snapshot_meta);
+        if (err == DISTRIC_OK) {
+            node->log.base_index = snapshot_meta.last_included_index;
+            node->log.base_term = snapshot_meta.last_included_term;
+            atomic_store(&node->commit_index, snapshot_meta.last_included_index);
+            node->last_applied = snapshot_meta.last_included_index;
+            
+            LOG_INFO(config->logger, "raft", "Loaded snapshot metadata",
+                    "last_included_index", &(int){snapshot_meta.last_included_index},
+                    "last_included_term", &(int){snapshot_meta.last_included_term});
+        }
+    }
+    
     /* Register metrics */
     if (config->metrics) {
         metrics_register_gauge(config->metrics, "raft_state", "Current Raft state (0=follower, 1=candidate, 2=leader)",
@@ -511,7 +649,8 @@ distric_err_t raft_create(const raft_config_t* config, raft_node_t** node_out) {
     
     LOG_INFO(config->logger, "raft", "Node created",
             "node_id", config->node_id,
-            "peers", &(int){config->peer_count});
+            "peers", &(int){config->peer_count},
+            "persistence", config->persistence_data_dir ? "enabled" : "disabled");
     
     return DISTRIC_OK;
 }
@@ -524,6 +663,11 @@ void raft_destroy(raft_node_t* node) {
     pthread_rwlock_destroy(&node->lock);
     
     raft_log_destroy(&node->log);
+    
+    /* Destroy persistence (Session 3.4) */
+    if (node->persistence) {
+        raft_persistence_destroy(node->persistence);
+    }
     
     free(node->config.peers);
     free(node->next_index);
@@ -707,6 +851,9 @@ distric_err_t raft_handle_request_vote(
         strncpy(node->voted_for, candidate_id, sizeof(node->voted_for) - 1);
         node->last_heartbeat_ms = get_time_ms();  /* Reset election timer */
         
+        /* Persist state BEFORE responding (Session 3.4) */
+        persist_state(node);
+        
         LOG_INFO(node->config.logger, "raft", "Granted vote",
                 "candidate", candidate_id,
                 "term", &(int){term});
@@ -782,12 +929,12 @@ distric_err_t raft_handle_append_entries(
             raft_log_entry_t* existing = log_get(&node->log, entry->index);
             if (existing && existing->term != entry->term) {
                 /* Delete conflicting entry and all that follow */
-                log_truncate(&node->log, entry->index);
+                log_truncate(&node->log, entry->index, node);
             }
             
             /* Append entry if not already present */
             if (!log_get(&node->log, entry->index)) {
-                log_append(&node->log, entry->term, entry->type, entry->data, entry->data_len);
+                log_append(&node->log, entry->term, entry->type, entry->data, entry->data_len, node);
             }
         }
     }
@@ -828,7 +975,7 @@ distric_err_t raft_append_entry(
         return DISTRIC_ERR_NOT_FOUND;  /* Not leader */
     }
     
-    distric_err_t err = log_append(&node->log, node->current_term, RAFT_ENTRY_COMMAND, data, data_len);
+    distric_err_t err = log_append(&node->log, node->current_term, RAFT_ENTRY_COMMAND, data, data_len, node);
     if (err != DISTRIC_OK) {
         pthread_rwlock_unlock(&node->lock);
         return err;
@@ -1363,7 +1510,7 @@ distric_err_t raft_get_replication_stats(
 }
 
 /* ============================================================================
- * SNAPSHOT API (Stubs for Session 3.5)
+ * SNAPSHOT API (Session 3.4 Integration)
  * ========================================================================= */
 
 distric_err_t raft_create_snapshot(
@@ -1371,12 +1518,52 @@ distric_err_t raft_create_snapshot(
     const uint8_t* snapshot_data,
     size_t snapshot_len
 ) {
-    (void)node;
-    (void)snapshot_data;
-    (void)snapshot_len;
+    if (!node || !snapshot_data) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
     
-    /* TODO: Implement in Session 3.5 */
-    return DISTRIC_ERR_INVALID_ARG;
+    if (!node->persistence) {
+        return DISTRIC_ERR_INVALID_ARG;  /* Persistence not enabled */
+    }
+    
+    pthread_rwlock_wrlock(&node->lock);
+    
+    uint32_t last_applied = node->last_applied;
+    raft_log_entry_t* entry = log_get(&node->log, last_applied);
+    
+    if (!entry) {
+        pthread_rwlock_unlock(&node->lock);
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    uint32_t last_included_term = entry->term;
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    /* Save snapshot to persistence */
+    raft_snapshot_metadata_t metadata = {
+        .last_included_index = last_applied,
+        .last_included_term = last_included_term,
+        .data_len = snapshot_len
+    };
+    
+    distric_err_t err = raft_persistence_save_snapshot(node->persistence, &metadata, snapshot_data);
+    if (err != DISTRIC_OK) {
+        return err;
+    }
+    
+    /* Update base index/term */
+    pthread_rwlock_wrlock(&node->lock);
+    node->log.base_index = last_applied;
+    node->log.base_term = last_included_term;
+    pthread_rwlock_unlock(&node->lock);
+    
+    LOG_INFO(node->config.logger, "raft", "Snapshot created",
+            "last_included_index", &(int){last_applied},
+            "last_included_term", &(int){last_included_term},
+            "data_len", &(int){snapshot_len});
+    
+    return DISTRIC_OK;
 }
 
 distric_err_t raft_install_snapshot(
@@ -1386,12 +1573,48 @@ distric_err_t raft_install_snapshot(
     const uint8_t* snapshot_data,
     size_t snapshot_len
 ) {
-    (void)node;
-    (void)last_included_index;
-    (void)last_included_term;
-    (void)snapshot_data;
-    (void)snapshot_len;
+    if (!node || !snapshot_data) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
     
-    /* TODO: Implement in Session 3.5 */
-    return DISTRIC_ERR_INVALID_ARG;
+    if (!node->persistence) {
+        return DISTRIC_ERR_INVALID_ARG;  /* Persistence not enabled */
+    }
+    
+    /* Save snapshot to persistence */
+    raft_snapshot_metadata_t metadata = {
+        .last_included_index = last_included_index,
+        .last_included_term = last_included_term,
+        .data_len = snapshot_len
+    };
+    
+    distric_err_t err = raft_persistence_save_snapshot(node->persistence, &metadata, snapshot_data);
+    if (err != DISTRIC_OK) {
+        return err;
+    }
+    
+    /* Update state */
+    pthread_rwlock_wrlock(&node->lock);
+    
+    node->log.base_index = last_included_index;
+    node->log.base_term = last_included_term;
+    
+    /* Discard log entries covered by snapshot */
+    log_truncate(&node->log, last_included_index + 1, NULL);  /* NULL = already persisted */
+    
+    /* Update commit and applied indices */
+    if (last_included_index > atomic_load(&node->commit_index)) {
+        atomic_store(&node->commit_index, last_included_index);
+    }
+    if (last_included_index > node->last_applied) {
+        node->last_applied = last_included_index;
+    }
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    LOG_INFO(node->config.logger, "raft", "Snapshot installed",
+            "last_included_index", &(int){last_included_index},
+            "last_included_term", &(int){last_included_term});
+    
+    return DISTRIC_OK;
 }

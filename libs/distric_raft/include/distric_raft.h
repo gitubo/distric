@@ -79,6 +79,8 @@ extern "C" {
 /** @} */
 
 #include "distric_raft/raft_rpc.h"
+#include "distric_raft/raft_replication.h"
+#include "distric_raft/raft_persistence.h"
 
 /* Future modules will be added here:
  * - raft_persistence: Durable storage for log and state

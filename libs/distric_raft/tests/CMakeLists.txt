@@ -14,3 +14,8 @@ add_test(NAME test_raft_rpc COMMAND test_raft_rpc)
 add_executable(test_raft_replication test_raft_replication.c)
 target_link_libraries(test_raft_replication distric_raft distric_protocol distric_obs Threads::Threads)
 add_test(NAME test_raft_replication COMMAND test_raft_replication)
+
+# Test: Persistence
+add_executable(test_raft_persistence test_raft_persistence.c)
+target_link_libraries(test_raft_persistence distric_raft distric_protocol distric_obs Threads::Threads)
+add_test(NAME test_raft_persistence COMMAND test_raft_persistence)
