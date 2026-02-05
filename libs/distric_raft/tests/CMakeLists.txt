@@ -24,3 +24,8 @@ add_test(NAME test_raft_persistence COMMAND test_raft_persistence)
 add_executable(test_raft_snapshot test_raft_snapshot.c)
 target_link_libraries(test_raft_snapshot distric_raft distric_protocol distric_obs Threads::Threads)
 add_test(NAME test_raft_snapshot COMMAND test_raft_snapshot)
+
+# Test: Multi-Node Cluster Integration (Session 3.6)
+add_executable(test_raft_cluster test_raft_cluster.c)
+target_link_libraries(test_raft_cluster distric_raft distric_protocol distric_transport distric_obs Threads::Threads)
+add_test(NAME test_raft_cluster COMMAND test_raft_cluster)
