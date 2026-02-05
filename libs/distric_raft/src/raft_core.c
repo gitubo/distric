@@ -1511,37 +1511,58 @@ distric_err_t raft_create_snapshot(
     
     pthread_rwlock_wrlock(&node->lock);
     
-    uint32_t last_applied = node->last_applied;
-    raft_log_entry_t* entry = log_get(&node->log, last_applied);
+    /* Use commit_index instead of last_applied for snapshot point */
+    uint32_t last_included_index = atomic_load(&node->commit_index);
+    uint32_t last_included_term;
     
-    if (!entry) {
-        pthread_rwlock_unlock(&node->lock);
-        return DISTRIC_ERR_INVALID_ARG;
+    /* Handle case where nothing has been committed yet */
+    if (last_included_index == 0) {
+        /* Use base term or term 0 */
+        last_included_term = node->log.base_term;
+        
+        /* If base_term is also 0, use current_term */
+        if (last_included_term == 0) {
+            last_included_term = node->current_term;
+        }
+    } else {
+        /* Get the term of the last committed entry */
+        raft_log_entry_t* entry = log_get(&node->log, last_included_index);
+        
+        if (entry) {
+            last_included_term = entry->term;
+        } else {
+            /* Entry might be in a previous snapshot */
+            last_included_term = node->log.base_term;
+        }
     }
-    
-    uint32_t last_included_term = entry->term;
     
     pthread_rwlock_unlock(&node->lock);
     
     /* Save snapshot to persistence */
     distric_err_t err = raft_persistence_save_snapshot(node->persistence, 
-                                                        last_applied,
+                                                        last_included_index,
                                                         last_included_term,
                                                         snapshot_data, 
                                                         snapshot_len);
     if (err != DISTRIC_OK) {
-        LOG_WARN(node->config.logger, "raft", "Snapshot save not implemented yet");
+        LOG_ERROR(node->config.logger, "raft", "Failed to save snapshot");
         return err;
     }
     
     /* Update base index/term */
     pthread_rwlock_wrlock(&node->lock);
-    node->log.base_index = last_applied;
+    node->log.base_index = last_included_index;
     node->log.base_term = last_included_term;
+    
+    /* Update last_applied if needed */
+    if (last_included_index > node->last_applied) {
+        node->last_applied = last_included_index;
+    }
+    
     pthread_rwlock_unlock(&node->lock);
     
     LOG_INFO(node->config.logger, "raft", "Snapshot created",
-            "last_included_index", &(int){last_applied},
+            "last_included_index", &(int){last_included_index},
             "last_included_term", &(int){last_included_term},
             "data_len", &(int){snapshot_len});
     
