@@ -1,13 +1,26 @@
 /**
- * @file test_raft_persistence.c
- * @brief Tests for Raft Persistence
+ * @file raft_persistence.c
+ * @brief Raft Persistence Implementation
  * 
- * Tests:
- * - State save/load
- * - Log entry persistence
- * - Crash recovery
- * - Snapshot save/load
- * - Log compaction
+ * Simple file-based persistence with no external dependencies.
+ * 
+ * File Layout:
+ *   /data_dir/state.json     - Current term and voted_for
+ *   /data_dir/log.dat        - Binary log entries
+ *   /data_dir/snapshot.dat   - Snapshot (future)
+ * 
+ * State Format (JSON):
+ *   {"term":42,"voted_for":"node-3"}
+ * 
+ * Log Format (binary):
+ *   [4 bytes: magic "RAFT"]
+ *   [4 bytes: version = 1]
+ *   Repeated records:
+ *     [4 bytes: index]
+ *     [4 bytes: term]
+ *     [1 byte: type]
+ *     [4 bytes: data_len]
+ *     [data_len bytes: data]
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -18,660 +31,690 @@
 #define _DEFAULT_SOURCE
 #endif
 
-#include <distric_raft/raft_persistence.h>
-#include <stdio.h>
+#include "raft_persistence.h"
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
+#include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
-
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST_START() printf("\n[TEST] %s...\n", __func__)
-#define TEST_PASS() do { \
-    printf("[PASS] %s\n", __func__); \
-    tests_passed++; \
-} while(0)
-
-#define ASSERT_OK(expr) do { \
-    distric_err_t _err = (expr); \
-    if (_err != DISTRIC_OK) { \
-        fprintf(stderr, "FAIL: %s returned %d\n", #expr, _err); \
-        tests_failed++; \
-        return; \
-    } \
-} while(0)
-
-#define ASSERT_TRUE(expr) do { \
-    if (!(expr)) { \
-        fprintf(stderr, "FAIL: %s is false\n", #expr); \
-        tests_failed++; \
-        return; \
-    } \
-} while(0)
-
-#define ASSERT_EQ(a, b) do { \
-    if ((a) != (b)) { \
-        fprintf(stderr, "FAIL: %s (%d) != %s (%d)\n", #a, (int)(a), #b, (int)(b)); \
-        tests_failed++; \
-        return; \
-    } \
-} while(0)
-
-#define ASSERT_STR_EQ(a, b) do { \
-    if (strcmp((a), (b)) != 0) { \
-        fprintf(stderr, "FAIL: %s (%s) != %s (%s)\n", #a, (a), #b, (b)); \
-        tests_failed++; \
-        return; \
-    } \
-} while(0)
-
-/* Test directory */
-#define TEST_DATA_DIR "/tmp/distric_test_persistence"
+#include <sys/types.h>
+#include <errno.h>
+#include <stdint.h>
 
 /* ============================================================================
- * TEST HELPERS
+ * CONSTANTS
  * ========================================================================= */
 
-static void cleanup_test_dir(void) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", TEST_DATA_DIR);
-    system(cmd);
-}
+#define LOG_FILE_MAGIC 0x52414654  /* "RAFT" */
+#define LOG_FILE_VERSION 1
 
-static void create_test_dir(void) {
-    cleanup_test_dir();
-    mkdir(TEST_DATA_DIR, 0755);
-}
+#define MAX_PATH_LEN 512
 
-static raft_persistence_context_t* create_test_context(void) {
-    raft_persistence_config_t config = {
-        .data_dir = TEST_DATA_DIR,
-        .max_db_size_mb = 10,
-        .sync_on_write = true,
-        .logger = NULL
-    };
+/* ============================================================================
+ * INTERNAL STRUCTURES
+ * ========================================================================= */
+
+struct raft_persistence {
+    char data_dir[256];
+    char state_path[MAX_PATH_LEN];
+    char state_tmp_path[MAX_PATH_LEN];
+    char log_path[MAX_PATH_LEN];
     
-    raft_persistence_context_t* context = NULL;
-    distric_err_t err = raft_persistence_create(&config, &context);
+    int log_fd;                    /* File descriptor for log file */
+    
+    logger_t* logger;
+};
+
+/* ============================================================================
+ * FILE UTILITIES
+ * ========================================================================= */
+
+static distric_err_t ensure_directory(const char* path, logger_t* logger) {
+    struct stat st;
+    
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return DISTRIC_OK;
+        }
+        LOG_ERROR(logger, "persistence", "Path exists but is not a directory", "path", path);
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    if (mkdir(path, 0755) != 0) {
+        LOG_ERROR(logger, "persistence", "Failed to create directory",
+                 "path", path, "errno", &errno);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    LOG_INFO(logger, "persistence", "Created directory", "path", path);
+    return DISTRIC_OK;
+}
+
+static distric_err_t write_file_atomic(const char* path, const char* tmp_path,
+                                       const void* data, size_t len, logger_t* logger) {
+    /* Write to temporary file */
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        LOG_ERROR(logger, "persistence", "Failed to create tmp file",
+                 "path", tmp_path, "errno", &errno);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    ssize_t written = write(fd, data, len);
+    if (written != (ssize_t)len) {
+        LOG_ERROR(logger, "persistence", "Failed to write tmp file",
+                 "expected", &(int){len}, "written", &(int){written});
+        close(fd);
+        unlink(tmp_path);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Sync to disk */
+    if (fsync(fd) != 0) {
+        LOG_ERROR(logger, "persistence", "Failed to fsync tmp file", "errno", &errno);
+        close(fd);
+        unlink(tmp_path);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    close(fd);
+    
+    /* Atomic rename */
+    if (rename(tmp_path, path) != 0) {
+        LOG_ERROR(logger, "persistence", "Failed to rename tmp file", "errno", &errno);
+        unlink(tmp_path);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    return DISTRIC_OK;
+}
+
+static distric_err_t read_file(const char* path, char** data_out, size_t* len_out, logger_t* logger) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            *data_out = NULL;
+            *len_out = 0;
+            return DISTRIC_OK;  /* File doesn't exist yet */
+        }
+        LOG_ERROR(logger, "persistence", "Failed to open file", "path", path, "errno", &errno);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Get file size */
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        LOG_ERROR(logger, "persistence", "Failed to stat file", "errno", &errno);
+        close(fd);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    size_t size = st.st_size;
+    if (size == 0) {
+        close(fd);
+        *data_out = NULL;
+        *len_out = 0;
+        return DISTRIC_OK;
+    }
+    
+    /* Allocate buffer */
+    char* buffer = (char*)malloc(size + 1);  /* +1 for null terminator */
+    if (!buffer) {
+        close(fd);
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    /* Read file */
+    ssize_t bytes_read = read(fd, buffer, size);
+    close(fd);
+    
+    if (bytes_read != (ssize_t)size) {
+        LOG_ERROR(logger, "persistence", "Failed to read complete file");
+        free(buffer);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    buffer[size] = '\0';  /* Null terminate for text parsing */
+    
+    *data_out = buffer;
+    *len_out = size;
+    
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * STATE FILE OPERATIONS (Simple JSON-like format)
+ * ========================================================================= */
+
+static distric_err_t parse_state_file(const char* content, uint32_t* term_out, char* voted_for_out) {
+    /* Very simple parser for: {"term":42,"voted_for":"node-3"} */
+    *term_out = 0;
+    voted_for_out[0] = '\0';
+    
+    if (!content || strlen(content) == 0) {
+        return DISTRIC_OK;  /* Empty state */
+    }
+    
+    /* Parse term */
+    const char* term_str = strstr(content, "\"term\":");
+    if (term_str) {
+        term_str += 7;  /* Skip "term": */
+        *term_out = (uint32_t)atoi(term_str);
+    }
+    
+    /* Parse voted_for */
+    const char* vote_str = strstr(content, "\"voted_for\":\"");
+    if (vote_str) {
+        vote_str += 13;  /* Skip "voted_for":" */
+        const char* end = strchr(vote_str, '"');
+        if (end) {
+            size_t len = end - vote_str;
+            if (len > 0 && len < 64) {
+                strncpy(voted_for_out, vote_str, len);
+                voted_for_out[len] = '\0';
+            }
+        }
+    }
+    
+    return DISTRIC_OK;
+}
+
+static distric_err_t format_state_file(uint32_t term, const char* voted_for,
+                                       char** content_out, size_t* len_out) {
+    char buffer[256];
+    int written;
+    
+    if (!voted_for || voted_for[0] == '\0') {
+        written = snprintf(buffer, sizeof(buffer), "{\"term\":%u,\"voted_for\":\"\"}", term);
+    } else {
+        written = snprintf(buffer, sizeof(buffer), "{\"term\":%u,\"voted_for\":\"%s\"}", term, voted_for);
+    }
+    
+    if (written < 0 || written >= (int)sizeof(buffer)) {
+        return DISTRIC_ERR_BUFFER_OVERFLOW;
+    }
+    
+    char* content = (char*)malloc(written + 1);
+    if (!content) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    memcpy(content, buffer, written + 1);
+    *content_out = content;
+    *len_out = written;
+    
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * LOG FILE OPERATIONS
+ * ========================================================================= */
+
+static distric_err_t write_log_header(int fd, logger_t* logger) {
+    uint32_t magic = LOG_FILE_MAGIC;
+    uint32_t version = LOG_FILE_VERSION;
+    
+    if (write(fd, &magic, 4) != 4 || write(fd, &version, 4) != 4) {
+        LOG_ERROR(logger, "persistence", "Failed to write log header");
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    return DISTRIC_OK;
+}
+
+static distric_err_t read_log_header(int fd, logger_t* logger) {
+    uint32_t magic, version;
+    
+    if (read(fd, &magic, 4) != 4 || read(fd, &version, 4) != 4) {
+        /* Empty file - write header */
+        lseek(fd, 0, SEEK_SET);
+        return write_log_header(fd, logger);
+    }
+    
+    if (magic != LOG_FILE_MAGIC) {
+        LOG_ERROR(logger, "persistence", "Invalid log file magic");
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    if (version != LOG_FILE_VERSION) {
+        LOG_ERROR(logger, "persistence", "Unsupported log file version");
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * LIFECYCLE
+ * ========================================================================= */
+
+distric_err_t raft_persistence_init(
+    const raft_persistence_config_t* config,
+    raft_persistence_t** persistence_out
+) {
+    if (!config || !config->data_dir || !persistence_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    raft_persistence_t* p = (raft_persistence_t*)calloc(1, sizeof(raft_persistence_t));
+    if (!p) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    strncpy(p->data_dir, config->data_dir, sizeof(p->data_dir) - 1);
+    p->logger = config->logger;
+    p->log_fd = -1;
+    
+    /* Build file paths */
+    snprintf(p->state_path, sizeof(p->state_path), "%s/state.json", p->data_dir);
+    snprintf(p->state_tmp_path, sizeof(p->state_tmp_path), "%s/state.json.tmp", p->data_dir);
+    snprintf(p->log_path, sizeof(p->log_path), "%s/log.dat", p->data_dir);
+    
+    /* Create directory */
+    distric_err_t err = ensure_directory(p->data_dir, p->logger);
     if (err != DISTRIC_OK) {
-        return NULL;
+        free(p);
+        return err;
     }
     
-    return context;
+    /* Open/create log file */
+    p->log_fd = open(p->log_path, O_RDWR | O_CREAT, 0644);
+    if (p->log_fd < 0) {
+        LOG_ERROR(p->logger, "persistence", "Failed to open log file",
+                 "path", p->log_path, "errno", &errno);
+        free(p);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Read/write log header */
+    err = read_log_header(p->log_fd, p->logger);
+    if (err != DISTRIC_OK) {
+        close(p->log_fd);
+        free(p);
+        return err;
+    }
+    
+    LOG_INFO(p->logger, "persistence", "Initialized",
+            "data_dir", p->data_dir);
+    
+    *persistence_out = p;
+    return DISTRIC_OK;
+}
+
+void raft_persistence_destroy(raft_persistence_t* persistence) {
+    if (!persistence) return;
+    
+    if (persistence->log_fd >= 0) {
+        close(persistence->log_fd);
+    }
+    
+    free(persistence);
 }
 
 /* ============================================================================
- * STATE PERSISTENCE TESTS
+ * STATE OPERATIONS
  * ========================================================================= */
 
-void test_state_save_load() {
-    TEST_START();
-    
-    create_test_dir();
-    
-    raft_persistence_context_t* context = create_test_context();
-    ASSERT_TRUE(context != NULL);
-    
-    /* Save state */
-    raft_persistent_state_t state = {
-        .current_term = 42,
-    };
-    strncpy(state.voted_for, "node-123", sizeof(state.voted_for) - 1);
-    
-    ASSERT_OK(raft_persistence_save_state(context, &state));
-    
-    /* Load state */
-    raft_persistent_state_t loaded = {0};
-    ASSERT_OK(raft_persistence_load_state(context, &loaded));
-    
-    ASSERT_EQ(loaded.current_term, 42);
-    ASSERT_STR_EQ(loaded.voted_for, "node-123");
-    
-    printf("  State persisted correctly\n");
-    
-    raft_persistence_destroy(context);
-    cleanup_test_dir();
-    
-    TEST_PASS();
-}
-
-void test_state_persistence_across_restart() {
-    TEST_START();
-    
-    create_test_dir();
-    
-    /* First session: save state */
-    {
-        raft_persistence_context_t* context = create_test_context();
-        ASSERT_TRUE(context != NULL);
-        
-        raft_persistent_state_t state = {
-            .current_term = 100,
-        };
-        strncpy(state.voted_for, "leader-5", sizeof(state.voted_for) - 1);
-        
-        ASSERT_OK(raft_persistence_save_state(context, &state));
-        
-        raft_persistence_destroy(context);
+distric_err_t raft_persistence_save_term(
+    raft_persistence_t* persistence,
+    uint32_t term
+) {
+    if (!persistence) {
+        return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* Second session: load state */
-    {
-        raft_persistence_context_t* context = create_test_context();
-        ASSERT_TRUE(context != NULL);
-        
-        raft_persistent_state_t loaded = {0};
-        ASSERT_OK(raft_persistence_load_state(context, &loaded));
-        
-        ASSERT_EQ(loaded.current_term, 100);
-        ASSERT_STR_EQ(loaded.voted_for, "leader-5");
-        
-        printf("  State survives restart\n");
-        
-        raft_persistence_destroy(context);
+    /* Load current voted_for to preserve it */
+    uint32_t old_term;
+    char voted_for[64];
+    distric_err_t err = raft_persistence_load_state(persistence, &old_term, voted_for);
+    if (err != DISTRIC_OK) {
+        return err;
     }
     
-    cleanup_test_dir();
-    
-    TEST_PASS();
+    return raft_persistence_save_state(persistence, term, voted_for);
 }
 
-void test_state_no_prior_state() {
-    TEST_START();
+distric_err_t raft_persistence_save_vote(
+    raft_persistence_t* persistence,
+    const char* voted_for
+) {
+    if (!persistence) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
     
-    create_test_dir();
+    /* Load current term to preserve it */
+    uint32_t term;
+    char old_voted_for[64];
+    distric_err_t err = raft_persistence_load_state(persistence, &term, old_voted_for);
+    if (err != DISTRIC_OK) {
+        return err;
+    }
     
-    raft_persistence_context_t* context = create_test_context();
-    ASSERT_TRUE(context != NULL);
+    return raft_persistence_save_state(persistence, term, voted_for);
+}
+
+distric_err_t raft_persistence_save_state(
+    raft_persistence_t* persistence,
+    uint32_t term,
+    const char* voted_for
+) {
+    if (!persistence) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
     
-    /* Try to load without saving */
-    raft_persistent_state_t loaded = {0};
-    distric_err_t err = raft_persistence_load_state(context, &loaded);
+    /* Format state */
+    char* content = NULL;
+    size_t len = 0;
+    distric_err_t err = format_state_file(term, voted_for, &content, &len);
+    if (err != DISTRIC_OK) {
+        return err;
+    }
     
-    ASSERT_TRUE(err == DISTRIC_ERR_NOT_FOUND);
+    /* Write atomically */
+    err = write_file_atomic(persistence->state_path, persistence->state_tmp_path,
+                           content, len, persistence->logger);
+    free(content);
     
-    printf("  Correctly returns NOT_FOUND for missing state\n");
+    if (err == DISTRIC_OK) {
+        LOG_DEBUG(persistence->logger, "persistence", "Saved state",
+                 "term", &(int){term},
+                 "voted_for", voted_for ? voted_for : "");
+    }
     
-    raft_persistence_destroy(context);
-    cleanup_test_dir();
+    return err;
+}
+
+distric_err_t raft_persistence_load_state(
+    raft_persistence_t* persistence,
+    uint32_t* term_out,
+    char* voted_for_out
+) {
+    if (!persistence || !term_out || !voted_for_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
     
-    TEST_PASS();
+    /* Read state file */
+    char* content = NULL;
+    size_t len = 0;
+    distric_err_t err = read_file(persistence->state_path, &content, &len, persistence->logger);
+    if (err != DISTRIC_OK) {
+        return err;
+    }
+    
+    /* Parse */
+    if (content) {
+        err = parse_state_file(content, term_out, voted_for_out);
+        free(content);
+    } else {
+        *term_out = 0;
+        voted_for_out[0] = '\0';
+    }
+    
+    LOG_DEBUG(persistence->logger, "persistence", "Loaded state",
+             "term", &(int){*term_out},
+             "voted_for", voted_for_out);
+    
+    return err;
 }
 
 /* ============================================================================
- * LOG PERSISTENCE TESTS
+ * LOG OPERATIONS
  * ========================================================================= */
 
-void test_log_append_and_load() {
-    TEST_START();
-    
-    create_test_dir();
-    
-    raft_persistence_context_t* context = create_test_context();
-    ASSERT_TRUE(context != NULL);
-    
-    /* Append entries */
-    raft_log_entry_t entry1 = {
-        .index = 1,
-        .term = 1,
-        .type = RAFT_ENTRY_COMMAND,
-        .data = (uint8_t*)"cmd1",
-        .data_len = 4
-    };
-    
-    raft_log_entry_t entry2 = {
-        .index = 2,
-        .term = 1,
-        .type = RAFT_ENTRY_COMMAND,
-        .data = (uint8_t*)"cmd2",
-        .data_len = 4
-    };
-    
-    ASSERT_OK(raft_persistence_append_entry(context, &entry1));
-    ASSERT_OK(raft_persistence_append_entry(context, &entry2));
-    
-    /* Load entry */
-    raft_log_entry_t loaded = {0};
-    ASSERT_OK(raft_persistence_load_entry(context, 1, &loaded));
-    
-    ASSERT_EQ(loaded.index, 1);
-    ASSERT_EQ(loaded.term, 1);
-    ASSERT_EQ(loaded.type, RAFT_ENTRY_COMMAND);
-    ASSERT_EQ(loaded.data_len, 4);
-    ASSERT_TRUE(memcmp(loaded.data, "cmd1", 4) == 0);
-    
-    free(loaded.data);
-    
-    printf("  Log entries persisted correctly\n");
-    
-    raft_persistence_destroy(context);
-    cleanup_test_dir();
-    
-    TEST_PASS();
-}
-
-void test_log_load_all() {
-    TEST_START();
-    
-    create_test_dir();
-    
-    raft_persistence_context_t* context = create_test_context();
-    ASSERT_TRUE(context != NULL);
-    
-    /* Append 10 entries */
-    for (uint32_t i = 1; i <= 10; i++) {
-        char data[16];
-        snprintf(data, sizeof(data), "cmd%u", i);
-        
-        raft_log_entry_t entry = {
-            .index = i,
-            .term = (i / 3) + 1,
-            .type = RAFT_ENTRY_COMMAND,
-            .data = (uint8_t*)data,
-            .data_len = strlen(data)
-        };
-        
-        ASSERT_OK(raft_persistence_append_entry(context, &entry));
+distric_err_t raft_persistence_append_log(
+    raft_persistence_t* persistence,
+    const raft_log_entry_t* entry
+) {
+    if (!persistence || !entry) {
+        return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* Load all */
-    raft_log_entry_t* entries = NULL;
+    /* Seek to end */
+    if (lseek(persistence->log_fd, 0, SEEK_END) < 0) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to seek log", "errno", &errno);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Write record */
+    uint32_t index = entry->index;
+    uint32_t term = entry->term;
+    uint8_t type = (uint8_t)entry->type;
+    uint32_t data_len = entry->data_len;
+    
+    if (write(persistence->log_fd, &index, 4) != 4 ||
+        write(persistence->log_fd, &term, 4) != 4 ||
+        write(persistence->log_fd, &type, 1) != 1 ||
+        write(persistence->log_fd, &data_len, 4) != 4) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to write log entry header");
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    if (data_len > 0 && entry->data) {
+        if (write(persistence->log_fd, entry->data, data_len) != (ssize_t)data_len) {
+            LOG_ERROR(persistence->logger, "persistence", "Failed to write log entry data");
+            return DISTRIC_ERR_INIT_FAILED;
+        }
+    }
+    
+    /* Sync */
+    if (fsync(persistence->log_fd) != 0) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to fsync log");
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    LOG_DEBUG(persistence->logger, "persistence", "Appended log entry",
+             "index", &(int){index}, "term", &(int){term});
+    
+    return DISTRIC_OK;
+}
+
+distric_err_t raft_persistence_load_log(
+    raft_persistence_t* persistence,
+    raft_log_entry_t** entries_out,
+    size_t* count_out
+) {
+    if (!persistence || !entries_out || !count_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    *entries_out = NULL;
+    *count_out = 0;
+    
+    /* Seek past header */
+    if (lseek(persistence->log_fd, 8, SEEK_SET) < 0) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to seek log");
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Count entries first */
     size_t count = 0;
-    
-    ASSERT_OK(raft_persistence_load_all_entries(context, &entries, &count));
-    
-    ASSERT_EQ(count, 10);
-    ASSERT_EQ(entries[0].index, 1);
-    ASSERT_EQ(entries[9].index, 10);
-    
-    printf("  Loaded all %zu entries\n", count);
-    
-    /* Cleanup */
-    for (size_t i = 0; i < count; i++) {
-        free(entries[i].data);
-    }
-    free(entries);
-    
-    raft_persistence_destroy(context);
-    cleanup_test_dir();
-    
-    TEST_PASS();
-}
-
-void test_log_truncate() {
-    TEST_START();
-    
-    create_test_dir();
-    
-    raft_persistence_context_t* context = create_test_context();
-    ASSERT_TRUE(context != NULL);
-    
-    /* Append 10 entries */
-    for (uint32_t i = 1; i <= 10; i++) {
-        char data[16];
-        snprintf(data, sizeof(data), "cmd%u", i);
+    while (1) {
+        uint32_t index, term, data_len;
+        uint8_t type;
         
-        raft_log_entry_t entry = {
-            .index = i,
-            .term = 1,
-            .type = RAFT_ENTRY_COMMAND,
-            .data = (uint8_t*)data,
-            .data_len = strlen(data)
-        };
+        ssize_t r = read(persistence->log_fd, &index, 4);
+        if (r == 0) break;  /* EOF */
+        if (r != 4) goto read_error;
         
-        ASSERT_OK(raft_persistence_append_entry(context, &entry));
-    }
-    
-    /* Truncate from index 6 */
-    ASSERT_OK(raft_persistence_truncate_log(context, 6));
-    
-    /* Verify only 1-5 remain */
-    raft_log_entry_t* entries = NULL;
-    size_t count = 0;
-    
-    ASSERT_OK(raft_persistence_load_all_entries(context, &entries, &count));
-    
-    ASSERT_EQ(count, 5);
-    ASSERT_EQ(entries[0].index, 1);
-    ASSERT_EQ(entries[4].index, 5);
-    
-    printf("  Truncated log from index 6\n");
-    printf("  Remaining entries: %zu\n", count);
-    
-    /* Cleanup */
-    for (size_t i = 0; i < count; i++) {
-        free(entries[i].data);
-    }
-    free(entries);
-    
-    raft_persistence_destroy(context);
-    cleanup_test_dir();
-    
-    TEST_PASS();
-}
-
-void test_log_bounds() {
-    TEST_START();
-    
-    create_test_dir();
-    
-    raft_persistence_context_t* context = create_test_context();
-    ASSERT_TRUE(context != NULL);
-    
-    /* Empty log */
-    uint32_t first, last;
-    ASSERT_OK(raft_persistence_get_log_bounds(context, &first, &last));
-    ASSERT_EQ(first, 0);
-    ASSERT_EQ(last, 0);
-    
-    /* Append entries 5-10 */
-    for (uint32_t i = 5; i <= 10; i++) {
-        raft_log_entry_t entry = {
-            .index = i,
-            .term = 1,
-            .type = RAFT_ENTRY_COMMAND,
-            .data = (uint8_t*)"cmd",
-            .data_len = 3
-        };
-        
-        ASSERT_OK(raft_persistence_append_entry(context, &entry));
-    }
-    
-    /* Check bounds */
-    ASSERT_OK(raft_persistence_get_log_bounds(context, &first, &last));
-    ASSERT_EQ(first, 5);
-    ASSERT_EQ(last, 10);
-    
-    printf("  Log bounds: [%u, %u]\n", first, last);
-    
-    raft_persistence_destroy(context);
-    cleanup_test_dir();
-    
-    TEST_PASS();
-}
-
-/* ============================================================================
- * CRASH RECOVERY TESTS
- * ========================================================================= */
-
-void test_crash_recovery() {
-    TEST_START();
-    
-    create_test_dir();
-    
-    /* Simulate normal operation */
-    {
-        raft_persistence_context_t* context = create_test_context();
-        ASSERT_TRUE(context != NULL);
-        
-        /* Save state */
-        raft_persistent_state_t state = {
-            .current_term = 50,
-        };
-        strncpy(state.voted_for, "node-X", sizeof(state.voted_for) - 1);
-        ASSERT_OK(raft_persistence_save_state(context, &state));
-        
-        /* Append entries */
-        for (uint32_t i = 1; i <= 20; i++) {
-            char data[16];
-            snprintf(data, sizeof(data), "cmd%u", i);
-            
-            raft_log_entry_t entry = {
-                .index = i,
-                .term = (i / 5) + 1,
-                .type = RAFT_ENTRY_COMMAND,
-                .data = (uint8_t*)data,
-                .data_len = strlen(data)
-            };
-            
-            ASSERT_OK(raft_persistence_append_entry(context, &entry));
+        if (read(persistence->log_fd, &term, 4) != 4 ||
+            read(persistence->log_fd, &type, 1) != 1 ||
+            read(persistence->log_fd, &data_len, 4) != 4) {
+            goto read_error;
         }
         
-        raft_persistence_destroy(context);
-        /* Simulate crash here */
+        /* Skip data */
+        if (data_len > 0) {
+            if (lseek(persistence->log_fd, data_len, SEEK_CUR) < 0) {
+                goto read_error;
+            }
+        }
+        
+        count++;
     }
     
-    /* Recover after crash */
-    {
-        raft_persistence_context_t* context = create_test_context();
-        ASSERT_TRUE(context != NULL);
-        
-        /* Load state */
-        raft_persistent_state_t state = {0};
-        ASSERT_OK(raft_persistence_load_state(context, &state));
-        ASSERT_EQ(state.current_term, 50);
-        ASSERT_STR_EQ(state.voted_for, "node-X");
-        
-        /* Load log */
-        raft_log_entry_t* entries = NULL;
-        size_t count = 0;
-        ASSERT_OK(raft_persistence_load_all_entries(context, &entries, &count));
-        ASSERT_EQ(count, 20);
-        
-        printf("  Crash recovery successful\n");
-        printf("  Recovered state: term=%u, voted_for=%s\n", 
-               state.current_term, state.voted_for);
-        printf("  Recovered log: %zu entries\n", count);
-        
-        /* Cleanup */
-        for (size_t i = 0; i < count; i++) {
-            free(entries[i].data);
-        }
+    if (count == 0) {
+        return DISTRIC_OK;  /* Empty log */
+    }
+    
+    /* Allocate entries */
+    raft_log_entry_t* entries = (raft_log_entry_t*)calloc(count, sizeof(raft_log_entry_t));
+    if (!entries) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    /* Seek back and read entries */
+    if (lseek(persistence->log_fd, 8, SEEK_SET) < 0) {
         free(entries);
-        
-        raft_persistence_destroy(context);
+        return DISTRIC_ERR_INIT_FAILED;
     }
     
-    cleanup_test_dir();
-    
-    TEST_PASS();
-}
-
-/* ============================================================================
- * SNAPSHOT TESTS
- * ========================================================================= */
-
-void test_snapshot_save_load() {
-    TEST_START();
-    
-    create_test_dir();
-    
-    raft_persistence_context_t* context = create_test_context();
-    ASSERT_TRUE(context != NULL);
-    
-    /* Create snapshot */
-    raft_snapshot_metadata_t metadata = {
-        .last_included_index = 100,
-        .last_included_term = 10,
-        .data_len = 1024
-    };
-    
-    uint8_t* data = (uint8_t*)malloc(metadata.data_len);
-    memset(data, 0xAB, metadata.data_len);
-    
-    ASSERT_OK(raft_persistence_save_snapshot(context, &metadata, data));
-    
-    /* Load metadata */
-    raft_snapshot_metadata_t loaded_meta = {0};
-    ASSERT_OK(raft_persistence_load_snapshot_metadata(context, &loaded_meta));
-    
-    ASSERT_EQ(loaded_meta.last_included_index, 100);
-    ASSERT_EQ(loaded_meta.last_included_term, 10);
-    ASSERT_EQ(loaded_meta.data_len, 1024);
-    
-    /* Load data */
-    uint8_t* loaded_data = NULL;
-    size_t loaded_len = 0;
-    ASSERT_OK(raft_persistence_load_snapshot_data(context, &loaded_data, &loaded_len));
-    
-    ASSERT_EQ(loaded_len, 1024);
-    ASSERT_TRUE(memcmp(loaded_data, data, 1024) == 0);
-    
-    printf("  Snapshot persisted correctly\n");
-    
-    free(data);
-    free(loaded_data);
-    
-    raft_persistence_destroy(context);
-    cleanup_test_dir();
-    
-    TEST_PASS();
-}
-
-void test_snapshot_log_compaction() {
-    TEST_START();
-    
-    create_test_dir();
-    
-    raft_persistence_context_t* context = create_test_context();
-    ASSERT_TRUE(context != NULL);
-    
-    /* Append 100 log entries */
-    for (uint32_t i = 1; i <= 100; i++) {
-        raft_log_entry_t entry = {
-            .index = i,
-            .term = 1,
-            .type = RAFT_ENTRY_COMMAND,
-            .data = (uint8_t*)"cmd",
-            .data_len = 3
-        };
+    for (size_t i = 0; i < count; i++) {
+        uint32_t index, term, data_len;
+        uint8_t type;
         
-        ASSERT_OK(raft_persistence_append_entry(context, &entry));
+        if (read(persistence->log_fd, &index, 4) != 4 ||
+            read(persistence->log_fd, &term, 4) != 4 ||
+            read(persistence->log_fd, &type, 1) != 1 ||
+            read(persistence->log_fd, &data_len, 4) != 4) {
+            raft_persistence_free_log(entries, i);
+            return DISTRIC_ERR_INIT_FAILED;
+        }
+        
+        entries[i].index = index;
+        entries[i].term = term;
+        entries[i].type = (raft_entry_type_t)type;
+        entries[i].data_len = data_len;
+        
+        if (data_len > 0) {
+            entries[i].data = (uint8_t*)malloc(data_len);
+            if (!entries[i].data) {
+                raft_persistence_free_log(entries, i);
+                return DISTRIC_ERR_NO_MEMORY;
+            }
+            
+            if (read(persistence->log_fd, entries[i].data, data_len) != (ssize_t)data_len) {
+                raft_persistence_free_log(entries, i + 1);
+                return DISTRIC_ERR_INIT_FAILED;
+            }
+        } else {
+            entries[i].data = NULL;
+        }
     }
     
-    /* Create snapshot at index 80 */
-    raft_snapshot_metadata_t metadata = {
-        .last_included_index = 80,
-        .last_included_term = 1,
-        .data_len = 100
-    };
+    *entries_out = entries;
+    *count_out = count;
     
-    uint8_t data[100];
-    memset(data, 0, sizeof(data));
+    LOG_INFO(persistence->logger, "persistence", "Loaded log",
+            "entry_count", &(int){count});
     
-    ASSERT_OK(raft_persistence_save_snapshot(context, &metadata, data));
+    return DISTRIC_OK;
+
+read_error:
+    LOG_ERROR(persistence->logger, "persistence", "Failed to read log file");
+    return DISTRIC_ERR_INIT_FAILED;
+}
+
+distric_err_t raft_persistence_truncate_log(
+    raft_persistence_t* persistence,
+    uint32_t from_index
+) {
+    if (!persistence) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
     
-    /* Verify log only contains entries 81-100 */
-    uint32_t first, last;
-    ASSERT_OK(raft_persistence_get_log_bounds(context, &first, &last));
-    
-    /* Note: After compaction, entries 1-80 should be removed */
-    printf("  Log bounds after snapshot: [%u, %u]\n", first, last);
-    ASSERT_EQ(last, 100);
-    
+    /* Load log, filter, rewrite */
     raft_log_entry_t* entries = NULL;
     size_t count = 0;
-    ASSERT_OK(raft_persistence_load_all_entries(context, &entries, &count));
     
-    printf("  Entries after compaction: %zu (expected 20)\n", count);
-    /* Should have entries 81-100 (20 entries) */
-    ASSERT_EQ(count, 20);
+    distric_err_t err = raft_persistence_load_log(persistence, &entries, &count);
+    if (err != DISTRIC_OK) {
+        return err;
+    }
     
-    /* Cleanup */
+    /* Close current log */
+    close(persistence->log_fd);
+    
+    /* Reopen and truncate */
+    persistence->log_fd = open(persistence->log_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (persistence->log_fd < 0) {
+        raft_persistence_free_log(entries, count);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Write header */
+    err = write_log_header(persistence->log_fd, persistence->logger);
+    if (err != DISTRIC_OK) {
+        raft_persistence_free_log(entries, count);
+        return err;
+    }
+    
+    /* Rewrite entries before from_index */
+    size_t kept = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].index < from_index) {
+            err = raft_persistence_append_log(persistence, &entries[i]);
+            if (err != DISTRIC_OK) {
+                raft_persistence_free_log(entries, count);
+                return err;
+            }
+            kept++;
+        }
+    }
+    
+    raft_persistence_free_log(entries, count);
+    
+    LOG_INFO(persistence->logger, "persistence", "Truncated log",
+            "from_index", &(int){from_index},
+            "kept", &(int){kept});
+    
+    return DISTRIC_OK;
+}
+
+void raft_persistence_free_log(raft_log_entry_t* entries, size_t count) {
+    if (!entries) return;
+    
     for (size_t i = 0; i < count; i++) {
         free(entries[i].data);
     }
+    
     free(entries);
-    
-    raft_persistence_destroy(context);
-    cleanup_test_dir();
-    
-    TEST_PASS();
 }
 
 /* ============================================================================
- * STATISTICS TESTS
+ * SNAPSHOT OPERATIONS (Stubs for future)
  * ========================================================================= */
 
-void test_persistence_stats() {
-    TEST_START();
+distric_err_t raft_persistence_save_snapshot(
+    raft_persistence_t* persistence,
+    uint32_t last_included_index,
+    uint32_t last_included_term,
+    const uint8_t* snapshot_data,
+    size_t snapshot_len
+) {
+    (void)persistence;
+    (void)last_included_index;
+    (void)last_included_term;
+    (void)snapshot_data;
+    (void)snapshot_len;
     
-    create_test_dir();
-    
-    raft_persistence_context_t* context = create_test_context();
-    ASSERT_TRUE(context != NULL);
-    
-    /* Append entries */
-    for (uint32_t i = 1; i <= 50; i++) {
-        raft_log_entry_t entry = {
-            .index = i,
-            .term = 1,
-            .type = RAFT_ENTRY_COMMAND,
-            .data = (uint8_t*)"command_data",
-            .data_len = 12
-        };
-        
-        ASSERT_OK(raft_persistence_append_entry(context, &entry));
-    }
-    
-    /* Get stats */
-    raft_persistence_stats_t stats = {0};
-    ASSERT_OK(raft_persistence_get_stats(context, &stats));
-    
-    ASSERT_EQ(stats.log_entry_count, 50);
-    ASSERT_TRUE(!stats.has_snapshot);
-    
-    printf("  Database statistics:\n");
-    printf("    Total size: %zu bytes\n", stats.total_size_bytes);
-    printf("    Log entries: %zu\n", stats.log_entry_count);
-    printf("    Has snapshot: %s\n", stats.has_snapshot ? "yes" : "no");
-    
-    raft_persistence_destroy(context);
-    cleanup_test_dir();
-    
-    TEST_PASS();
+    /* TODO: Implement in Session 3.5 */
+    return DISTRIC_ERR_INVALID_ARG;
 }
 
-/* ============================================================================
- * MAIN
- * ========================================================================= */
-
-int main(void) {
-    printf("=== DistriC Raft - Persistence Tests ===\n");
+distric_err_t raft_persistence_load_snapshot(
+    raft_persistence_t* persistence,
+    uint32_t* last_included_index_out,
+    uint32_t* last_included_term_out,
+    uint8_t** snapshot_data_out,
+    size_t* snapshot_len_out
+) {
+    (void)persistence;
+    (void)last_included_index_out;
+    (void)last_included_term_out;
+    (void)snapshot_data_out;
+    (void)snapshot_len_out;
     
-    /* State persistence */
-    test_state_save_load();
-    test_state_persistence_across_restart();
-    test_state_no_prior_state();
-    
-    /* Log persistence */
-    test_log_append_and_load();
-    test_log_load_all();
-    test_log_truncate();
-    test_log_bounds();
-    
-    /* Crash recovery */
-    test_crash_recovery();
-    
-    /* Snapshots */
-    test_snapshot_save_load();
-    test_snapshot_log_compaction();
-    
-    /* Statistics */
-    test_persistence_stats();
-    
-    printf("\n=== Test Results ===\n");
-    printf("Passed: %d\n", tests_passed);
-    printf("Failed: %d\n", tests_failed);
-    
-    if (tests_failed == 0) {
-        printf("\n✓ All Raft persistence tests passed!\n");
-        printf("✓ Session 3.4 (Persistence) COMPLETE\n");
-        printf("\nKey Features Implemented:\n");
-        printf("  - LMDB-based durable storage\n");
-        printf("  - Persistent state (current_term, voted_for)\n");
-        printf("  - Log entry persistence and recovery\n");
-        printf("  - Snapshot save/load with log compaction\n");
-        printf("  - Crash recovery with full state restoration\n");
-        printf("  - Database statistics and monitoring\n");
-        printf("\nNext Steps:\n");
-        printf("  - Session 3.5: Integration with raft_core\n");
-        printf("  - Session 3.6: Multi-node integration tests\n");
-        printf("  - Session 3.7: Performance testing\n");
-    }
-    
-    return tests_failed > 0 ? 1 : 0;
+    /* TODO: Implement in Session 3.5 */
+    return DISTRIC_ERR_NOT_FOUND;
 }

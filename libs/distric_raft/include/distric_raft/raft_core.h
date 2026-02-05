@@ -118,6 +118,9 @@ struct raft_config {
     /* Log configuration */
     uint32_t snapshot_threshold;       /**< Snapshot after N log entries (default: 10000) */
     
+    /* Persistence configuration */
+    const char* persistence_data_dir;  /**< Directory for persistent storage (NULL to disable) */
+    
     /* Callbacks */
     raft_apply_fn_t apply_fn;           /**< State machine apply callback */
     raft_state_change_fn_t state_change_fn;  /**< State change callback */
