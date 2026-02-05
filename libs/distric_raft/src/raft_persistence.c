@@ -1,8 +1,26 @@
 /**
  * @file raft_persistence.c
- * @brief Raft Persistence Implementation using LMDB
+ * @brief Raft Persistence Implementation
  * 
- * Provides durable storage for Raft state, log, and snapshots.
+ * Simple file-based persistence with no external dependencies.
+ * 
+ * File Layout:
+ *   /data_dir/state.json     - Current term and voted_for
+ *   /data_dir/log.dat        - Binary log entries
+ *   /data_dir/snapshot.dat   - Snapshot (future)
+ * 
+ * State Format (JSON):
+ *   {"term":42,"voted_for":"node-3"}
+ * 
+ * Log Format (binary):
+ *   [4 bytes: magic "RAFT"]
+ *   [4 bytes: version = 1]
+ *   Repeated records:
+ *     [4 bytes: index]
+ *     [4 bytes: term]
+ *     [1 byte: type]
+ *     [4 bytes: data_len]
+ *     [data_len bytes: data]
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -14,927 +32,690 @@
 #endif
 
 #include "distric_raft/raft_persistence.h"
-#include <lmdb.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <errno.h>
+#include <stdint.h>
+
+/* ============================================================================
+ * CONSTANTS
+ * ========================================================================= */
+
+#define LOG_FILE_MAGIC 0x52414654  /* "RAFT" */
+#define LOG_FILE_VERSION 1
+
+#define MAX_PATH_LEN 512
 
 /* ============================================================================
  * INTERNAL STRUCTURES
  * ========================================================================= */
 
-/**
- * @brief Persistence context
- */
-struct raft_persistence_context {
-    /* Configuration */
-    raft_persistence_config_t config;
+struct raft_persistence {
+    char data_dir[256];
+    char state_path[MAX_PATH_LEN];
+    char state_tmp_path[MAX_PATH_LEN];
+    char log_path[MAX_PATH_LEN];
     
-    /* LMDB environment */
-    MDB_env* env;
+    int log_fd;                    /* File descriptor for log file */
     
-    /* LMDB databases */
-    MDB_dbi state_db;       /**< Persistent state (term, voted_for) */
-    MDB_dbi log_db;         /**< Log entries (key=index, value=entry) */
-    MDB_dbi snapshot_db;    /**< Snapshot (metadata + data) */
-    
-    /* Statistics */
-    _Atomic size_t total_writes;
-    _Atomic size_t total_reads;
+    logger_t* logger;
 };
 
-/* Database keys */
-#define STATE_KEY_TERM "current_term"
-#define STATE_KEY_VOTED_FOR "voted_for"
-#define SNAPSHOT_KEY_METADATA "metadata"
-#define SNAPSHOT_KEY_DATA "data"
-
 /* ============================================================================
- * LMDB ERROR HANDLING
+ * FILE UTILITIES
  * ========================================================================= */
 
-static distric_err_t lmdb_err_to_distric(int mdb_err) {
-    switch (mdb_err) {
-        case MDB_SUCCESS:
+static distric_err_t ensure_directory(const char* path, logger_t* logger) {
+    struct stat st;
+    
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
             return DISTRIC_OK;
-        case MDB_NOTFOUND:
-            return DISTRIC_ERR_NOT_FOUND;
-        case ENOMEM:
-        case MDB_MAP_FULL:
-            return DISTRIC_ERR_NO_MEMORY;
-        default:
-            return DISTRIC_ERR_INIT_FAILED;
+        }
+        LOG_ERROR(logger, "persistence", "Path exists but is not a directory", "path", path);
+        return DISTRIC_ERR_INVALID_ARG;
     }
+    
+    if (mkdir(path, 0755) != 0) {
+        LOG_ERROR(logger, "persistence", "Failed to create directory",
+                 "path", path, "errno", &errno);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    LOG_INFO(logger, "persistence", "Created directory", "path", path);
+    return DISTRIC_OK;
+}
+
+static distric_err_t write_file_atomic(const char* path, const char* tmp_path,
+                                       const void* data, size_t len, logger_t* logger) {
+    /* Write to temporary file */
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        LOG_ERROR(logger, "persistence", "Failed to create tmp file",
+                 "path", tmp_path, "errno", &errno);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    ssize_t written = write(fd, data, len);
+    if (written != (ssize_t)len) {
+        LOG_ERROR(logger, "persistence", "Failed to write tmp file",
+                 "expected", &(int){len}, "written", &(int){written});
+        close(fd);
+        unlink(tmp_path);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Sync to disk */
+    if (fsync(fd) != 0) {
+        LOG_ERROR(logger, "persistence", "Failed to fsync tmp file", "errno", &errno);
+        close(fd);
+        unlink(tmp_path);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    close(fd);
+    
+    /* Atomic rename */
+    if (rename(tmp_path, path) != 0) {
+        LOG_ERROR(logger, "persistence", "Failed to rename tmp file", "errno", &errno);
+        unlink(tmp_path);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    return DISTRIC_OK;
+}
+
+static distric_err_t read_file(const char* path, char** data_out, size_t* len_out, logger_t* logger) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            *data_out = NULL;
+            *len_out = 0;
+            return DISTRIC_OK;  /* File doesn't exist yet */
+        }
+        LOG_ERROR(logger, "persistence", "Failed to open file", "path", path, "errno", &errno);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Get file size */
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        LOG_ERROR(logger, "persistence", "Failed to stat file", "errno", &errno);
+        close(fd);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    size_t size = st.st_size;
+    if (size == 0) {
+        close(fd);
+        *data_out = NULL;
+        *len_out = 0;
+        return DISTRIC_OK;
+    }
+    
+    /* Allocate buffer */
+    char* buffer = (char*)malloc(size + 1);  /* +1 for null terminator */
+    if (!buffer) {
+        close(fd);
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    /* Read file */
+    ssize_t bytes_read = read(fd, buffer, size);
+    close(fd);
+    
+    if (bytes_read != (ssize_t)size) {
+        LOG_ERROR(logger, "persistence", "Failed to read complete file");
+        free(buffer);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    buffer[size] = '\0';  /* Null terminate for text parsing */
+    
+    *data_out = buffer;
+    *len_out = size;
+    
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * STATE FILE OPERATIONS (Simple JSON-like format)
+ * ========================================================================= */
+
+static distric_err_t parse_state_file(const char* content, uint32_t* term_out, char* voted_for_out) {
+    /* Very simple parser for: {"term":42,"voted_for":"node-3"} */
+    *term_out = 0;
+    voted_for_out[0] = '\0';
+    
+    if (!content || strlen(content) == 0) {
+        return DISTRIC_OK;  /* Empty state */
+    }
+    
+    /* Parse term */
+    const char* term_str = strstr(content, "\"term\":");
+    if (term_str) {
+        term_str += 7;  /* Skip "term": */
+        *term_out = (uint32_t)atoi(term_str);
+    }
+    
+    /* Parse voted_for */
+    const char* vote_str = strstr(content, "\"voted_for\":\"");
+    if (vote_str) {
+        vote_str += 13;  /* Skip "voted_for":" */
+        const char* end = strchr(vote_str, '"');
+        if (end) {
+            size_t len = end - vote_str;
+            if (len > 0 && len < 64) {
+                strncpy(voted_for_out, vote_str, len);
+                voted_for_out[len] = '\0';
+            }
+        }
+    }
+    
+    return DISTRIC_OK;
+}
+
+static distric_err_t format_state_file(uint32_t term, const char* voted_for,
+                                       char** content_out, size_t* len_out) {
+    char buffer[256];
+    int written;
+    
+    if (!voted_for || voted_for[0] == '\0') {
+        written = snprintf(buffer, sizeof(buffer), "{\"term\":%u,\"voted_for\":\"\"}", term);
+    } else {
+        written = snprintf(buffer, sizeof(buffer), "{\"term\":%u,\"voted_for\":\"%s\"}", term, voted_for);
+    }
+    
+    if (written < 0 || written >= (int)sizeof(buffer)) {
+        return DISTRIC_ERR_BUFFER_OVERFLOW;
+    }
+    
+    char* content = (char*)malloc(written + 1);
+    if (!content) {
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    memcpy(content, buffer, written + 1);
+    *content_out = content;
+    *len_out = written;
+    
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * LOG FILE OPERATIONS
+ * ========================================================================= */
+
+static distric_err_t write_log_header(int fd, logger_t* logger) {
+    uint32_t magic = LOG_FILE_MAGIC;
+    uint32_t version = LOG_FILE_VERSION;
+    
+    if (write(fd, &magic, 4) != 4 || write(fd, &version, 4) != 4) {
+        LOG_ERROR(logger, "persistence", "Failed to write log header");
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    return DISTRIC_OK;
+}
+
+static distric_err_t read_log_header(int fd, logger_t* logger) {
+    uint32_t magic, version;
+    
+    if (read(fd, &magic, 4) != 4 || read(fd, &version, 4) != 4) {
+        /* Empty file - write header */
+        lseek(fd, 0, SEEK_SET);
+        return write_log_header(fd, logger);
+    }
+    
+    if (magic != LOG_FILE_MAGIC) {
+        LOG_ERROR(logger, "persistence", "Invalid log file magic");
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    if (version != LOG_FILE_VERSION) {
+        LOG_ERROR(logger, "persistence", "Unsupported log file version");
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    return DISTRIC_OK;
 }
 
 /* ============================================================================
  * LIFECYCLE
  * ========================================================================= */
 
-distric_err_t raft_persistence_create(
+distric_err_t raft_persistence_init(
     const raft_persistence_config_t* config,
-    raft_persistence_context_t** context_out
+    raft_persistence_t** persistence_out
 ) {
-    if (!config || !config->data_dir || !context_out) {
+    if (!config || !config->data_dir || !persistence_out) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    raft_persistence_context_t* context = (raft_persistence_context_t*)calloc(
-        1, sizeof(raft_persistence_context_t));
-    if (!context) {
+    raft_persistence_t* p = (raft_persistence_t*)calloc(1, sizeof(raft_persistence_t));
+    if (!p) {
         return DISTRIC_ERR_NO_MEMORY;
     }
     
-    /* Copy configuration */
-    memcpy(&context->config, config, sizeof(raft_persistence_config_t));
-    if (context->config.max_db_size_mb == 0) {
-        context->config.max_db_size_mb = 1024;  /* Default: 1GB */
+    strncpy(p->data_dir, config->data_dir, sizeof(p->data_dir) - 1);
+    p->logger = config->logger;
+    p->log_fd = -1;
+    
+    /* Build file paths */
+    snprintf(p->state_path, sizeof(p->state_path), "%s/state.json", p->data_dir);
+    snprintf(p->state_tmp_path, sizeof(p->state_tmp_path), "%s/state.json.tmp", p->data_dir);
+    snprintf(p->log_path, sizeof(p->log_path), "%s/log.dat", p->data_dir);
+    
+    /* Create directory */
+    distric_err_t err = ensure_directory(p->data_dir, p->logger);
+    if (err != DISTRIC_OK) {
+        free(p);
+        return err;
     }
     
-    /* Create data directory if it doesn't exist */
-    struct stat st;
-    if (stat(config->data_dir, &st) != 0) {
-        if (mkdir(config->data_dir, 0755) != 0) {
-            LOG_ERROR(config->logger, "raft_persistence", 
-                     "Failed to create data directory",
-                     "dir", config->data_dir,
-                     "error", strerror(errno));
-            free(context);
-            return DISTRIC_ERR_INIT_FAILED;
-        }
-    }
-    
-    /* Create LMDB environment */
-    int rc = mdb_env_create(&context->env);
-    if (rc != MDB_SUCCESS) {
-        LOG_ERROR(config->logger, "raft_persistence", 
-                 "Failed to create LMDB environment",
-                 "error", mdb_strerror(rc));
-        free(context);
+    /* Open/create log file */
+    p->log_fd = open(p->log_path, O_RDWR | O_CREAT, 0644);
+    if (p->log_fd < 0) {
+        LOG_ERROR(p->logger, "persistence", "Failed to open log file",
+                 "path", p->log_path, "errno", &errno);
+        free(p);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
-    /* Set map size (max database size) */
-    size_t map_size = (size_t)context->config.max_db_size_mb * 1024 * 1024;
-    rc = mdb_env_set_mapsize(context->env, map_size);
-    if (rc != MDB_SUCCESS) {
-        LOG_ERROR(config->logger, "raft_persistence", 
-                 "Failed to set LMDB map size",
-                 "error", mdb_strerror(rc));
-        mdb_env_close(context->env);
-        free(context);
-        return DISTRIC_ERR_INIT_FAILED;
+    /* Read/write log header */
+    err = read_log_header(p->log_fd, p->logger);
+    if (err != DISTRIC_OK) {
+        close(p->log_fd);
+        free(p);
+        return err;
     }
     
-    /* Set max databases */
-    rc = mdb_env_set_maxdbs(context->env, 3);  /* state, log, snapshot */
-    if (rc != MDB_SUCCESS) {
-        LOG_ERROR(config->logger, "raft_persistence", 
-                 "Failed to set max databases",
-                 "error", mdb_strerror(rc));
-        mdb_env_close(context->env);
-        free(context);
-        return DISTRIC_ERR_INIT_FAILED;
-    }
+    LOG_INFO(p->logger, "persistence", "Initialized",
+            "data_dir", p->data_dir);
     
-    /* Open environment */
-    unsigned int env_flags = MDB_NOSUBDIR;
-    if (!context->config.sync_on_write) {
-        env_flags |= MDB_NOSYNC;  /* Faster but less durable */
-    }
-    
-    char db_path[512];
-    snprintf(db_path, sizeof(db_path), "%s/raft.mdb", config->data_dir);
-    
-    rc = mdb_env_open(context->env, db_path, env_flags, 0644);
-    if (rc != MDB_SUCCESS) {
-        LOG_ERROR(config->logger, "raft_persistence", 
-                 "Failed to open LMDB environment",
-                 "path", db_path,
-                 "error", mdb_strerror(rc));
-        mdb_env_close(context->env);
-        free(context);
-        return DISTRIC_ERR_INIT_FAILED;
-    }
-    
-    /* Open databases */
-    MDB_txn* txn = NULL;
-    rc = mdb_txn_begin(context->env, NULL, 0, &txn);
-    if (rc != MDB_SUCCESS) {
-        mdb_env_close(context->env);
-        free(context);
-        return DISTRIC_ERR_INIT_FAILED;
-    }
-    
-    /* State database */
-    rc = mdb_dbi_open(txn, "state", MDB_CREATE, &context->state_db);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        mdb_env_close(context->env);
-        free(context);
-        return DISTRIC_ERR_INIT_FAILED;
-    }
-    
-    /* Log database (integer keys for indices) */
-    rc = mdb_dbi_open(txn, "log", MDB_CREATE | MDB_INTEGERKEY, &context->log_db);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        mdb_env_close(context->env);
-        free(context);
-        return DISTRIC_ERR_INIT_FAILED;
-    }
-    
-    /* Snapshot database */
-    rc = mdb_dbi_open(txn, "snapshot", MDB_CREATE, &context->snapshot_db);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        mdb_env_close(context->env);
-        free(context);
-        return DISTRIC_ERR_INIT_FAILED;
-    }
-    
-    /* Commit transaction */
-    rc = mdb_txn_commit(txn);
-    if (rc != MDB_SUCCESS) {
-        mdb_env_close(context->env);
-        free(context);
-        return DISTRIC_ERR_INIT_FAILED;
-    }
-    
-    LOG_INFO(config->logger, "raft_persistence", "Persistence initialized",
-            "data_dir", config->data_dir,
-            "max_size_mb", &(int){context->config.max_db_size_mb},
-            "sync", context->config.sync_on_write ? "enabled" : "disabled");
-    
-    *context_out = context;
+    *persistence_out = p;
     return DISTRIC_OK;
 }
 
-void raft_persistence_destroy(raft_persistence_context_t* context) {
-    if (!context) return;
+void raft_persistence_destroy(raft_persistence_t* persistence) {
+    if (!persistence) return;
     
-    /* Close databases */
-    if (context->env) {
-        mdb_env_sync(context->env, 1);  /* Force sync */
-        mdb_env_close(context->env);
+    if (persistence->log_fd >= 0) {
+        close(persistence->log_fd);
     }
     
-    LOG_INFO(context->config.logger, "raft_persistence", "Persistence destroyed",
-            "total_writes", &(int){atomic_load(&context->total_writes)},
-            "total_reads", &(int){atomic_load(&context->total_reads)});
-    
-    free(context);
+    free(persistence);
 }
 
 /* ============================================================================
- * STATE PERSISTENCE
+ * STATE OPERATIONS
  * ========================================================================= */
+
+distric_err_t raft_persistence_save_term(
+    raft_persistence_t* persistence,
+    uint32_t term
+) {
+    if (!persistence) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    /* Load current voted_for to preserve it */
+    uint32_t old_term;
+    char voted_for[64];
+    distric_err_t err = raft_persistence_load_state(persistence, &old_term, voted_for);
+    if (err != DISTRIC_OK && err != DISTRIC_ERR_NOT_FOUND) {
+        return err;
+    }
+    
+    return raft_persistence_save_state(persistence, term, voted_for);
+}
+
+distric_err_t raft_persistence_save_vote(
+    raft_persistence_t* persistence,
+    const char* voted_for
+) {
+    if (!persistence) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    /* Load current term to preserve it */
+    uint32_t term;
+    char old_voted_for[64];
+    distric_err_t err = raft_persistence_load_state(persistence, &term, old_voted_for);
+    if (err != DISTRIC_OK && err != DISTRIC_ERR_NOT_FOUND) {
+        return err;
+    }
+    
+    return raft_persistence_save_state(persistence, term, voted_for);
+}
 
 distric_err_t raft_persistence_save_state(
-    raft_persistence_context_t* context,
-    const raft_persistent_state_t* state
+    raft_persistence_t* persistence,
+    uint32_t term,
+    const char* voted_for
 ) {
-    if (!context || !state) {
+    if (!persistence) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, 0, &txn);
-    if (rc != MDB_SUCCESS) {
-        LOG_ERROR(context->config.logger, "raft_persistence",
-                 "Failed to begin transaction",
-                 "error", mdb_strerror(rc));
-        return lmdb_err_to_distric(rc);
+    /* Format state */
+    char* content = NULL;
+    size_t len = 0;
+    distric_err_t err = format_state_file(term, voted_for, &content, &len);
+    if (err != DISTRIC_OK) {
+        return err;
     }
     
-    /* Save current_term */
-    MDB_val key, val;
-    key.mv_data = (void*)STATE_KEY_TERM;
-    key.mv_size = strlen(STATE_KEY_TERM);
-    val.mv_data = (void*)&state->current_term;
-    val.mv_size = sizeof(state->current_term);
-    
-    rc = mdb_put(txn, context->state_db, &key, &val, 0);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        LOG_ERROR(context->config.logger, "raft_persistence",
-                 "Failed to save current_term",
-                 "error", mdb_strerror(rc));
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Save voted_for */
-    key.mv_data = (void*)STATE_KEY_VOTED_FOR;
-    key.mv_size = strlen(STATE_KEY_VOTED_FOR);
-    val.mv_data = (void*)state->voted_for;
-    val.mv_size = strlen(state->voted_for) + 1;  /* Include null terminator */
-    
-    rc = mdb_put(txn, context->state_db, &key, &val, 0);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        LOG_ERROR(context->config.logger, "raft_persistence",
-                 "Failed to save voted_for",
-                 "error", mdb_strerror(rc));
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Commit */
-    rc = mdb_txn_commit(txn);
-    if (rc != MDB_SUCCESS) {
-        LOG_ERROR(context->config.logger, "raft_persistence",
-                 "Failed to commit state",
-                 "error", mdb_strerror(rc));
-        return lmdb_err_to_distric(rc);
-    }
-    
-    atomic_fetch_add(&context->total_writes, 1);
-    
-    LOG_DEBUG(context->config.logger, "raft_persistence", "State saved",
-             "term", &(int){state->current_term},
-             "voted_for", state->voted_for);
-    
-    return DISTRIC_OK;
-}
-
-distric_err_t raft_persistence_load_state(
-    raft_persistence_context_t* context,
-    raft_persistent_state_t* state_out
-) {
-    if (!context || !state_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    memset(state_out, 0, sizeof(raft_persistent_state_t));
-    
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, MDB_RDONLY, &txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Load current_term */
-    MDB_val key, val;
-    key.mv_data = (void*)STATE_KEY_TERM;
-    key.mv_size = strlen(STATE_KEY_TERM);
-    
-    rc = mdb_get(txn, context->state_db, &key, &val);
-    if (rc == MDB_NOTFOUND) {
-        mdb_txn_abort(txn);
-        return DISTRIC_ERR_NOT_FOUND;
-    } else if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        return lmdb_err_to_distric(rc);
-    }
-    
-    memcpy(&state_out->current_term, val.mv_data, sizeof(uint32_t));
-    
-    /* Load voted_for */
-    key.mv_data = (void*)STATE_KEY_VOTED_FOR;
-    key.mv_size = strlen(STATE_KEY_VOTED_FOR);
-    
-    rc = mdb_get(txn, context->state_db, &key, &val);
-    if (rc == MDB_SUCCESS) {
-        size_t len = val.mv_size < sizeof(state_out->voted_for) ? 
-                     val.mv_size : sizeof(state_out->voted_for) - 1;
-        memcpy(state_out->voted_for, val.mv_data, len);
-        state_out->voted_for[len] = '\0';
-    } else if (rc != MDB_NOTFOUND) {
-        mdb_txn_abort(txn);
-        return lmdb_err_to_distric(rc);
-    }
-    
-    mdb_txn_abort(txn);
-    
-    atomic_fetch_add(&context->total_reads, 1);
-    
-    LOG_DEBUG(context->config.logger, "raft_persistence", "State loaded",
-             "term", &(int){state_out->current_term},
-             "voted_for", state_out->voted_for);
-    
-    return DISTRIC_OK;
-}
-
-/* ============================================================================
- * LOG PERSISTENCE
- * ========================================================================= */
-
-/**
- * @brief Serialized log entry format
- * 
- * [uint32_t index]
- * [uint32_t term]
- * [uint8_t type]
- * [uint32_t data_len]
- * [uint8_t data[data_len]]
- */
-
-static size_t serialize_log_entry(const raft_log_entry_t* entry, uint8_t** buf_out) {
-    size_t total_len = sizeof(uint32_t) * 3 + sizeof(uint8_t) + entry->data_len;
-    
-    uint8_t* buf = (uint8_t*)malloc(total_len);
-    if (!buf) {
-        return 0;
-    }
-    
-    size_t offset = 0;
-    
-    /* Index */
-    memcpy(buf + offset, &entry->index, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    /* Term */
-    memcpy(buf + offset, &entry->term, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    /* Type */
-    memcpy(buf + offset, &entry->type, sizeof(uint8_t));
-    offset += sizeof(uint8_t);
-    
-    /* Data length */
-    memcpy(buf + offset, &entry->data_len, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    /* Data */
-    if (entry->data && entry->data_len > 0) {
-        memcpy(buf + offset, entry->data, entry->data_len);
-    }
-    
-    *buf_out = buf;
-    return total_len;
-}
-
-static distric_err_t deserialize_log_entry(const uint8_t* buf, size_t len, 
-                                           raft_log_entry_t* entry_out) {
-    if (len < sizeof(uint32_t) * 3 + sizeof(uint8_t)) {
-        return DISTRIC_ERR_INVALID_FORMAT;
-    }
-    
-    size_t offset = 0;
-    
-    /* Index */
-    memcpy(&entry_out->index, buf + offset, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    /* Term */
-    memcpy(&entry_out->term, buf + offset, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    /* Type */
-    memcpy(&entry_out->type, buf + offset, sizeof(uint8_t));
-    offset += sizeof(uint8_t);
-    
-    /* Data length */
-    memcpy(&entry_out->data_len, buf + offset, sizeof(uint32_t));
-    offset += sizeof(uint32_t);
-    
-    /* Data */
-    if (entry_out->data_len > 0) {
-        if (offset + entry_out->data_len > len) {
-            return DISTRIC_ERR_INVALID_FORMAT;
-        }
-        
-        entry_out->data = (uint8_t*)malloc(entry_out->data_len);
-        if (!entry_out->data) {
-            return DISTRIC_ERR_NO_MEMORY;
-        }
-        
-        memcpy(entry_out->data, buf + offset, entry_out->data_len);
-    } else {
-        entry_out->data = NULL;
-    }
-    
-    return DISTRIC_OK;
-}
-
-distric_err_t raft_persistence_append_entry(
-    raft_persistence_context_t* context,
-    const raft_log_entry_t* entry
-) {
-    if (!context || !entry) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    /* Serialize entry */
-    uint8_t* buf = NULL;
-    size_t len = serialize_log_entry(entry, &buf);
-    if (len == 0) {
-        return DISTRIC_ERR_NO_MEMORY;
-    }
-    
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, 0, &txn);
-    if (rc != MDB_SUCCESS) {
-        free(buf);
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Store with index as key */
-    MDB_val key, val;
-    key.mv_data = (void*)&entry->index;
-    key.mv_size = sizeof(uint32_t);
-    val.mv_data = buf;
-    val.mv_size = len;
-    
-    rc = mdb_put(txn, context->log_db, &key, &val, 0);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        free(buf);
-        LOG_ERROR(context->config.logger, "raft_persistence",
-                 "Failed to append log entry",
-                 "index", &(int){entry->index},
-                 "error", mdb_strerror(rc));
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Commit */
-    rc = mdb_txn_commit(txn);
-    free(buf);
-    
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    atomic_fetch_add(&context->total_writes, 1);
-    
-    LOG_DEBUG(context->config.logger, "raft_persistence", "Entry appended",
-             "index", &(int){entry->index},
-             "term", &(int){entry->term});
-    
-    return DISTRIC_OK;
-}
-
-distric_err_t raft_persistence_load_entry(
-    raft_persistence_context_t* context,
-    uint32_t index,
-    raft_log_entry_t* entry_out
-) {
-    if (!context || !entry_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    memset(entry_out, 0, sizeof(raft_log_entry_t));
-    
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, MDB_RDONLY, &txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    MDB_val key, val;
-    key.mv_data = &index;
-    key.mv_size = sizeof(uint32_t);
-    
-    rc = mdb_get(txn, context->log_db, &key, &val);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Deserialize */
-    distric_err_t err = deserialize_log_entry((const uint8_t*)val.mv_data, 
-                                              val.mv_size, entry_out);
-    
-    mdb_txn_abort(txn);
+    /* Write atomically */
+    err = write_file_atomic(persistence->state_path, persistence->state_tmp_path,
+                           content, len, persistence->logger);
+    free(content);
     
     if (err == DISTRIC_OK) {
-        atomic_fetch_add(&context->total_reads, 1);
+        LOG_DEBUG(persistence->logger, "persistence", "Saved state",
+                 "term", &(int){term},
+                 "voted_for", voted_for ? voted_for : "");
     }
     
     return err;
 }
 
-distric_err_t raft_persistence_load_all_entries(
-    raft_persistence_context_t* context,
+distric_err_t raft_persistence_load_state(
+    raft_persistence_t* persistence,
+    uint32_t* term_out,
+    char* voted_for_out
+) {
+    if (!persistence || !term_out || !voted_for_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    /* Read state file */
+    char* content = NULL;
+    size_t len = 0;
+    distric_err_t err = read_file(persistence->state_path, &content, &len, persistence->logger);
+    if (err != DISTRIC_OK) {
+        return err;
+    }
+    
+    /* Parse */
+    if (content) {
+        err = parse_state_file(content, term_out, voted_for_out);
+        free(content);
+    } else {
+        *term_out = 0;
+        voted_for_out[0] = '\0';
+        return DISTRIC_ERR_NOT_FOUND;
+    }
+    
+    LOG_DEBUG(persistence->logger, "persistence", "Loaded state",
+             "term", &(int){*term_out},
+             "voted_for", voted_for_out);
+    
+    return err;
+}
+
+/* ============================================================================
+ * LOG OPERATIONS
+ * ========================================================================= */
+
+distric_err_t raft_persistence_append_log(
+    raft_persistence_t* persistence,
+    const raft_log_entry_t* entry
+) {
+    if (!persistence || !entry) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    /* Seek to end */
+    if (lseek(persistence->log_fd, 0, SEEK_END) < 0) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to seek log", "errno", &errno);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Write record */
+    uint32_t index = entry->index;
+    uint32_t term = entry->term;
+    uint8_t type = (uint8_t)entry->type;
+    uint32_t data_len = entry->data_len;
+    
+    if (write(persistence->log_fd, &index, 4) != 4 ||
+        write(persistence->log_fd, &term, 4) != 4 ||
+        write(persistence->log_fd, &type, 1) != 1 ||
+        write(persistence->log_fd, &data_len, 4) != 4) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to write log entry header");
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    if (data_len > 0 && entry->data) {
+        if (write(persistence->log_fd, entry->data, data_len) != (ssize_t)data_len) {
+            LOG_ERROR(persistence->logger, "persistence", "Failed to write log entry data");
+            return DISTRIC_ERR_INIT_FAILED;
+        }
+    }
+    
+    /* Sync */
+    if (fsync(persistence->log_fd) != 0) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to fsync log");
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    LOG_DEBUG(persistence->logger, "persistence", "Appended log entry",
+             "index", &(int){index}, "term", &(int){term});
+    
+    return DISTRIC_OK;
+}
+
+distric_err_t raft_persistence_load_log(
+    raft_persistence_t* persistence,
     raft_log_entry_t** entries_out,
     size_t* count_out
 ) {
-    if (!context || !entries_out || !count_out) {
+    if (!persistence || !entries_out || !count_out) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
     *entries_out = NULL;
     *count_out = 0;
     
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, MDB_RDONLY, &txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
+    /* Seek past header */
+    if (lseek(persistence->log_fd, 8, SEEK_SET) < 0) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to seek log");
+        return DISTRIC_ERR_INIT_FAILED;
     }
     
     /* Count entries first */
-    MDB_cursor* cursor = NULL;
-    rc = mdb_cursor_open(txn, context->log_db, &cursor);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        return lmdb_err_to_distric(rc);
-    }
-    
-    MDB_val key, val;
     size_t count = 0;
-    
-    rc = mdb_cursor_get(cursor, &key, &val, MDB_FIRST);
-    while (rc == MDB_SUCCESS) {
+    while (1) {
+        uint32_t index, term, data_len;
+        uint8_t type;
+        
+        ssize_t r = read(persistence->log_fd, &index, 4);
+        if (r == 0) break;  /* EOF */
+        if (r != 4) goto read_error;
+        
+        if (read(persistence->log_fd, &term, 4) != 4 ||
+            read(persistence->log_fd, &type, 1) != 1 ||
+            read(persistence->log_fd, &data_len, 4) != 4) {
+            goto read_error;
+        }
+        
+        /* Skip data */
+        if (data_len > 0) {
+            if (lseek(persistence->log_fd, data_len, SEEK_CUR) < 0) {
+                goto read_error;
+            }
+        }
+        
         count++;
-        rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
     }
     
     if (count == 0) {
-        mdb_cursor_close(cursor);
-        mdb_txn_abort(txn);
-        return DISTRIC_OK;
+        return DISTRIC_OK;  /* Empty log */
     }
     
-    /* Allocate array */
+    /* Allocate entries */
     raft_log_entry_t* entries = (raft_log_entry_t*)calloc(count, sizeof(raft_log_entry_t));
     if (!entries) {
-        mdb_cursor_close(cursor);
-        mdb_txn_abort(txn);
         return DISTRIC_ERR_NO_MEMORY;
     }
     
-    /* Load entries */
-    size_t i = 0;
-    rc = mdb_cursor_get(cursor, &key, &val, MDB_FIRST);
-    while (rc == MDB_SUCCESS && i < count) {
-        distric_err_t err = deserialize_log_entry((const uint8_t*)val.mv_data,
-                                                  val.mv_size, &entries[i]);
-        if (err != DISTRIC_OK) {
-            /* Cleanup on error */
-            for (size_t j = 0; j < i; j++) {
-                free(entries[j].data);
-            }
-            free(entries);
-            mdb_cursor_close(cursor);
-            mdb_txn_abort(txn);
-            return err;
-        }
-        
-        i++;
-        rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+    /* Seek back and read entries */
+    if (lseek(persistence->log_fd, 8, SEEK_SET) < 0) {
+        free(entries);
+        return DISTRIC_ERR_INIT_FAILED;
     }
     
-    mdb_cursor_close(cursor);
-    mdb_txn_abort(txn);
+    for (size_t i = 0; i < count; i++) {
+        uint32_t index, term, data_len;
+        uint8_t type;
+        
+        if (read(persistence->log_fd, &index, 4) != 4 ||
+            read(persistence->log_fd, &term, 4) != 4 ||
+            read(persistence->log_fd, &type, 1) != 1 ||
+            read(persistence->log_fd, &data_len, 4) != 4) {
+            raft_persistence_free_log(entries, i);
+            return DISTRIC_ERR_INIT_FAILED;
+        }
+        
+        entries[i].index = index;
+        entries[i].term = term;
+        entries[i].type = (raft_entry_type_t)type;
+        entries[i].data_len = data_len;
+        
+        if (data_len > 0) {
+            entries[i].data = (uint8_t*)malloc(data_len);
+            if (!entries[i].data) {
+                raft_persistence_free_log(entries, i);
+                return DISTRIC_ERR_NO_MEMORY;
+            }
+            
+            if (read(persistence->log_fd, entries[i].data, data_len) != (ssize_t)data_len) {
+                raft_persistence_free_log(entries, i + 1);
+                return DISTRIC_ERR_INIT_FAILED;
+            }
+        } else {
+            entries[i].data = NULL;
+        }
+    }
     
     *entries_out = entries;
     *count_out = count;
     
-    atomic_fetch_add(&context->total_reads, count);
-    
-    LOG_INFO(context->config.logger, "raft_persistence", "All entries loaded",
-            "count", &(int){count});
+    LOG_INFO(persistence->logger, "persistence", "Loaded log",
+            "entry_count", &(int){count});
     
     return DISTRIC_OK;
+
+read_error:
+    LOG_ERROR(persistence->logger, "persistence", "Failed to read log file");
+    return DISTRIC_ERR_INIT_FAILED;
 }
 
 distric_err_t raft_persistence_truncate_log(
-    raft_persistence_context_t* context,
+    raft_persistence_t* persistence,
     uint32_t from_index
 ) {
-    if (!context) {
+    if (!persistence) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, 0, &txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
+    /* Load log, filter, rewrite */
+    raft_log_entry_t* entries = NULL;
+    size_t count = 0;
+    
+    distric_err_t err = raft_persistence_load_log(persistence, &entries, &count);
+    if (err != DISTRIC_OK) {
+        return err;
     }
     
-    /* Open cursor */
-    MDB_cursor* cursor = NULL;
-    rc = mdb_cursor_open(txn, context->log_db, &cursor);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        return lmdb_err_to_distric(rc);
+    /* Close current log */
+    close(persistence->log_fd);
+    
+    /* Reopen and truncate */
+    persistence->log_fd = open(persistence->log_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (persistence->log_fd < 0) {
+        raft_persistence_free_log(entries, count);
+        return DISTRIC_ERR_INIT_FAILED;
     }
     
-    /* Delete all entries with index >= from_index */
-    MDB_val key, val;
-    size_t deleted = 0;
+    /* Write header */
+    err = write_log_header(persistence->log_fd, persistence->logger);
+    if (err != DISTRIC_OK) {
+        raft_persistence_free_log(entries, count);
+        return err;
+    }
     
-    rc = mdb_cursor_get(cursor, &key, &val, MDB_FIRST);
-    while (rc == MDB_SUCCESS) {
-        uint32_t index = *(uint32_t*)key.mv_data;
-        
-        if (index >= from_index) {
-            rc = mdb_cursor_del(cursor, 0);
-            if (rc != MDB_SUCCESS) {
-                mdb_cursor_close(cursor);
-                mdb_txn_abort(txn);
-                return lmdb_err_to_distric(rc);
+    /* Rewrite entries before from_index */
+    size_t kept = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].index < from_index) {
+            err = raft_persistence_append_log(persistence, &entries[i]);
+            if (err != DISTRIC_OK) {
+                raft_persistence_free_log(entries, count);
+                return err;
             }
-            deleted++;
+            kept++;
         }
-        
-        rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
     }
     
-    mdb_cursor_close(cursor);
+    raft_persistence_free_log(entries, count);
     
-    /* Commit */
-    rc = mdb_txn_commit(txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    LOG_INFO(context->config.logger, "raft_persistence", "Log truncated",
+    LOG_INFO(persistence->logger, "persistence", "Truncated log",
             "from_index", &(int){from_index},
-            "deleted", &(int){deleted});
+            "kept", &(int){kept});
     
     return DISTRIC_OK;
 }
 
-distric_err_t raft_persistence_get_log_bounds(
-    raft_persistence_context_t* context,
-    uint32_t* first_index_out,
-    uint32_t* last_index_out
-) {
-    if (!context || !first_index_out || !last_index_out) {
-        return DISTRIC_ERR_INVALID_ARG;
+void raft_persistence_free_log(raft_log_entry_t* entries, size_t count) {
+    if (!entries) return;
+    
+    for (size_t i = 0; i < count; i++) {
+        free(entries[i].data);
     }
     
-    *first_index_out = 0;
-    *last_index_out = 0;
-    
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, MDB_RDONLY, &txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    MDB_cursor* cursor = NULL;
-    rc = mdb_cursor_open(txn, context->log_db, &cursor);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        return lmdb_err_to_distric(rc);
-    }
-    
-    MDB_val key, val;
-    
-    /* Get first */
-    rc = mdb_cursor_get(cursor, &key, &val, MDB_FIRST);
-    if (rc == MDB_SUCCESS) {
-        *first_index_out = *(uint32_t*)key.mv_data;
-        
-        /* Get last */
-        rc = mdb_cursor_get(cursor, &key, &val, MDB_LAST);
-        if (rc == MDB_SUCCESS) {
-            *last_index_out = *(uint32_t*)key.mv_data;
-        }
-    }
-    
-    mdb_cursor_close(cursor);
-    mdb_txn_abort(txn);
-    
-    return DISTRIC_OK;
+    free(entries);
 }
 
 /* ============================================================================
- * SNAPSHOT PERSISTENCE
+ * SNAPSHOT OPERATIONS (Stubs for future)
  * ========================================================================= */
 
 distric_err_t raft_persistence_save_snapshot(
-    raft_persistence_context_t* context,
-    const raft_snapshot_metadata_t* metadata,
-    const uint8_t* data
+    raft_persistence_t* persistence,
+    uint32_t last_included_index,
+    uint32_t last_included_term,
+    const uint8_t* snapshot_data,
+    size_t snapshot_len
 ) {
-    if (!context || !metadata || !data) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
+    (void)persistence;
+    (void)last_included_index;
+    (void)last_included_term;
+    (void)snapshot_data;
+    (void)snapshot_len;
     
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, 0, &txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Save metadata */
-    MDB_val key, val;
-    key.mv_data = (void*)SNAPSHOT_KEY_METADATA;
-    key.mv_size = strlen(SNAPSHOT_KEY_METADATA);
-    val.mv_data = (void*)metadata;
-    val.mv_size = sizeof(raft_snapshot_metadata_t);
-    
-    rc = mdb_put(txn, context->snapshot_db, &key, &val, 0);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Save data */
-    key.mv_data = (void*)SNAPSHOT_KEY_DATA;
-    key.mv_size = strlen(SNAPSHOT_KEY_DATA);
-    val.mv_data = (void*)data;
-    val.mv_size = metadata->data_len;
-    
-    rc = mdb_put(txn, context->snapshot_db, &key, &val, 0);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Commit */
-    rc = mdb_txn_commit(txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Delete compacted log entries */
-    distric_err_t err = raft_persistence_truncate_log(context, metadata->last_included_index + 1);
-    if (err != DISTRIC_OK) {
-        LOG_WARN(context->config.logger, "raft_persistence",
-                "Failed to truncate log after snapshot");
-    }
-    
-    LOG_INFO(context->config.logger, "raft_persistence", "Snapshot saved",
-            "last_included_index", &(int){metadata->last_included_index},
-            "last_included_term", &(int){metadata->last_included_term},
-            "data_len", &(int){metadata->data_len});
-    
-    return DISTRIC_OK;
+    /* TODO: Implement in Session 3.5 */
+    return DISTRIC_ERR_INVALID_ARG;
 }
 
-distric_err_t raft_persistence_load_snapshot_metadata(
-    raft_persistence_context_t* context,
-    raft_snapshot_metadata_t* metadata_out
+distric_err_t raft_persistence_load_snapshot(
+    raft_persistence_t* persistence,
+    uint32_t* last_included_index_out,
+    uint32_t* last_included_term_out,
+    uint8_t** snapshot_data_out,
+    size_t* snapshot_len_out
 ) {
-    if (!context || !metadata_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
+    (void)persistence;
+    (void)last_included_index_out;
+    (void)last_included_term_out;
+    (void)snapshot_data_out;
+    (void)snapshot_len_out;
     
-    memset(metadata_out, 0, sizeof(raft_snapshot_metadata_t));
-    
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, MDB_RDONLY, &txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    MDB_val key, val;
-    key.mv_data = (void*)SNAPSHOT_KEY_METADATA;
-    key.mv_size = strlen(SNAPSHOT_KEY_METADATA);
-    
-    rc = mdb_get(txn, context->snapshot_db, &key, &val);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        return lmdb_err_to_distric(rc);
-    }
-    
-    memcpy(metadata_out, val.mv_data, sizeof(raft_snapshot_metadata_t));
-    
-    mdb_txn_abort(txn);
-    return DISTRIC_OK;
-}
-
-distric_err_t raft_persistence_load_snapshot_data(
-    raft_persistence_context_t* context,
-    uint8_t** data_out,
-    size_t* len_out
-) {
-    if (!context || !data_out || !len_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    *data_out = NULL;
-    *len_out = 0;
-    
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, MDB_RDONLY, &txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    MDB_val key, val;
-    key.mv_data = (void*)SNAPSHOT_KEY_DATA;
-    key.mv_size = strlen(SNAPSHOT_KEY_DATA);
-    
-    rc = mdb_get(txn, context->snapshot_db, &key, &val);
-    if (rc != MDB_SUCCESS) {
-        mdb_txn_abort(txn);
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Copy data */
-    uint8_t* data = (uint8_t*)malloc(val.mv_size);
-    if (!data) {
-        mdb_txn_abort(txn);
-        return DISTRIC_ERR_NO_MEMORY;
-    }
-    
-    memcpy(data, val.mv_data, val.mv_size);
-    *data_out = data;
-    *len_out = val.mv_size;
-    
-    mdb_txn_abort(txn);
-    return DISTRIC_OK;
-}
-
-/* ============================================================================
- * UTILITIES
- * ========================================================================= */
-
-distric_err_t raft_persistence_compact(raft_persistence_context_t* context) {
-    if (!context) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    /* LMDB auto-compacts on commit, but we can force a sync */
-    int rc = mdb_env_sync(context->env, 1);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    LOG_INFO(context->config.logger, "raft_persistence", "Database compacted");
-    
-    return DISTRIC_OK;
-}
-
-distric_err_t raft_persistence_get_stats(
-    raft_persistence_context_t* context,
-    raft_persistence_stats_t* stats_out
-) {
-    if (!context || !stats_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    memset(stats_out, 0, sizeof(raft_persistence_stats_t));
-    
-    MDB_txn* txn = NULL;
-    int rc = mdb_txn_begin(context->env, NULL, MDB_RDONLY, &txn);
-    if (rc != MDB_SUCCESS) {
-        return lmdb_err_to_distric(rc);
-    }
-    
-    /* Get environment info */
-    MDB_envinfo env_info;
-    rc = mdb_env_info(context->env, &env_info);
-    if (rc == MDB_SUCCESS) {
-        stats_out->total_size_bytes = env_info.me_mapsize;
-    }
-    
-    /* Get log entry count */
-    MDB_stat stat;
-    rc = mdb_stat(txn, context->log_db, &stat);
-    if (rc == MDB_SUCCESS) {
-        stats_out->log_entry_count = stat.ms_entries;
-    }
-    
-    /* Check if snapshot exists */
-    MDB_val key, val;
-    key.mv_data = (void*)SNAPSHOT_KEY_METADATA;
-    key.mv_size = strlen(SNAPSHOT_KEY_METADATA);
-    
-    rc = mdb_get(txn, context->snapshot_db, &key, &val);
-    if (rc == MDB_SUCCESS) {
-        stats_out->has_snapshot = true;
-        raft_snapshot_metadata_t metadata;
-        memcpy(&metadata, val.mv_data, sizeof(raft_snapshot_metadata_t));
-        stats_out->snapshot_size_bytes = metadata.data_len;
-    }
-    
-    mdb_txn_abort(txn);
-    
-    return DISTRIC_OK;
+    /* TODO: Implement in Session 3.5 */
+    return DISTRIC_ERR_NOT_FOUND;
 }

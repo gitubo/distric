@@ -78,7 +78,7 @@ struct raft_node {
     uint64_t last_heartbeat_sent_ms; /**< Last time we sent heartbeat (leader only) */
     
     /* Persistence (Session 3.4) */
-    raft_persistence_context_t* persistence;
+    raft_persistence_t* persistence;
     
     /* Metrics */
     metric_t* state_metric;
@@ -121,12 +121,9 @@ static void persist_state(raft_node_t* node) {
         return;
     }
     
-    raft_persistent_state_t pstate = {
-        .current_term = node->current_term,
-    };
-    strncpy(pstate.voted_for, node->voted_for, sizeof(pstate.voted_for) - 1);
-    
-    distric_err_t err = raft_persistence_save_state(node->persistence, &pstate);
+    distric_err_t err = raft_persistence_save_state(node->persistence, 
+                                                     node->current_term, 
+                                                     node->voted_for);
     if (err != DISTRIC_OK) {
         LOG_ERROR(node->config.logger, "raft", "Failed to persist state",
                  "term", &(int){node->current_term});
@@ -141,7 +138,7 @@ static distric_err_t persist_entry(raft_node_t* node, const raft_log_entry_t* en
         return DISTRIC_OK;
     }
     
-    return raft_persistence_append_entry(node->persistence, entry);
+    return raft_persistence_append_log(node->persistence, entry);
 }
 
 /* ============================================================================
@@ -561,75 +558,61 @@ distric_err_t raft_create(const raft_config_t* config, raft_node_t** node_out) {
     pthread_rwlock_init(&node->lock, NULL);
     
     /* Initialize persistence (Session 3.4) */
-    node->persistence = NULL;
-    if (config->persistence_data_dir) {
-        raft_persistence_config_t persist_config = {
-            .data_dir = config->persistence_data_dir,
-            .max_db_size_mb = 1024,
-            .sync_on_write = true,
-            .logger = config->logger
-        };
-        
-        err = raft_persistence_create(&persist_config, &node->persistence);
-        if (err != DISTRIC_OK) {
-            LOG_ERROR(config->logger, "raft", "Failed to initialize persistence",
-                     "data_dir", config->persistence_data_dir);
-            pthread_rwlock_destroy(&node->lock);
-            raft_log_destroy(&node->log);
-            free(node->config.peers);
-            free(node->next_index);
-            free(node->match_index);
-            free(node);
-            return err;
-        }
-        
-        /* Load persistent state */
-        raft_persistent_state_t pstate;
-        err = raft_persistence_load_state(node->persistence, &pstate);
-        if (err == DISTRIC_OK) {
-            node->current_term = pstate.current_term;
-            strncpy(node->voted_for, pstate.voted_for, sizeof(node->voted_for) - 1);
-            
-            LOG_INFO(config->logger, "raft", "Loaded persistent state",
-                    "term", &(int){pstate.current_term},
-                    "voted_for", pstate.voted_for);
-        } else if (err != DISTRIC_ERR_NOT_FOUND) {
-            LOG_ERROR(config->logger, "raft", "Failed to load persistent state");
-        }
-        
-        /* Load log entries */
-        raft_log_entry_t* entries = NULL;
-        size_t count = 0;
-        err = raft_persistence_load_all_entries(node->persistence, &entries, &count);
-        if (err == DISTRIC_OK && count > 0) {
-            /* Restore log from persistence */
-            for (size_t i = 0; i < count; i++) {
-                log_append(&node->log, entries[i].term, entries[i].type, 
-                          entries[i].data, entries[i].data_len, NULL);  /* NULL = don't re-persist */
-                free(entries[i].data);
-            }
-            free(entries);
-            
-            LOG_INFO(config->logger, "raft", "Loaded log from persistence",
-                    "entries", &(int){count});
-        } else if (err != DISTRIC_ERR_NOT_FOUND && err != DISTRIC_OK) {
-            LOG_ERROR(config->logger, "raft", "Failed to load log entries");
-        }
-        
-        /* Load snapshot metadata if exists */
-        raft_snapshot_metadata_t snapshot_meta;
-        err = raft_persistence_load_snapshot_metadata(node->persistence, &snapshot_meta);
-        if (err == DISTRIC_OK) {
-            node->log.base_index = snapshot_meta.last_included_index;
-            node->log.base_term = snapshot_meta.last_included_term;
-            atomic_store(&node->commit_index, snapshot_meta.last_included_index);
-            node->last_applied = snapshot_meta.last_included_index;
-            
-            LOG_INFO(config->logger, "raft", "Loaded snapshot metadata",
-                    "last_included_index", &(int){snapshot_meta.last_included_index},
-                    "last_included_term", &(int){snapshot_meta.last_included_term});
-        }
+node->persistence = NULL;
+if (config->persistence_data_dir) {
+    raft_persistence_config_t persist_config = {
+        .data_dir = config->persistence_data_dir,
+        .logger = config->logger
+    };
+    
+    err = raft_persistence_init(&persist_config, &node->persistence);
+    if (err != DISTRIC_OK) {
+        LOG_ERROR(config->logger, "raft", "Failed to initialize persistence",
+                 "data_dir", config->persistence_data_dir);
+        pthread_rwlock_destroy(&node->lock);
+        raft_log_destroy(&node->log);
+        free(node->config.peers);
+        free(node->next_index);
+        free(node->match_index);
+        free(node);
+        return err;
     }
+    
+    /* Load persistent state */
+    uint32_t loaded_term = 0;
+    char loaded_voted_for[64] = {0};
+    
+    err = raft_persistence_load_state(node->persistence, &loaded_term, loaded_voted_for);
+    if (err == DISTRIC_OK) {
+        node->current_term = loaded_term;
+        strncpy(node->voted_for, loaded_voted_for, sizeof(node->voted_for) - 1);
+        
+        LOG_INFO(config->logger, "raft", "Loaded persistent state",
+                "term", &(int){loaded_term},
+                "voted_for", loaded_voted_for);
+    } else if (err != DISTRIC_ERR_NOT_FOUND) {
+        LOG_ERROR(config->logger, "raft", "Failed to load persistent state");
+    }
+    
+    /* Load log entries */
+    raft_log_entry_t* entries = NULL;
+    size_t count = 0;
+    err = raft_persistence_load_log(node->persistence, &entries, &count);
+    if (err == DISTRIC_OK && count > 0) {
+        /* Restore log from persistence */
+        for (size_t i = 0; i < count; i++) {
+            log_append(&node->log, entries[i].term, entries[i].type, 
+                      entries[i].data, entries[i].data_len, NULL);  /* NULL = don't re-persist */
+            free(entries[i].data);
+        }
+        free(entries);
+        
+        LOG_INFO(config->logger, "raft", "Loaded log from persistence",
+                "entries", &(int){count});
+    } else if (err != DISTRIC_ERR_NOT_FOUND && err != DISTRIC_OK) {
+        LOG_ERROR(config->logger, "raft", "Failed to load log entries");
+    }
+}
     
     /* Register metrics */
     if (config->metrics) {
@@ -1541,14 +1524,13 @@ distric_err_t raft_create_snapshot(
     pthread_rwlock_unlock(&node->lock);
     
     /* Save snapshot to persistence */
-    raft_snapshot_metadata_t metadata = {
-        .last_included_index = last_applied,
-        .last_included_term = last_included_term,
-        .data_len = snapshot_len
-    };
-    
-    distric_err_t err = raft_persistence_save_snapshot(node->persistence, &metadata, snapshot_data);
+    distric_err_t err = raft_persistence_save_snapshot(node->persistence, 
+                                                        last_applied,
+                                                        last_included_term,
+                                                        snapshot_data, 
+                                                        snapshot_len);
     if (err != DISTRIC_OK) {
+        LOG_WARN(node->config.logger, "raft", "Snapshot save not implemented yet");
         return err;
     }
     
@@ -1582,14 +1564,13 @@ distric_err_t raft_install_snapshot(
     }
     
     /* Save snapshot to persistence */
-    raft_snapshot_metadata_t metadata = {
-        .last_included_index = last_included_index,
-        .last_included_term = last_included_term,
-        .data_len = snapshot_len
-    };
-    
-    distric_err_t err = raft_persistence_save_snapshot(node->persistence, &metadata, snapshot_data);
+    distric_err_t err = raft_persistence_save_snapshot(node->persistence,
+                                                        last_included_index,
+                                                        last_included_term,
+                                                        snapshot_data,
+                                                        snapshot_len);
     if (err != DISTRIC_OK) {
+        LOG_WARN(node->config.logger, "raft", "Snapshot save not implemented yet");
         return err;
     }
     

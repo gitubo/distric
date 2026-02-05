@@ -1,24 +1,20 @@
 /**
  * @file raft_persistence.h
- * @brief Raft Persistence - Internal API
+ * @brief Raft Persistence - Simple File-Based Implementation
  * 
  * Simple file-based persistence for Raft state and log.
+ * No external dependencies (no LMDB, SQLite, etc.)
  * 
- * NOTE: This module is designed with a clean interface so it can be
- * extracted to a separate library (distric_storage) in the future.
- * 
- * Design principles:
- * - No external dependencies (no LMDB, SQLite, etc.)
- * - Simple file formats (JSON for state, binary for log)
- * - Durable writes (fsync)
- * - Atomic updates (tmp + rename)
- * - Easy to debug (readable state file)
+ * File Layout:
+ *   /data_dir/state.json     - Current term and voted_for
+ *   /data_dir/log.dat        - Binary log entries
+ *   /data_dir/snapshot.dat   - Snapshot (future)
  * 
  * @version 1.0.0
  */
 
-#ifndef RAFT_PERSISTENCE_H
-#define RAFT_PERSISTENCE_H
+#ifndef DISTRIC_RAFT_PERSISTENCE_H
+#define DISTRIC_RAFT_PERSISTENCE_H
 
 #include <distric_raft/raft_core.h>
 #include <stdint.h>
@@ -242,4 +238,4 @@ distric_err_t raft_persistence_load_snapshot(
 }
 #endif
 
-#endif /* RAFT_PERSISTENCE_H */
+#endif /* DISTRIC_RAFT_PERSISTENCE_H */

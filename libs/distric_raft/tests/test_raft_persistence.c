@@ -31,7 +31,7 @@
 #define _DEFAULT_SOURCE
 #endif
 
-#include "raft_persistence.h"
+#include <distric_raft/raft_persistence.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
