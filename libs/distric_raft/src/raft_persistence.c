@@ -1,13 +1,13 @@
 /**
  * @file raft_persistence.c
- * @brief Raft Persistence Implementation
+ * @brief Raft Persistence Implementation with Snapshots
  * 
- * Simple file-based persistence with no external dependencies.
+ * Complete file-based persistence with snapshot support (Session 3.5).
  * 
  * File Layout:
  *   /data_dir/state.json     - Current term and voted_for
  *   /data_dir/log.dat        - Binary log entries
- *   /data_dir/snapshot.dat   - Snapshot (future)
+ *   /data_dir/snapshot.dat   - Latest snapshot
  * 
  * State Format (JSON):
  *   {"term":42,"voted_for":"node-3"}
@@ -21,6 +21,15 @@
  *     [1 byte: type]
  *     [4 bytes: data_len]
  *     [data_len bytes: data]
+ * 
+ * Snapshot Format (binary):
+ *   [4 bytes: magic "SNAP"]
+ *   [4 bytes: version = 1]
+ *   [4 bytes: last_included_index]
+ *   [4 bytes: last_included_term]
+ *   [4 bytes: data_len]
+ *   [4 bytes: crc32]
+ *   [data_len bytes: snapshot data]
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -49,6 +58,9 @@
 #define LOG_FILE_MAGIC 0x52414654  /* "RAFT" */
 #define LOG_FILE_VERSION 1
 
+#define SNAPSHOT_MAGIC 0x534E4150  /* "SNAP" */
+#define SNAPSHOT_VERSION 1
+
 #define MAX_PATH_LEN 512
 
 /* ============================================================================
@@ -60,11 +72,34 @@ struct raft_persistence {
     char state_path[MAX_PATH_LEN];
     char state_tmp_path[MAX_PATH_LEN];
     char log_path[MAX_PATH_LEN];
+    char snapshot_path[MAX_PATH_LEN];
+    char snapshot_tmp_path[MAX_PATH_LEN];
     
     int log_fd;                    /* File descriptor for log file */
     
     logger_t* logger;
 };
+
+/* ============================================================================
+ * CRC32 IMPLEMENTATION
+ * ========================================================================= */
+
+static uint32_t crc32_compute(const uint8_t* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFF;
+    
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1) {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc = crc >> 1;
+            }
+        }
+    }
+    
+    return ~crc;
+}
 
 /* ============================================================================
  * FILE UTILITIES
@@ -310,6 +345,8 @@ distric_err_t raft_persistence_init(
     snprintf(p->state_path, sizeof(p->state_path), "%s/state.json", p->data_dir);
     snprintf(p->state_tmp_path, sizeof(p->state_tmp_path), "%s/state.json.tmp", p->data_dir);
     snprintf(p->log_path, sizeof(p->log_path), "%s/log.dat", p->data_dir);
+    snprintf(p->snapshot_path, sizeof(p->snapshot_path), "%s/snapshot.dat", p->data_dir);
+    snprintf(p->snapshot_tmp_path, sizeof(p->snapshot_tmp_path), "%s/snapshot.dat.tmp", p->data_dir);
     
     /* Create directory */
     distric_err_t err = ensure_directory(p->data_dir, p->logger);
@@ -683,7 +720,7 @@ void raft_persistence_free_log(raft_log_entry_t* entries, size_t count) {
 }
 
 /* ============================================================================
- * SNAPSHOT OPERATIONS (Stubs for future)
+ * SNAPSHOT OPERATIONS (Session 3.5)
  * ========================================================================= */
 
 distric_err_t raft_persistence_save_snapshot(
@@ -693,14 +730,71 @@ distric_err_t raft_persistence_save_snapshot(
     const uint8_t* snapshot_data,
     size_t snapshot_len
 ) {
-    (void)persistence;
-    (void)last_included_index;
-    (void)last_included_term;
-    (void)snapshot_data;
-    (void)snapshot_len;
+    if (!persistence || !snapshot_data) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
     
-    /* TODO: Implement in Session 3.5 */
-    return DISTRIC_ERR_INVALID_ARG;
+    /* Open temporary snapshot file */
+    int fd = open(persistence->snapshot_tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to create snapshot tmp file",
+                 "errno", &errno);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Compute CRC32 of snapshot data */
+    uint32_t crc32 = crc32_compute(snapshot_data, snapshot_len);
+    
+    /* Write header */
+    uint32_t magic = SNAPSHOT_MAGIC;
+    uint32_t version = SNAPSHOT_VERSION;
+    uint32_t data_len = (uint32_t)snapshot_len;
+    
+    if (write(fd, &magic, 4) != 4 ||
+        write(fd, &version, 4) != 4 ||
+        write(fd, &last_included_index, 4) != 4 ||
+        write(fd, &last_included_term, 4) != 4 ||
+        write(fd, &data_len, 4) != 4 ||
+        write(fd, &crc32, 4) != 4) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to write snapshot header");
+        close(fd);
+        unlink(persistence->snapshot_tmp_path);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Write snapshot data */
+    ssize_t written = write(fd, snapshot_data, snapshot_len);
+    if (written != (ssize_t)snapshot_len) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to write snapshot data",
+                 "expected", &(int){snapshot_len}, "written", &(int){written});
+        close(fd);
+        unlink(persistence->snapshot_tmp_path);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Sync to disk */
+    if (fsync(fd) != 0) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to fsync snapshot");
+        close(fd);
+        unlink(persistence->snapshot_tmp_path);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    close(fd);
+    
+    /* Atomic rename */
+    if (rename(persistence->snapshot_tmp_path, persistence->snapshot_path) != 0) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to rename snapshot");
+        unlink(persistence->snapshot_tmp_path);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    LOG_INFO(persistence->logger, "persistence", "Saved snapshot",
+            "last_included_index", &(int){last_included_index},
+            "last_included_term", &(int){last_included_term},
+            "size", &(int){snapshot_len});
+    
+    return DISTRIC_OK;
 }
 
 distric_err_t raft_persistence_load_snapshot(
@@ -710,12 +804,84 @@ distric_err_t raft_persistence_load_snapshot(
     uint8_t** snapshot_data_out,
     size_t* snapshot_len_out
 ) {
-    (void)persistence;
-    (void)last_included_index_out;
-    (void)last_included_term_out;
-    (void)snapshot_data_out;
-    (void)snapshot_len_out;
+    if (!persistence || !last_included_index_out || !last_included_term_out ||
+        !snapshot_data_out || !snapshot_len_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
     
-    /* TODO: Implement in Session 3.5 */
-    return DISTRIC_ERR_NOT_FOUND;
+    /* Open snapshot file */
+    int fd = open(persistence->snapshot_path, O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            return DISTRIC_ERR_NOT_FOUND;  /* No snapshot exists */
+        }
+        LOG_ERROR(persistence->logger, "persistence", "Failed to open snapshot", "errno", &errno);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Read header */
+    uint32_t magic, version, last_included_index, last_included_term, data_len, stored_crc32;
+    
+    if (read(fd, &magic, 4) != 4 ||
+        read(fd, &version, 4) != 4 ||
+        read(fd, &last_included_index, 4) != 4 ||
+        read(fd, &last_included_term, 4) != 4 ||
+        read(fd, &data_len, 4) != 4 ||
+        read(fd, &stored_crc32, 4) != 4) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to read snapshot header");
+        close(fd);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Validate header */
+    if (magic != SNAPSHOT_MAGIC) {
+        LOG_ERROR(persistence->logger, "persistence", "Invalid snapshot magic");
+        close(fd);
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    if (version != SNAPSHOT_VERSION) {
+        LOG_ERROR(persistence->logger, "persistence", "Unsupported snapshot version");
+        close(fd);
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    /* Allocate buffer for snapshot data */
+    uint8_t* data = (uint8_t*)malloc(data_len);
+    if (!data) {
+        close(fd);
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    /* Read snapshot data */
+    ssize_t bytes_read = read(fd, data, data_len);
+    close(fd);
+    
+    if (bytes_read != (ssize_t)data_len) {
+        LOG_ERROR(persistence->logger, "persistence", "Failed to read snapshot data");
+        free(data);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Verify CRC32 */
+    uint32_t computed_crc32 = crc32_compute(data, data_len);
+    if (computed_crc32 != stored_crc32) {
+        LOG_ERROR(persistence->logger, "persistence", "Snapshot CRC32 mismatch",
+                 "expected", &(int){stored_crc32},
+                 "computed", &(int){computed_crc32});
+        free(data);
+        return DISTRIC_ERR_INVALID_FORMAT;
+    }
+    
+    *last_included_index_out = last_included_index;
+    *last_included_term_out = last_included_term;
+    *snapshot_data_out = data;
+    *snapshot_len_out = data_len;
+    
+    LOG_INFO(persistence->logger, "persistence", "Loaded snapshot",
+            "last_included_index", &(int){last_included_index},
+            "last_included_term", &(int){last_included_term},
+            "size", &(int){data_len});
+    
+    return DISTRIC_OK;
 }

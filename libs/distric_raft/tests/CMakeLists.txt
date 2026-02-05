@@ -19,3 +19,8 @@ add_test(NAME test_raft_replication COMMAND test_raft_replication)
 add_executable(test_raft_persistence test_raft_persistence.c)
 target_link_libraries(test_raft_persistence distric_raft distric_protocol distric_obs Threads::Threads)
 add_test(NAME test_raft_persistence COMMAND test_raft_persistence)
+
+# Test: Snapshot
+add_executable(test_raft_snapshot test_raft_snapshot.c)
+target_link_libraries(test_raft_snapshot distric_raft distric_protocol distric_obs Threads::Threads)
+add_test(NAME test_raft_snapshot COMMAND test_raft_snapshot)
