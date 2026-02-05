@@ -14,6 +14,7 @@
 #endif
 
 #include "distric_raft/raft_rpc.h"
+#include "distric_raft/raft_messages.h"
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
