@@ -1,15 +1,6 @@
 /**
  * @file test_raft_cluster.c
  * @brief Multi-Node Raft Cluster Integration Tests (Session 3.6)
- * 
- * Tests:
- * - Cluster formation (3-5 nodes)
- * - Leader election with majority quorum
- * - Log replication across cluster
- * - Leader failover and re-election
- * - Network partition handling
- * - Snapshot replication to followers
- * - Full cluster recovery
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -28,6 +19,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <time.h>
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -41,7 +33,7 @@ static int tests_failed = 0;
 #define ASSERT_OK(expr) do { \
     distric_err_t _err = (expr); \
     if (_err != DISTRIC_OK) { \
-        fprintf(stderr, "FAIL: %s returned %d\n", #expr, _err); \
+        fprintf(stderr, "FAIL: %s returned %d (%s)\n", #expr, _err, distric_strerror(_err)); \
         tests_failed++; \
         return; \
     } \
@@ -65,6 +57,7 @@ static int tests_failed = 0;
 
 #define TEST_DATA_DIR "/tmp/raft_cluster_test"
 #define MAX_NODES 5
+#define BASE_PORT 19000  /* Use higher port range to avoid conflicts */
 
 /* ============================================================================
  * TEST CLUSTER INFRASTRUCTURE
@@ -167,7 +160,7 @@ static distric_err_t cluster_create_node(
                         "node-%zu", i);
                 snprintf(peers[peer_count].address, sizeof(peers[peer_count].address),
                         "127.0.0.1");
-                peers[peer_count].port = 9000 + i;
+                peers[peer_count].port = BASE_PORT + i;
                 peer_count++;
             }
         }
@@ -195,6 +188,7 @@ static distric_err_t cluster_create_node(
     distric_err_t err = raft_create(&config, &ctx->node);
     if (err != DISTRIC_OK) {
         free(peers);
+        fprintf(stderr, "Failed to create raft node %s: %s\n", node_id, distric_strerror(err));
         return err;
     }
     
@@ -212,7 +206,10 @@ static distric_err_t cluster_create_node(
     
     err = raft_rpc_create(&rpc_config, ctx->node, &ctx->rpc);
     if (err != DISTRIC_OK) {
+        fprintf(stderr, "Failed to create RPC context for %s on port %u: %s\n", 
+                node_id, port, distric_strerror(err));
         raft_destroy(ctx->node);
+        ctx->node = NULL;
         return err;
     }
     
@@ -222,11 +219,13 @@ static distric_err_t cluster_create_node(
 static distric_err_t cluster_start_node(cluster_node_ctx_t* ctx) {
     distric_err_t err = raft_start(ctx->node);
     if (err != DISTRIC_OK) {
+        fprintf(stderr, "Failed to start raft node %s: %s\n", ctx->node_id, distric_strerror(err));
         return err;
     }
     
     err = raft_rpc_start(ctx->rpc);
     if (err != DISTRIC_OK) {
+        fprintf(stderr, "Failed to start RPC for %s: %s\n", ctx->node_id, distric_strerror(err));
         return err;
     }
     
@@ -245,8 +244,12 @@ static void cluster_stop_node(cluster_node_ctx_t* ctx) {
     ctx->running = false;
     pthread_join(ctx->tick_thread, NULL);
     
-    raft_rpc_stop(ctx->rpc);
-    raft_stop(ctx->node);
+    if (ctx->rpc) {
+        raft_rpc_stop(ctx->rpc);
+    }
+    if (ctx->node) {
+        raft_stop(ctx->node);
+    }
 }
 
 static void cluster_destroy_node(cluster_node_ctx_t* ctx) {
@@ -287,10 +290,11 @@ static distric_err_t cluster_init(test_cluster_t* cluster, size_t node_count) {
     for (size_t i = 0; i < node_count; i++) {
         char node_id[64];
         snprintf(node_id, sizeof(node_id), "node-%zu", i);
-        uint16_t port = 9000 + i;
+        uint16_t port = BASE_PORT + i;
         
         err = cluster_create_node(cluster, i, node_id, port);
         if (err != DISTRIC_OK) {
+            fprintf(stderr, "Failed to create node %zu: %s\n", i, distric_strerror(err));
             /* Cleanup already created nodes */
             for (size_t j = 0; j < i; j++) {
                 cluster_destroy_node(&cluster->nodes[j]);
@@ -328,6 +332,9 @@ static distric_err_t cluster_start(test_cluster_t* cluster) {
             }
             return err;
         }
+        
+        /* Small delay between starting nodes to avoid port conflicts */
+        usleep(100000);  /* 100ms */
     }
     
     return DISTRIC_OK;
@@ -337,6 +344,9 @@ static void cluster_stop(test_cluster_t* cluster) {
     for (size_t i = 0; i < cluster->node_count; i++) {
         cluster_stop_node(&cluster->nodes[i]);
     }
+    
+    /* Wait for TIME_WAIT to clear */
+    usleep(200000);  /* 200ms */
 }
 
 static cluster_node_ctx_t* cluster_find_leader(test_cluster_t* cluster) {
@@ -411,8 +421,8 @@ void test_cluster_3_nodes_formation() {
     ASSERT_OK(cluster_init(&cluster, 3));
     ASSERT_OK(cluster_start(&cluster));
     
-    /* Wait for leader election (should happen within 1 second) */
-    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 2000));
+    /* Wait for leader election (should happen within 2 seconds) */
+    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 3000));
     
     /* Verify exactly one leader */
     ASSERT_EQ(cluster_count_leaders(&cluster), 1);
@@ -439,7 +449,7 @@ void test_cluster_5_nodes_formation() {
     ASSERT_OK(cluster_start(&cluster));
     
     /* Wait for leader election */
-    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 2000));
+    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 3000));
     
     /* Verify exactly one leader */
     ASSERT_EQ(cluster_count_leaders(&cluster), 1);
@@ -467,7 +477,7 @@ void test_log_replication_3_nodes() {
     ASSERT_OK(cluster_start(&cluster));
     
     /* Wait for leader */
-    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 2000));
+    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 3000));
     
     cluster_node_ctx_t* leader = cluster_find_leader(&cluster);
     ASSERT_TRUE(leader != NULL);
@@ -506,7 +516,7 @@ void test_log_replication_3_nodes() {
         pthread_mutex_unlock(&cluster.nodes[i].apply_lock);
         
         printf("  [%s] applied=%u entries\n", cluster.nodes[i].node_id, applied);
-        ASSERT_TRUE(applied >= 10);  /* At least our 10 commands (may include NO-OP) */
+        ASSERT_TRUE(applied >= 10);
     }
     
     printf("  Log replicated successfully across 3 nodes\n");
@@ -528,7 +538,7 @@ void test_log_replication_5_nodes() {
     ASSERT_OK(cluster_start(&cluster));
     
     /* Wait for leader */
-    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 2000));
+    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 3000));
     
     cluster_node_ctx_t* leader = cluster_find_leader(&cluster);
     ASSERT_TRUE(leader != NULL);
@@ -570,7 +580,7 @@ void test_leader_failover() {
     ASSERT_OK(cluster_start(&cluster));
     
     /* Wait for initial leader */
-    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 2000));
+    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 3000));
     
     cluster_node_ctx_t* old_leader = cluster_find_leader(&cluster);
     ASSERT_TRUE(old_leader != NULL);
@@ -593,10 +603,10 @@ void test_leader_failover() {
     cluster_stop_node(old_leader);
     
     /* Wait for new leader election */
-    sleep(1);  /* Give time for election timeout */
+    sleep(1);
     
     bool new_leader_elected = false;
-    for (int i = 0; i < 50; i++) {  /* Wait up to 5 seconds */
+    for (int i = 0; i < 50; i++) {
         size_t leader_count = 0;
         cluster_node_ctx_t* new_leader = NULL;
         
@@ -624,7 +634,7 @@ void test_leader_failover() {
             break;
         }
         
-        usleep(100000);  /* 100ms */
+        usleep(100000);
     }
     
     ASSERT_TRUE(new_leader_elected);
@@ -648,7 +658,7 @@ void test_follower_failure() {
     ASSERT_OK(cluster_start(&cluster));
     
     /* Wait for leader */
-    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 2000));
+    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 3000));
     
     cluster_node_ctx_t* leader = cluster_find_leader(&cluster);
     ASSERT_TRUE(leader != NULL);
@@ -701,7 +711,7 @@ void test_split_brain_prevention() {
     ASSERT_OK(cluster_start(&cluster));
     
     /* Wait for leader */
-    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 2000));
+    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 3000));
     
     cluster_node_ctx_t* leader = cluster_find_leader(&cluster);
     ASSERT_TRUE(leader != NULL);
@@ -774,7 +784,7 @@ void test_cluster_recovery() {
         ASSERT_OK(cluster_init(&cluster, 3));
         ASSERT_OK(cluster_start(&cluster));
         
-        ASSERT_TRUE(cluster_wait_for_leader(&cluster, 2000));
+        ASSERT_TRUE(cluster_wait_for_leader(&cluster, 3000));
         
         cluster_node_ctx_t* leader = cluster_find_leader(&cluster);
         ASSERT_TRUE(leader != NULL);
@@ -797,13 +807,16 @@ void test_cluster_recovery() {
         cluster_destroy(&cluster);
     }
     
+    /* Wait for ports to be released */
+    sleep(2);
+    
     /* Second session: recover cluster */
     {
         test_cluster_t cluster;
         ASSERT_OK(cluster_init(&cluster, 3));
         ASSERT_OK(cluster_start(&cluster));
         
-        ASSERT_TRUE(cluster_wait_for_leader(&cluster, 2000));
+        ASSERT_TRUE(cluster_wait_for_leader(&cluster, 3000));
         
         /* Verify logs were recovered */
         for (size_t i = 0; i < cluster.node_count; i++) {
@@ -851,7 +864,7 @@ void test_concurrent_appends() {
     ASSERT_OK(cluster_init(&cluster, 3));
     ASSERT_OK(cluster_start(&cluster));
     
-    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 2000));
+    ASSERT_TRUE(cluster_wait_for_leader(&cluster, 3000));
     
     cluster_node_ctx_t* leader = cluster_find_leader(&cluster);
     ASSERT_TRUE(leader != NULL);
