@@ -14,11 +14,12 @@
 #endif
 
 #include "distric_raft/raft_rpc.h"
-#include "distric_raft/raft_messages.h"
+#include <distric_protocol/messages.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <stdio.h>
 
 /* ============================================================================
  * INTERNAL STRUCTURES
@@ -412,9 +413,12 @@ distric_err_t raft_rpc_create(
     
     *context_out = context;
     
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", config->bind_port);
+    
     LOG_INFO(config->logger, "raft_rpc", "RPC context created",
             "bind_address", config->bind_address,
-            "bind_port", &(int){config->bind_port});
+            "bind_port", port_str);
     
     return DISTRIC_OK;
 }
@@ -532,9 +536,11 @@ distric_err_t raft_rpc_send_request_vote(
         
         retries++;
         if (retries <= context->config.max_retries) {
+            char retry_str[16];
+            snprintf(retry_str, sizeof(retry_str), "%u", retries);
             LOG_WARN(context->config.logger, "raft_rpc", "RequestVote RPC failed, retrying",
                     "peer", peer_address,
-                    "retry", &retries);
+                    "retry", retry_str);
             usleep(100000);  /* 100ms backoff */
         }
     }
@@ -676,10 +682,12 @@ distric_err_t raft_rpc_send_append_entries(
     /* Update metrics */
     metrics_counter_inc(context->append_entries_sent_metric);
     
+    char entries_str[16];
+    snprintf(entries_str, sizeof(entries_str), "%zu", entry_count);
     LOG_DEBUG(context->config.logger, "raft_rpc", "AppendEntries sent",
-             "peer", peer_address,
-             "entries", &(int){entry_count},
-             "success", response.success ? "true" : "false");
+            "peer", peer_address,
+            "entries", entries_str,
+            "success", response.success ? "true" : "false");
     
     return DISTRIC_OK;
 }
@@ -871,9 +879,12 @@ distric_err_t raft_rpc_broadcast_request_vote(
     
     *votes_received_out = votes;
     
+    char votes_str[16], needed_str[32];
+    snprintf(votes_str, sizeof(votes_str), "%u", votes);
+    snprintf(needed_str, sizeof(needed_str), "%zu", (config->peer_count + 1) / 2 + 1);
     LOG_INFO(context->config.logger, "raft_rpc", "RequestVote broadcast complete",
-            "votes", &votes,
-            "needed", &(int){(config->peer_count + 1) / 2 + 1});
+            "votes", votes_str,
+            "needed", needed_str);
     
     return DISTRIC_OK;
 }

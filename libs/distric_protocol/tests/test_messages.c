@@ -2,12 +2,11 @@
  * @file test_messages.c
  * @brief Comprehensive tests for protocol message serialization
  * 
- * Tests message types:
+ * Tests ALL message types in distric_protocol:
+ * - Raft messages (RequestVote, AppendEntries, InstallSnapshot)
  * - Gossip messages (Ping, Ack, MembershipUpdate, IndirectPing)
  * - Task messages (Assignment, Result)
  * - Client messages (Submit, Response)
- * 
- * Note: Raft message tests are in distric_raft library
  */
 
 #include <distric_protocol/messages.h>
@@ -57,6 +56,245 @@ static int tests_failed = 0;
         return; \
     } \
 } while(0)
+
+/* ============================================================================
+ * RAFT MESSAGE TESTS
+ * ========================================================================= */
+
+void test_raft_request_vote() {
+    TEST_START();
+    
+    raft_request_vote_t msg = {
+        .term = 42,
+        .last_log_index = 1000,
+        .last_log_term = 41
+    };
+    strncpy(msg.candidate_id, "coordinator-1", sizeof(msg.candidate_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_request_vote(&msg, &buffer, &len));
+    
+    printf("  RequestVote size: %zu bytes\n", len);
+    
+    raft_request_vote_t decoded;
+    ASSERT_OK(deserialize_raft_request_vote(buffer, len, &decoded));
+    
+    ASSERT_STR_EQ(decoded.candidate_id, "coordinator-1");
+    ASSERT_EQ(decoded.term, 42);
+    ASSERT_EQ(decoded.last_log_index, 1000);
+    ASSERT_EQ(decoded.last_log_term, 41);
+    
+    free_raft_request_vote(&decoded);
+    free(buffer);
+    TEST_PASS();
+}
+
+void test_raft_request_vote_response() {
+    TEST_START();
+    
+    raft_request_vote_response_t msg = {
+        .term = 42,
+        .vote_granted = true
+    };
+    strncpy(msg.node_id, "node-1", sizeof(msg.node_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_request_vote_response(&msg, &buffer, &len));
+    
+    raft_request_vote_response_t decoded;
+    ASSERT_OK(deserialize_raft_request_vote_response(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.term, 42);
+    ASSERT_TRUE(decoded.vote_granted);
+    ASSERT_STR_EQ(decoded.node_id, "node-1");
+    
+    free(buffer);
+    TEST_PASS();
+}
+
+void test_raft_append_entries_empty() {
+    TEST_START();
+    
+    raft_append_entries_t msg = {
+        .term = 42,
+        .prev_log_index = 1000,
+        .prev_log_term = 41,
+        .leader_commit = 999,
+        .entries = NULL,
+        .entry_count = 0
+    };
+    strncpy(msg.leader_id, "leader-1", sizeof(msg.leader_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_append_entries(&msg, &buffer, &len));
+    
+    printf("  AppendEntries (heartbeat) size: %zu bytes\n", len);
+    
+    raft_append_entries_t decoded;
+    ASSERT_OK(deserialize_raft_append_entries(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.term, 42);
+    ASSERT_STR_EQ(decoded.leader_id, "leader-1");
+    ASSERT_EQ(decoded.prev_log_index, 1000);
+    ASSERT_EQ(decoded.prev_log_term, 41);
+    ASSERT_EQ(decoded.leader_commit, 999);
+    ASSERT_EQ(decoded.entry_count, 0);
+    
+    free_raft_append_entries(&decoded);
+    free(buffer);
+    TEST_PASS();
+}
+
+void test_raft_append_entries_with_entries() {
+    TEST_START();
+    
+    /* Create test entries */
+    raft_log_entry_wire_t entries[3];
+    
+    uint8_t data1[] = "command1";
+    entries[0].index = 1001;
+    entries[0].term = 42;
+    entries[0].entry_type = RAFT_ENTRY_NORMAL;
+    entries[0].data = data1;
+    entries[0].data_len = 8;
+    
+    uint8_t data2[] = "command2";
+    entries[1].index = 1002;
+    entries[1].term = 42;
+    entries[1].entry_type = RAFT_ENTRY_NORMAL;
+    entries[1].data = data2;
+    entries[1].data_len = 8;
+    
+    entries[2].index = 1003;
+    entries[2].term = 42;
+    entries[2].entry_type = RAFT_ENTRY_NOOP;
+    entries[2].data = NULL;
+    entries[2].data_len = 0;
+    
+    raft_append_entries_t msg = {
+        .term = 42,
+        .prev_log_index = 1000,
+        .prev_log_term = 41,
+        .leader_commit = 999,
+        .entries = entries,
+        .entry_count = 3
+    };
+    strncpy(msg.leader_id, "leader-1", sizeof(msg.leader_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_append_entries(&msg, &buffer, &len));
+    
+    printf("  AppendEntries (3 entries) size: %zu bytes\n", len);
+    
+    raft_append_entries_t decoded;
+    ASSERT_OK(deserialize_raft_append_entries(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.entry_count, 3);
+    ASSERT_EQ(decoded.entries[0].index, 1001);
+    ASSERT_EQ(decoded.entries[0].term, 42);
+    ASSERT_EQ(decoded.entries[0].entry_type, RAFT_ENTRY_NORMAL);
+    ASSERT_EQ(decoded.entries[0].data_len, 8);
+    ASSERT_TRUE(memcmp(decoded.entries[0].data, "command1", 8) == 0);
+    
+    ASSERT_EQ(decoded.entries[2].entry_type, RAFT_ENTRY_NOOP);
+    ASSERT_EQ(decoded.entries[2].data_len, 0);
+    
+    free_raft_append_entries(&decoded);
+    free(buffer);
+    TEST_PASS();
+}
+
+void test_raft_append_entries_response() {
+    TEST_START();
+    
+    raft_append_entries_response_t msg = {
+        .term = 42,
+        .success = true,
+        .match_index = 1003
+    };
+    strncpy(msg.node_id, "node-1", sizeof(msg.node_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_append_entries_response(&msg, &buffer, &len));
+    
+    raft_append_entries_response_t decoded;
+    ASSERT_OK(deserialize_raft_append_entries_response(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.term, 42);
+    ASSERT_TRUE(decoded.success);
+    ASSERT_EQ(decoded.match_index, 1003);
+    ASSERT_STR_EQ(decoded.node_id, "node-1");
+    
+    free(buffer);
+    TEST_PASS();
+}
+
+void test_raft_install_snapshot() {
+    TEST_START();
+    
+    uint8_t snapshot_data[256];
+    for (int i = 0; i < 256; i++) {
+        snapshot_data[i] = (uint8_t)i;
+    }
+    
+    raft_install_snapshot_t msg = {
+        .term = 42,
+        .last_included_index = 1000,
+        .last_included_term = 41,
+        .data = snapshot_data,
+        .data_len = 256
+    };
+    strncpy(msg.leader_id, "leader-1", sizeof(msg.leader_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_install_snapshot(&msg, &buffer, &len));
+    
+    printf("  InstallSnapshot size: %zu bytes\n", len);
+    
+    raft_install_snapshot_t decoded;
+    ASSERT_OK(deserialize_raft_install_snapshot(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.term, 42);
+    ASSERT_STR_EQ(decoded.leader_id, "leader-1");
+    ASSERT_EQ(decoded.last_included_index, 1000);
+    ASSERT_EQ(decoded.last_included_term, 41);
+    ASSERT_EQ(decoded.data_len, 256);
+    ASSERT_TRUE(memcmp(decoded.data, snapshot_data, 256) == 0);
+    
+    free_raft_install_snapshot(&decoded);
+    free(buffer);
+    TEST_PASS();
+}
+
+void test_raft_install_snapshot_response() {
+    TEST_START();
+    
+    raft_install_snapshot_response_t msg = {
+        .term = 42,
+        .success = true
+    };
+    strncpy(msg.node_id, "node-1", sizeof(msg.node_id) - 1);
+    
+    uint8_t* buffer = NULL;
+    size_t len = 0;
+    ASSERT_OK(serialize_raft_install_snapshot_response(&msg, &buffer, &len));
+    
+    raft_install_snapshot_response_t decoded;
+    ASSERT_OK(deserialize_raft_install_snapshot_response(buffer, len, &decoded));
+    
+    ASSERT_EQ(decoded.term, 42);
+    ASSERT_TRUE(decoded.success);
+    ASSERT_STR_EQ(decoded.node_id, "node-1");
+    
+    free(buffer);
+    TEST_PASS();
+}
 
 /* ============================================================================
  * GOSSIP MESSAGE TESTS
@@ -146,6 +384,8 @@ void test_gossip_membership_update() {
     updates[0].state = NODE_STATE_ALIVE;
     updates[0].role = NODE_ROLE_COORDINATOR;
     updates[0].incarnation = 100;
+    updates[0].cpu_usage = 45;
+    updates[0].memory_usage = 67;
     
     strncpy(updates[1].node_id, "node-2", sizeof(updates[1].node_id) - 1);
     strncpy(updates[1].address, "10.0.1.2", sizeof(updates[1].address) - 1);
@@ -153,6 +393,8 @@ void test_gossip_membership_update() {
     updates[1].state = NODE_STATE_ALIVE;
     updates[1].role = NODE_ROLE_COORDINATOR;
     updates[1].incarnation = 101;
+    updates[1].cpu_usage = 12;
+    updates[1].memory_usage = 34;
     
     strncpy(updates[2].node_id, "worker-1", sizeof(updates[2].node_id) - 1);
     strncpy(updates[2].address, "10.0.2.1", sizeof(updates[2].address) - 1);
@@ -160,6 +402,8 @@ void test_gossip_membership_update() {
     updates[2].state = NODE_STATE_SUSPECTED;
     updates[2].role = NODE_ROLE_WORKER;
     updates[2].incarnation = 200;
+    updates[2].cpu_usage = 78;
+    updates[2].memory_usage = 89;
     
     gossip_membership_update_t msg = {
         .updates = updates,
@@ -185,68 +429,14 @@ void test_gossip_membership_update() {
     ASSERT_EQ(decoded.updates[0].port, 9000);
     ASSERT_EQ(decoded.updates[0].state, NODE_STATE_ALIVE);
     ASSERT_EQ(decoded.updates[0].role, NODE_ROLE_COORDINATOR);
+    ASSERT_EQ(decoded.updates[0].cpu_usage, 45);
+    ASSERT_EQ(decoded.updates[0].memory_usage, 67);
     
     /* Verify third node (suspected worker) */
     ASSERT_STR_EQ(decoded.updates[2].node_id, "worker-1");
     ASSERT_EQ(decoded.updates[2].state, NODE_STATE_SUSPECTED);
     ASSERT_EQ(decoded.updates[2].role, NODE_ROLE_WORKER);
-    
-    free_gossip_membership_update(&decoded);
-    free(buffer);
-    TEST_PASS();
-}
-
-void test_gossip_membership_with_load_metrics() {
-    TEST_START();
-    
-    gossip_node_info_t updates[2];
-    
-    strncpy(updates[0].node_id, "worker-1", sizeof(updates[0].node_id) - 1);
-    strncpy(updates[0].address, "10.0.2.1", sizeof(updates[0].address) - 1);
-    updates[0].port = 9001;
-    updates[0].state = NODE_STATE_ALIVE;
-    updates[0].role = NODE_ROLE_WORKER;
-    updates[0].incarnation = 100;
-    updates[0].cpu_usage = 45;      /* 45% CPU */
-    updates[0].memory_usage = 67;   /* 67% memory */
-    
-    strncpy(updates[1].node_id, "worker-2", sizeof(updates[1].node_id) - 1);
-    strncpy(updates[1].address, "10.0.2.2", sizeof(updates[1].address) - 1);
-    updates[1].port = 9001;
-    updates[1].state = NODE_STATE_ALIVE;
-    updates[1].role = NODE_ROLE_WORKER;
-    updates[1].incarnation = 101;
-    updates[1].cpu_usage = 12;      /* 12% CPU */
-    updates[1].memory_usage = 34;   /* 34% memory */
-    
-    gossip_membership_update_t msg = {
-        .updates = updates,
-        .update_count = 2
-    };
-    strncpy(msg.sender_id, "coordinator-1", sizeof(msg.sender_id) - 1);
-    
-    uint8_t* buffer = NULL;
-    size_t len = 0;
-    ASSERT_OK(serialize_gossip_membership_update(&msg, &buffer, &len));
-    
-    gossip_membership_update_t decoded;
-    ASSERT_OK(deserialize_gossip_membership_update(buffer, len, &decoded));
-    
-    ASSERT_EQ(decoded.update_count, 2);
-    
-    /* Verify first worker */
-    ASSERT_STR_EQ(decoded.updates[0].node_id, "worker-1");
-    ASSERT_EQ(decoded.updates[0].cpu_usage, 45);
-    ASSERT_EQ(decoded.updates[0].memory_usage, 67);
-    
-    /* Verify second worker */
-    ASSERT_STR_EQ(decoded.updates[1].node_id, "worker-2");
-    ASSERT_EQ(decoded.updates[1].cpu_usage, 12);
-    ASSERT_EQ(decoded.updates[1].memory_usage, 34);
-    
-    printf("  Load metrics: worker-1 (CPU=%u%%, MEM=%u%%), worker-2 (CPU=%u%%, MEM=%u%%)\n",
-           decoded.updates[0].cpu_usage, decoded.updates[0].memory_usage,
-           decoded.updates[1].cpu_usage, decoded.updates[1].memory_usage);
+    ASSERT_EQ(decoded.updates[2].cpu_usage, 78);
     
     free_gossip_membership_update(&decoded);
     free(buffer);
@@ -411,6 +601,15 @@ void test_client_response() {
 void test_utility_functions() {
     TEST_START();
     
+    /* Raft utilities */
+    ASSERT_STR_EQ(raft_entry_type_to_string(RAFT_ENTRY_NORMAL), "NORMAL");
+    ASSERT_STR_EQ(raft_entry_type_to_string(RAFT_ENTRY_CONFIG), "CONFIG");
+    ASSERT_STR_EQ(raft_entry_type_to_string(RAFT_ENTRY_NOOP), "NOOP");
+    
+    ASSERT_STR_EQ(config_change_type_to_string(CONFIG_CHANGE_ADD_NODE), "ADD_NODE");
+    ASSERT_STR_EQ(config_change_type_to_string(CONFIG_CHANGE_REMOVE_NODE), "REMOVE_NODE");
+    
+    /* Gossip utilities */
     ASSERT_STR_EQ(node_state_to_string(NODE_STATE_ALIVE), "ALIVE");
     ASSERT_STR_EQ(node_state_to_string(NODE_STATE_SUSPECTED), "SUSPECTED");
     ASSERT_STR_EQ(node_state_to_string(NODE_STATE_FAILED), "FAILED");
@@ -418,6 +617,7 @@ void test_utility_functions() {
     ASSERT_STR_EQ(node_role_to_string(NODE_ROLE_COORDINATOR), "COORDINATOR");
     ASSERT_STR_EQ(node_role_to_string(NODE_ROLE_WORKER), "WORKER");
     
+    /* Task utilities */
     ASSERT_STR_EQ(task_status_to_string(TASK_STATUS_PENDING), "PENDING");
     ASSERT_STR_EQ(task_status_to_string(TASK_STATUS_RUNNING), "RUNNING");
     ASSERT_STR_EQ(task_status_to_string(TASK_STATUS_COMPLETED), "COMPLETED");
@@ -432,24 +632,37 @@ void test_utility_functions() {
  * MAIN
  * ========================================================================= */
 int main(void) {
-    printf("=== DistriC Protocol - Message Serialization Tests ===\n");
+    printf("=== DistriC Protocol - Complete Message Serialization Tests ===\n");
+    
+    /* Raft tests */
+    printf("\n--- Raft Messages ---\n");
+    test_raft_request_vote();
+    test_raft_request_vote_response();
+    test_raft_append_entries_empty();
+    test_raft_append_entries_with_entries();
+    test_raft_append_entries_response();
+    test_raft_install_snapshot();
+    test_raft_install_snapshot_response();
     
     /* Gossip tests */
+    printf("\n--- Gossip Messages ---\n");
     test_gossip_ping();
     test_gossip_ack();
     test_gossip_indirect_ping();
     test_gossip_membership_update();
-    test_gossip_membership_with_load_metrics();
     
     /* Task tests */
+    printf("\n--- Task Messages ---\n");
     test_task_assignment();
     test_task_result();
     
     /* Client tests */
+    printf("\n--- Client Messages ---\n");
     test_client_submit();
     test_client_response();
     
     /* Utility tests */
+    printf("\n--- Utility Functions ---\n");
     test_utility_functions();
     
     printf("\n=== Test Results ===\n");
@@ -458,7 +671,8 @@ int main(void) {
     
     if (tests_failed == 0) {
         printf("\n✓ All protocol message serialization tests passed!\n");
-        printf("✓ Note: Raft message tests are in distric_raft library\n");
+        printf("✓ Raft messages now tested in distric_protocol (refactoring complete)\n");
+        printf("✓ Ready to proceed with distric_raft cleanup\n");
     }
     
     return tests_failed > 0 ? 1 : 0;

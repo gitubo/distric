@@ -19,7 +19,6 @@ set(RAFT_SOURCES
     src/raft_core.c
     src/raft_rpc.c
     src/raft_persistence.c
-    src/raft_message.c
 )
 
 # Create library
