@@ -428,14 +428,8 @@ distric_err_t raft_rpc_start(raft_rpc_context_t* context) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* Start TCP server */
-    distric_err_t err = tcp_server_start(context->tcp_server, NULL, NULL);
-    if (err != DISTRIC_OK) {
-        return err;
-    }
-    
-    /* Start RPC server */
-    err = rpc_server_start(context->rpc_server);
+    /* Start RPC server - this will start the TCP server internally */
+    distric_err_t err = rpc_server_start(context->rpc_server);
     if (err != DISTRIC_OK) {
         return err;
     }
