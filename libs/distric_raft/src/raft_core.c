@@ -125,8 +125,10 @@ static void persist_state(raft_node_t* node) {
                                                      node->current_term, 
                                                      node->voted_for);
     if (err != DISTRIC_OK) {
+        char term_str[16];
+        snprintf(term_str, sizeof(term_str), "%u", node->current_term);
         LOG_ERROR(node->config.logger, "raft", "Failed to persist state",
-                 "term", &(int){node->current_term});
+                 "term", term_str, NULL);
     }
 }
 
@@ -212,8 +214,10 @@ static distric_err_t log_append(raft_log_t* log, uint32_t term, raft_entry_type_
     if (node && node->persistence) {
         distric_err_t err = persist_entry(node, entry);
         if (err != DISTRIC_OK) {
+            char idx_str[16];
+            snprintf(idx_str, sizeof(idx_str), "%u", entry->index);
             LOG_ERROR(node->config.logger, "raft", "Failed to persist log entry",
-                     "index", &(int){entry->index});
+                     "index", idx_str, NULL);
             /* Rollback in-memory append */
             free(entry->data);
             log->count--;
@@ -293,8 +297,12 @@ static void transition_to_follower(raft_node_t* node, uint32_t term) {
     persist_state(node);
     
     if (old_state != RAFT_STATE_FOLLOWER) {
+        char term_str[16];
+        snprintf(term_str, sizeof(term_str), "%u", term);
+        
         LOG_INFO(node->config.logger, "raft", "Became FOLLOWER",
-                "term", &(int){term}, "old_state", raft_state_to_string(old_state));
+                "term", term_str, 
+                "old_state", raft_state_to_string(old_state), NULL);
         
         if (node->config.state_change_fn) {
             node->config.state_change_fn(old_state, RAFT_STATE_FOLLOWER, node->config.user_data);
@@ -317,9 +325,14 @@ static void transition_to_candidate(raft_node_t* node) {
     /* Persist state change (Session 3.4) */
     persist_state(node);
     
+    char term_str[16], timeout_str[16];
+    snprintf(term_str, sizeof(term_str), "%u", node->current_term);
+    snprintf(timeout_str, sizeof(timeout_str), "%llu", 
+            (unsigned long long)node->election_timeout_ms);
+    
     LOG_INFO(node->config.logger, "raft", "Became CANDIDATE",
-            "term", &(int){node->current_term},
-            "timeout_ms", &(int){node->election_timeout_ms});
+            "term", term_str,
+            "timeout_ms", timeout_str, NULL);
     
     if (node->config.state_change_fn) {
         node->config.state_change_fn(old_state, RAFT_STATE_CANDIDATE, node->config.user_data);
@@ -347,9 +360,13 @@ static void transition_to_leader(raft_node_t* node) {
     /* Initialize heartbeat timestamp */
     node->last_heartbeat_sent_ms = get_time_ms();
     
+    char term_str[16], index_str[16];
+    snprintf(term_str, sizeof(term_str), "%u", node->current_term);
+    snprintf(index_str, sizeof(index_str), "%u", last_index);
+    
     LOG_INFO(node->config.logger, "raft", "Became LEADER",
-            "term", &(int){node->current_term},
-            "last_log_index", &(int){last_index});
+            "term", term_str,
+            "last_log_index", index_str, NULL);
     
     if (node->config.state_change_fn) {
         node->config.state_change_fn(old_state, RAFT_STATE_LEADER, node->config.user_data);
@@ -386,15 +403,20 @@ static void apply_committed_entries(raft_node_t* node) {
         /* Get entry */
         raft_log_entry_t* entry = log_get(&node->log, node->last_applied);
         if (!entry) {
+            char idx_str[16];
+            snprintf(idx_str, sizeof(idx_str), "%u", node->last_applied);
             LOG_ERROR(node->config.logger, "raft", "Missing log entry",
-                     "index", &(int){node->last_applied});
+                     "index", idx_str, NULL);
             break;
         }
         
         /* Skip NO-OP entries */
         if (entry->type == RAFT_ENTRY_NOOP) {
+            char idx_str[16];
+            snprintf(idx_str, sizeof(idx_str), "%u", node->last_applied);
+            
             LOG_DEBUG(node->config.logger, "raft", "Skipping NO-OP entry",
-                     "index", &(int){node->last_applied});
+                     "index", idx_str, NULL);
             continue;
         }
         
@@ -403,9 +425,13 @@ static void apply_committed_entries(raft_node_t* node) {
         node->config.apply_fn(entry, node->config.user_data);
         pthread_rwlock_wrlock(&node->lock);
         
+        char idx_str[16], term_str[16];
+        snprintf(idx_str, sizeof(idx_str), "%u", node->last_applied);
+        snprintf(term_str, sizeof(term_str), "%u", entry->term);
+        
         LOG_DEBUG(node->config.logger, "raft", "Applied entry to state machine",
-                 "index", &(int){node->last_applied},
-                 "term", &(int){entry->term});
+                 "index", idx_str,
+                 "term", term_str, NULL);
     }
     
     pthread_rwlock_unlock(&node->lock);
@@ -434,9 +460,13 @@ static void update_commit_index(raft_node_t* node) {
         if (last_log_index > old_commit) {
             atomic_store(&node->commit_index, last_log_index);
             
+            char old_str[16], new_str[16];
+            snprintf(old_str, sizeof(old_str), "%u", old_commit);
+            snprintf(new_str, sizeof(new_str), "%u", last_log_index);
+            
             LOG_INFO(node->config.logger, "raft", "Advanced commit index (single-node)",
-                    "old", &(int){old_commit},
-                    "new", &(int){last_log_index});
+                    "old", old_str,
+                    "new", new_str, NULL);
         }
         pthread_rwlock_unlock(&node->lock);
         return;
@@ -465,11 +495,15 @@ static void update_commit_index(raft_node_t* node) {
         if (replicas >= majority) {
             atomic_store(&node->commit_index, n);
             
+            char old_str[16], new_str[16], repl_str[16], maj_str[16];
+            snprintf(old_str, sizeof(old_str), "%u", old_commit);
+            snprintf(new_str, sizeof(new_str), "%u", n);
+            snprintf(repl_str, sizeof(repl_str), "%u", replicas);
+            snprintf(maj_str, sizeof(maj_str), "%u", majority);
+            
             LOG_INFO(node->config.logger, "raft", "Advanced commit index",
-                    "old", &(int){old_commit},
-                    "new", &(int){n},
-                    "replicas", &(int){replicas},
-                    "majority", &(int){majority});
+                    "old", old_str, "new", new_str,
+                    "replicas", repl_str, "majority", maj_str, NULL);
             
             old_commit = n;
         }
@@ -558,61 +592,65 @@ distric_err_t raft_create(const raft_config_t* config, raft_node_t** node_out) {
     pthread_rwlock_init(&node->lock, NULL);
     
     /* Initialize persistence (Session 3.4) */
-node->persistence = NULL;
-if (config->persistence_data_dir) {
-    raft_persistence_config_t persist_config = {
-        .data_dir = config->persistence_data_dir,
-        .logger = config->logger
-    };
-    
-    err = raft_persistence_init(&persist_config, &node->persistence);
-    if (err != DISTRIC_OK) {
-        LOG_ERROR(config->logger, "raft", "Failed to initialize persistence",
-                 "data_dir", config->persistence_data_dir);
-        pthread_rwlock_destroy(&node->lock);
-        raft_log_destroy(&node->log);
-        free(node->config.peers);
-        free(node->next_index);
-        free(node->match_index);
-        free(node);
-        return err;
-    }
-    
-    /* Load persistent state */
-    uint32_t loaded_term = 0;
-    char loaded_voted_for[64] = {0};
-    
-    err = raft_persistence_load_state(node->persistence, &loaded_term, loaded_voted_for);
-    if (err == DISTRIC_OK) {
-        node->current_term = loaded_term;
-        strncpy(node->voted_for, loaded_voted_for, sizeof(node->voted_for) - 1);
+    node->persistence = NULL;
+    if (config->persistence_data_dir) {
+        raft_persistence_config_t persist_config = {
+            .data_dir = config->persistence_data_dir,
+            .logger = config->logger
+        };
         
-        LOG_INFO(config->logger, "raft", "Loaded persistent state",
-                "term", &(int){loaded_term},
-                "voted_for", loaded_voted_for);
-    } else if (err != DISTRIC_ERR_NOT_FOUND) {
-        LOG_ERROR(config->logger, "raft", "Failed to load persistent state");
-    }
-    
-    /* Load log entries */
-    raft_log_entry_t* entries = NULL;
-    size_t count = 0;
-    err = raft_persistence_load_log(node->persistence, &entries, &count);
-    if (err == DISTRIC_OK && count > 0) {
-        /* Restore log from persistence */
-        for (size_t i = 0; i < count; i++) {
-            log_append(&node->log, entries[i].term, entries[i].type, 
-                      entries[i].data, entries[i].data_len, NULL);  /* NULL = don't re-persist */
-            free(entries[i].data);
+        err = raft_persistence_init(&persist_config, &node->persistence);
+        if (err != DISTRIC_OK) {
+            LOG_ERROR(config->logger, "raft", "Failed to initialize persistence",
+                     "data_dir", config->persistence_data_dir, NULL);
+            pthread_rwlock_destroy(&node->lock);
+            raft_log_destroy(&node->log);
+            free(node->config.peers);
+            free(node->next_index);
+            free(node->match_index);
+            free(node);
+            return err;
         }
-        free(entries);
         
-        LOG_INFO(config->logger, "raft", "Loaded log from persistence",
-                "entries", &(int){count});
-    } else if (err != DISTRIC_ERR_NOT_FOUND && err != DISTRIC_OK) {
-        LOG_ERROR(config->logger, "raft", "Failed to load log entries");
+        /* Load persistent state */
+        uint32_t loaded_term = 0;
+        char loaded_voted_for[64] = {0};
+        
+        err = raft_persistence_load_state(node->persistence, &loaded_term, loaded_voted_for);
+        if (err == DISTRIC_OK) {
+            node->current_term = loaded_term;
+            strncpy(node->voted_for, loaded_voted_for, sizeof(node->voted_for) - 1);
+            
+            char term_str[16];
+            snprintf(term_str, sizeof(term_str), "%u", loaded_term);
+            LOG_INFO(config->logger, "raft", "Loaded persistent state",
+                    "term", term_str,
+                    "voted_for", loaded_voted_for, NULL);
+        } else if (err != DISTRIC_ERR_NOT_FOUND) {
+            LOG_ERROR(config->logger, "raft", "Failed to load persistent state", NULL);
+        }
+        
+        /* Load log entries */
+        raft_log_entry_t* entries = NULL;
+        size_t count = 0;
+        err = raft_persistence_load_log(node->persistence, &entries, &count);
+        if (err == DISTRIC_OK && count > 0) {
+            /* Restore log from persistence */
+            for (size_t i = 0; i < count; i++) {
+                log_append(&node->log, entries[i].term, entries[i].type, 
+                          entries[i].data, entries[i].data_len, NULL);  /* NULL = don't re-persist */
+                free(entries[i].data);
+            }
+            free(entries);
+            
+            char count_str[16];
+            snprintf(count_str, sizeof(count_str), "%zu", count);
+            LOG_INFO(config->logger, "raft", "Loaded log from persistence",
+                    "entries", count_str, NULL);
+        } else if (err != DISTRIC_ERR_NOT_FOUND && err != DISTRIC_OK) {
+            LOG_ERROR(config->logger, "raft", "Failed to load log entries", NULL);
+        }
     }
-}
     
     /* Register metrics */
     if (config->metrics) {
@@ -630,10 +668,12 @@ if (config->persistence_data_dir) {
     
     *node_out = node;
     
+    char peer_count_str[16];
+    snprintf(peer_count_str, sizeof(peer_count_str), "%zu", config->peer_count);
     LOG_INFO(config->logger, "raft", "Node created",
             "node_id", config->node_id,
-            "peers", &(int){config->peer_count},
-            "persistence", config->persistence_data_dir ? "enabled" : "disabled");
+            "peers", peer_count_str,
+            "persistence", config->persistence_data_dir ? "enabled" : "disabled", NULL);
     
     return DISTRIC_OK;
 }
@@ -666,7 +706,7 @@ distric_err_t raft_start(raft_node_t* node) {
     
     atomic_store(&node->running, true);
     
-    LOG_INFO(node->config.logger, "raft", "Node started");
+    LOG_INFO(node->config.logger, "raft", "Node started", NULL);
     
     return DISTRIC_OK;
 }
@@ -678,7 +718,7 @@ distric_err_t raft_stop(raft_node_t* node) {
     
     atomic_store(&node->running, false);
     
-    LOG_INFO(node->config.logger, "raft", "Node stopped");
+    LOG_INFO(node->config.logger, "raft", "Node stopped", NULL);
     
     return DISTRIC_OK;
 }
@@ -700,11 +740,18 @@ static void start_election(raft_node_t* node) {
     
     pthread_rwlock_unlock(&node->lock);
     
+    /* Format numeric values for logging */
+    char term_str[16], votes_str[16], last_idx_str[16], last_term_str[16];
+    snprintf(term_str, sizeof(term_str), "%u", node->current_term);
+    snprintf(votes_str, sizeof(votes_str), "%d", votes_needed);
+    snprintf(last_idx_str, sizeof(last_idx_str), "%u", last_log_index);
+    snprintf(last_term_str, sizeof(last_term_str), "%u", last_log_term);
+    
     LOG_INFO(node->config.logger, "raft", "Starting election",
-            "term", &(int){node->current_term},
-            "votes_needed", &votes_needed,
-            "last_log_index", &(int){last_log_index},
-            "last_log_term", &(int){last_log_term});
+            "term", term_str,
+            "votes_needed", votes_str,
+            "last_log_index", last_idx_str,
+            "last_log_term", last_term_str, NULL);
     
     /* If cluster size is 1, immediately become leader */
     if (votes_needed == 1) {
@@ -837,9 +884,11 @@ distric_err_t raft_handle_request_vote(
         /* Persist state BEFORE responding (Session 3.4) */
         persist_state(node);
         
+        char term_str[16];
+        snprintf(term_str, sizeof(term_str), "%u", term);
         LOG_INFO(node->config.logger, "raft", "Granted vote",
                 "candidate", candidate_id,
-                "term", &(int){term});
+                "term", term_str, NULL);
     }
     
     pthread_rwlock_unlock(&node->lock);
@@ -995,10 +1044,14 @@ distric_err_t raft_wait_committed(
         /* Check timeout */
         uint64_t elapsed = get_time_ms() - start;
         if (elapsed >= timeout_ms) {
+            char idx_str[16], commit_str[16], timeout_str[16];
+            snprintf(idx_str, sizeof(idx_str), "%u", index);
+            snprintf(commit_str, sizeof(commit_str), "%u", commit_index);
+            snprintf(timeout_str, sizeof(timeout_str), "%u", timeout_ms);
+            
             LOG_WARN(node->config.logger, "raft", "Wait for commit timed out",
-                    "index", &(int){index},
-                    "commit_index", &(int){commit_index},
-                    "timeout_ms", &(int){timeout_ms});
+                    "index", idx_str, "commit_index", commit_str,
+                    "timeout_ms", timeout_str, NULL);
             return DISTRIC_ERR_TIMEOUT;
         }
         
@@ -1286,9 +1339,12 @@ distric_err_t raft_handle_append_entries_response(
     if (peer_term > node->current_term) {
         pthread_rwlock_unlock(&node->lock);
         
+        char our_term_str[16], peer_term_str[16];
+        snprintf(our_term_str, sizeof(our_term_str), "%u", node->current_term);
+        snprintf(peer_term_str, sizeof(peer_term_str), "%u", peer_term);
         LOG_INFO(node->config.logger, "raft", "Stepping down due to higher term in AppendEntries response",
-                "our_term", &(int){node->current_term},
-                "peer_term", &(int){peer_term});
+                "our_term", our_term_str,
+                "peer_term", peer_term_str, NULL);
         
         return raft_step_down(node, peer_term);
     }
@@ -1304,18 +1360,26 @@ distric_err_t raft_handle_append_entries_response(
         node->next_index[peer_index] = match_index + 1;
         node->match_index[peer_index] = match_index;
         
+        char peer_str[16], match_str[16];
+        snprintf(peer_str, sizeof(peer_str), "%zu", peer_index);
+        snprintf(match_str, sizeof(match_str), "%u", match_index);
+        
         LOG_DEBUG(node->config.logger, "raft", "Replication succeeded",
-                 "peer_index", &(int){peer_index},
-                 "match_index", &(int){match_index});
+                 "peer_index", peer_str,
+                 "match_index", match_str, NULL);
     } else {
         /* Decrement next_index and retry */
         if (node->next_index[peer_index] > 1) {
             node->next_index[peer_index]--;
         }
         
+        char peer_str[16], next_str[16];
+        snprintf(peer_str, sizeof(peer_str), "%zu", peer_index);
+        snprintf(next_str, sizeof(next_str), "%u", node->next_index[peer_index]);
+        
         LOG_DEBUG(node->config.logger, "raft", "Replication failed, decrementing next_index",
-                 "peer_index", &(int){peer_index},
-                 "next_index", &(int){node->next_index[peer_index]});
+                 "peer_index", peer_str,
+                 "next_index", next_str, NULL);
     }
     
     pthread_rwlock_unlock(&node->lock);
@@ -1419,11 +1483,17 @@ distric_err_t raft_handle_log_conflict(
     
     node->next_index[peer_index] = new_next_index;
     
+    char peer_str[16], conflict_idx_str[16], conflict_term_str[16], next_str[16];
+    snprintf(peer_str, sizeof(peer_str), "%zu", peer_index);
+    snprintf(conflict_idx_str, sizeof(conflict_idx_str), "%u", conflict_index);
+    snprintf(conflict_term_str, sizeof(conflict_term_str), "%u", conflict_term);
+    snprintf(next_str, sizeof(next_str), "%u", new_next_index);
+    
     LOG_INFO(node->config.logger, "raft", "Handled log conflict",
-            "peer_index", &(int){peer_index},
-            "conflict_index", &(int){conflict_index},
-            "conflict_term", &(int){conflict_term},
-            "new_next_index", &(int){new_next_index});
+            "peer_index", peer_str,
+            "conflict_index", conflict_idx_str,
+            "conflict_term", conflict_term_str,
+            "new_next_index", next_str, NULL);
     
     pthread_rwlock_unlock(&node->lock);
     
@@ -1545,7 +1615,7 @@ distric_err_t raft_create_snapshot(
                                                         snapshot_data, 
                                                         snapshot_len);
     if (err != DISTRIC_OK) {
-        LOG_ERROR(node->config.logger, "raft", "Failed to save snapshot");
+        LOG_ERROR(node->config.logger, "raft", "Failed to save snapshot", NULL);
         return err;
     }
     
@@ -1561,10 +1631,14 @@ distric_err_t raft_create_snapshot(
     
     pthread_rwlock_unlock(&node->lock);
     
+    char idx_str[16], term_str[16], len_str[16];
+    snprintf(idx_str, sizeof(idx_str), "%u", last_included_index);
+    snprintf(term_str, sizeof(term_str), "%u", last_included_term);
+    snprintf(len_str, sizeof(len_str), "%zu", snapshot_len);
     LOG_INFO(node->config.logger, "raft", "Snapshot created",
-            "last_included_index", &(int){last_included_index},
-            "last_included_term", &(int){last_included_term},
-            "data_len", &(int){snapshot_len});
+            "last_included_index", idx_str,
+            "last_included_term", term_str,
+            "data_len", len_str, NULL);
     
     return DISTRIC_OK;
 }
@@ -1591,7 +1665,7 @@ distric_err_t raft_install_snapshot(
                                                         snapshot_data,
                                                         snapshot_len);
     if (err != DISTRIC_OK) {
-        LOG_WARN(node->config.logger, "raft", "Snapshot save not implemented yet");
+        LOG_WARN(node->config.logger, "raft", "Snapshot save not implemented yet", NULL);
         return err;
     }
     
@@ -1614,9 +1688,12 @@ distric_err_t raft_install_snapshot(
     
     pthread_rwlock_unlock(&node->lock);
     
+    char idx_str[16], term_str[16];
+    snprintf(idx_str, sizeof(idx_str), "%u", last_included_index);
+    snprintf(term_str, sizeof(term_str), "%u", last_included_term);
     LOG_INFO(node->config.logger, "raft", "Snapshot installed",
-            "last_included_index", &(int){last_included_index},
-            "last_included_term", &(int){last_included_term});
+            "last_included_index", idx_str,
+            "last_included_term", term_str, NULL);
     
     return DISTRIC_OK;
 }
