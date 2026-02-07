@@ -1,16 +1,8 @@
 /**
- * @file tcp_pool.c  
- * @brief TCP Connection Pool Implementation - SEGFAULT FIX
+ * @file tcp.c
+ * @brief TCP Transport Implementation
  * 
- * ROOT CAUSE:
- * Race condition between connection handlers and pool operations.
- * When server closes connection, pool entry becomes stale.
- * 
- * FIX:
- * 1. Add connection validity check before ANY access
- * 2. Use atomic flags for thread-safe validity tracking
- * 3. NULL out pointers immediately when marking failed
- * 4. Add defensive checks in all operations
+ * Non-blocking TCP server and client with integrated observability.
  */
 
 #ifndef _DEFAULT_SOURCE
@@ -21,433 +13,607 @@
 #define _POSIX_C_SOURCE 200112L
 #endif
 
-#include "distric_transport/tcp_pool.h"
+#include "distric_transport/tcp.h"
 #include <distric_obs.h>
-#include <stdio.h>
+
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <time.h>
-#include <unistd.h>
 
 /* ============================================================================
  * INTERNAL STRUCTURES
  * ========================================================================= */
 
-typedef struct pool_entry_s {
-    tcp_connection_t* conn;
-    char host[256];
-    uint16_t port;
-    uint64_t last_used;
-    _Atomic bool in_use;      /* CHANGED: Make atomic for thread safety */
-    _Atomic bool valid;       /* CHANGED: Make atomic for thread safety */
-    struct pool_entry_s* next;
-} pool_entry_t;
+/* Global connection ID counter for client connections */
+static _Atomic uint64_t g_client_connection_id_counter = 1;
 
-struct tcp_pool_s {
-    pool_entry_t* entries;
-    size_t max_connections;
-    size_t current_size;
+struct tcp_connection_s {
+    int fd;
+    char remote_addr[256];
+    uint16_t remote_port;
+    uint64_t connection_id;
     
-    _Atomic uint64_t hits;
-    _Atomic uint64_t misses;
-    _Atomic bool shutting_down;
-    
-    pthread_mutex_t lock;
-
     metrics_registry_t* metrics;
     logger_t* logger;
     
-    metric_t* pool_size_metric;
-    metric_t* pool_hits_metric;
-    metric_t* pool_misses_metric;
+    metric_t* bytes_sent_metric;
+    metric_t* bytes_recv_metric;
+};
+
+struct tcp_server_s {
+    int listen_fd;
+    char bind_addr[256];
+    uint16_t port;
+    
+    _Atomic bool running;
+    pthread_t accept_thread;
+    
+    tcp_connection_callback_t callback;
+    void* userdata;
+    
+    metrics_registry_t* metrics;
+    logger_t* logger;
+    
+    metric_t* connections_total_metric;
+    metric_t* active_connections_metric;
+    metric_t* errors_metric;
+    
+    _Atomic uint64_t connection_id_counter;
 };
 
 /* ============================================================================
  * UTILITY FUNCTIONS
  * ========================================================================= */
 
-static uint64_t get_timestamp_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-/* IMPROVED: Safe entry lookup with validity check */
-static pool_entry_t* find_entry(tcp_pool_t* pool, const char* host, uint16_t port) {
-    if (!pool || !host) return NULL;
+static int set_tcp_nodelay(int fd) {
+    int flag = 1;
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+}
+
+static int set_reuseaddr(int fd) {
+    int flag = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+}
+
+/* ============================================================================
+ * TCP CONNECTION IMPLEMENTATION
+ * ========================================================================= */
+
+distric_err_t tcp_connect(
+    const char* host,
+    uint16_t port,
+    int timeout_ms,
+    metrics_registry_t* metrics,
+    logger_t* logger,
+    tcp_connection_t** conn_out
+) {
+    if (!host || !conn_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
     
-    pool_entry_t* entry = pool->entries;
-    while (entry) {
-        /* CRITICAL: Check valid flag atomically BEFORE accessing conn */
-        if (atomic_load(&entry->valid) && 
-            !atomic_load(&entry->in_use) && 
-            entry->conn != NULL &&  /* Additional NULL check */
-            entry->port == port && 
-            strcmp(entry->host, host) == 0) {
-            return entry;
+    /* Resolve hostname */
+    struct hostent* he = gethostbyname(host);
+    if (!he) {
+        if (logger) {
+            LOG_ERROR(logger, "tcp", "Failed to resolve host", "host", host, NULL);
         }
-        entry = entry->next;
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Create socket */
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        if (logger) {
+            LOG_ERROR(logger, "tcp", "Failed to create socket", "errno", strerror(errno), NULL);
+        }
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    set_nonblocking(fd);
+    set_tcp_nodelay(fd);
+    
+    /* Connect */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+    
+    int result = connect(fd, (struct sockaddr*)&addr, sizeof(addr));
+    
+    if (result < 0 && errno != EINPROGRESS) {
+        if (logger) {
+            LOG_ERROR(logger, "tcp", "Connect failed immediately", 
+                     "host", host, "errno", strerror(errno), NULL);
+        }
+        close(fd);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Wait for connection with timeout */
+    if (errno == EINPROGRESS) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        
+        int poll_result = poll(&pfd, 1, timeout_ms);
+        
+        if (poll_result <= 0) {
+            if (logger) {
+                LOG_ERROR(logger, "tcp", "Connect timeout", "host", host, NULL);
+            }
+            close(fd);
+            return DISTRIC_ERR_TIMEOUT;
+        }
+        
+        /* Check for connection error */
+        int error;
+        socklen_t len = sizeof(error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
+            if (logger) {
+                LOG_ERROR(logger, "tcp", "Connect failed", 
+                         "host", host, "error", strerror(error), NULL);
+            }
+            close(fd);
+            return DISTRIC_ERR_INIT_FAILED;
+        }
+    }
+    
+    /* Create connection object */
+    tcp_connection_t* conn = calloc(1, sizeof(tcp_connection_t));
+    if (!conn) {
+        close(fd);
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    conn->fd = fd;
+    inet_ntop(AF_INET, &addr.sin_addr, conn->remote_addr, sizeof(conn->remote_addr));
+    conn->remote_port = port;
+    conn->connection_id = atomic_fetch_add(&g_client_connection_id_counter, 1);
+    conn->metrics = metrics;
+    conn->logger = logger;
+    
+    /* Register metrics */
+    if (metrics) {
+        metrics_register_counter(metrics, "tcp_bytes_sent_total",
+                                "Total TCP bytes sent", NULL, 0, &conn->bytes_sent_metric);
+        metrics_register_counter(metrics, "tcp_bytes_received_total",
+                                "Total TCP bytes received", NULL, 0, &conn->bytes_recv_metric);
+    }
+    
+    if (logger) {
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%u", port);
+        LOG_DEBUG(logger, "tcp", "Connected", 
+                 "host", host, "port", port_str, NULL);
+    }
+    
+    *conn_out = conn;
+    return DISTRIC_OK;
+}
+
+int tcp_send(tcp_connection_t* conn, const void* data, size_t len) {
+    if (!conn || !data || len == 0) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    ssize_t total_sent = 0;
+    const uint8_t* ptr = (const uint8_t*)data;
+    
+    while (total_sent < (ssize_t)len) {
+        ssize_t sent = send(conn->fd, ptr + total_sent, len - total_sent, MSG_NOSIGNAL);
+        
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Wait for socket to be writable */
+                struct pollfd pfd;
+                pfd.fd = conn->fd;
+                pfd.events = POLLOUT;
+                
+                int poll_result = poll(&pfd, 1, 5000); /* 5 second timeout */
+                if (poll_result <= 0) {
+                    if (conn->logger) {
+                        LOG_ERROR(conn->logger, "tcp", "Send timeout", NULL);
+                    }
+                    return -1;
+                }
+                continue;
+            }
+            
+            if (conn->logger) {
+                LOG_ERROR(conn->logger, "tcp", "Send failed", 
+                         "errno", strerror(errno), NULL);
+            }
+            return -1;
+        }
+        
+        total_sent += sent;
+    }
+    
+    if (conn->bytes_sent_metric) {
+        metrics_counter_add(conn->bytes_sent_metric, total_sent);
+    }
+    
+    return (int)total_sent;
+}
+
+int tcp_recv(tcp_connection_t* conn, void* buffer, size_t len, int timeout_ms) {
+    if (!conn || !buffer || len == 0) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    /* Wait for data with timeout */
+    if (timeout_ms >= 0) {
+        struct pollfd pfd;
+        pfd.fd = conn->fd;
+        pfd.events = POLLIN;
+        
+        int poll_result = poll(&pfd, 1, timeout_ms);
+        
+        if (poll_result == 0) {
+            /* Timeout */
+            return 0;
+        } else if (poll_result < 0) {
+            if (conn->logger) {
+                LOG_ERROR(conn->logger, "tcp", "Poll failed", 
+                         "errno", strerror(errno), NULL);
+            }
+            return -1;
+        }
+    }
+    
+    ssize_t received = recv(conn->fd, buffer, len, 0);
+    
+    if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        
+        if (conn->logger) {
+            LOG_ERROR(conn->logger, "tcp", "Recv failed", 
+                     "errno", strerror(errno), NULL);
+        }
+        return -1;
+    }
+    
+    if (received > 0 && conn->bytes_recv_metric) {
+        metrics_counter_add(conn->bytes_recv_metric, received);
+    }
+    
+    return (int)received;
+}
+
+void tcp_close(tcp_connection_t* conn) {
+    if (!conn) return;
+    
+    if (conn->logger) {
+        LOG_DEBUG(conn->logger, "tcp", "Connection closed", 
+                 "remote", conn->remote_addr, NULL);
+    }
+    
+    close(conn->fd);
+    free(conn);
+}
+
+distric_err_t tcp_get_remote_addr(
+    tcp_connection_t* conn,
+    char* addr_out,
+    size_t addr_len,
+    uint16_t* port_out
+) {
+    if (!conn || !addr_out || addr_len == 0) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    strncpy(addr_out, conn->remote_addr, addr_len - 1);
+    addr_out[addr_len - 1] = '\0';
+    
+    if (port_out) {
+        *port_out = conn->remote_port;
+    }
+    
+    return DISTRIC_OK;
+}
+
+uint64_t tcp_get_connection_id(tcp_connection_t* conn) {
+    return conn ? conn->connection_id : 0;
+}
+
+/* ============================================================================
+ * TCP SERVER IMPLEMENTATION
+ * ========================================================================= */
+
+/* Forward declaration */
+static void* lambda_wrapper(void* arg);
+
+static void* accept_thread_func(void* arg) {
+    tcp_server_t* server = (tcp_server_t*)arg;
+    
+    while (atomic_load(&server->running)) {
+        /* Wait for incoming connection */
+        struct pollfd pfd;
+        pfd.fd = server->listen_fd;
+        pfd.events = POLLIN;
+        
+        int poll_result = poll(&pfd, 1, 100); /* 100ms timeout */
+        
+        if (poll_result <= 0) {
+            continue;
+        }
+        
+        /* Accept connection */
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        
+        int client_fd = accept(server->listen_fd, (struct sockaddr*)&client_addr, &addr_len);
+        
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            
+            if (server->logger) {
+                LOG_ERROR(server->logger, "tcp_server", "Accept failed", 
+                         "errno", strerror(errno), NULL);
+            }
+            
+            if (server->errors_metric) {
+                metrics_counter_inc(server->errors_metric);
+            }
+            continue;
+        }
+        
+        set_nonblocking(client_fd);
+        set_tcp_nodelay(client_fd);
+        
+        /* Create connection object */
+        tcp_connection_t* conn = calloc(1, sizeof(tcp_connection_t));
+        if (!conn) {
+            close(client_fd);
+            continue;
+        }
+        
+        conn->fd = client_fd;
+        inet_ntop(AF_INET, &client_addr.sin_addr, conn->remote_addr, sizeof(conn->remote_addr));
+        conn->remote_port = ntohs(client_addr.sin_port);
+        conn->connection_id = atomic_fetch_add(&server->connection_id_counter, 1);
+        conn->metrics = server->metrics;
+        conn->logger = server->logger;
+        
+        /* Register metrics */
+        if (server->metrics) {
+            metrics_register_counter(server->metrics, "tcp_bytes_sent_total",
+                                    "Total TCP bytes sent", NULL, 0, &conn->bytes_sent_metric);
+            metrics_register_counter(server->metrics, "tcp_bytes_received_total",
+                                    "Total TCP bytes received", NULL, 0, &conn->bytes_recv_metric);
+        }
+        
+        /* Update server metrics */
+        if (server->connections_total_metric) {
+            metrics_counter_inc(server->connections_total_metric);
+        }
+        if (server->active_connections_metric) {
+            metrics_gauge_set(server->active_connections_metric, 1.0); // Simplified
+        }
+        
+        if (server->logger) {
+            char port_str[16];
+            snprintf(port_str, sizeof(port_str), "%u", conn->remote_port);
+            LOG_INFO(server->logger, "tcp_server", "Connection accepted", 
+                    "remote_addr", conn->remote_addr,
+                    "remote_port", port_str, NULL);
+        }
+        
+        /* Call user callback in new thread */
+        if (server->callback) {
+            pthread_t handler_thread;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            
+            /* Create handler args */
+            typedef struct {
+                tcp_connection_t* conn;
+                tcp_connection_callback_t callback;
+                void* userdata;
+            } handler_args_t;
+            
+            handler_args_t* args = malloc(sizeof(handler_args_t));
+            if (args) {
+                args->conn = conn;
+                args->callback = server->callback;
+                args->userdata = server->userdata;
+                
+                pthread_create(&handler_thread, &attr, 
+                    (void*(*)(void*))lambda_wrapper, args);
+            }
+            
+            pthread_attr_destroy(&attr);
+        } else {
+            tcp_close(conn);
+        }
     }
     
     return NULL;
 }
 
-static size_t count_valid_entries(tcp_pool_t* pool) {
-    size_t count = 0;
-    pool_entry_t* entry = pool->entries;
+/* Thread wrapper for callback */
+static void* lambda_wrapper(void* arg) {
+    typedef struct {
+        tcp_connection_t* conn;
+        tcp_connection_callback_t callback;
+        void* userdata;
+    } handler_args_t;
     
-    while (entry) {
-        /* Use atomic load for thread safety */
-        if (atomic_load(&entry->valid) && entry->conn != NULL) {
-            count++;
-        }
-        entry = entry->next;
-    }
+    handler_args_t* args = (handler_args_t*)arg;
     
-    return count;
+    args->callback(args->conn, args->userdata);
+    
+    free(args);
+    return NULL;
 }
 
-static void cleanup_invalid_entries(tcp_pool_t* pool) {
-    pool_entry_t** current = &pool->entries;
-    
-    while (*current) {
-        pool_entry_t* entry = *current;
-        
-        /* CRITICAL: Use atomic loads */
-        if (!atomic_load(&entry->valid) && !atomic_load(&entry->in_use)) {
-            *current = entry->next;
-            
-            /* Connection should already be NULL if properly marked invalid */
-            if (entry->conn) {
-                /* Defensive: This shouldn't happen, but handle it anyway */
-                entry->conn = NULL;
-            }
-            
-            free(entry);
-            pool->current_size--;
-        } else {
-            current = &entry->next;
-        }
-    }
-}
-
-/* ============================================================================
- * TCP POOL IMPLEMENTATION
- * ========================================================================= */
-
-distric_err_t tcp_pool_create(
-    size_t max_connections,
+distric_err_t tcp_server_create(
+    const char* bind_addr,
+    uint16_t port,
     metrics_registry_t* metrics,
     logger_t* logger,
-    tcp_pool_t** pool
+    tcp_server_t** server_out
 ) {
-    if (!pool || max_connections == 0) {
+    if (!bind_addr || !server_out) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    tcp_pool_t* p = calloc(1, sizeof(tcp_pool_t));
-    if (!p) {
-        return DISTRIC_ERR_ALLOC_FAILURE;
+    tcp_server_t* server = calloc(1, sizeof(tcp_server_t));
+    if (!server) {
+        return DISTRIC_ERR_NO_MEMORY;
     }
     
-    p->max_connections = max_connections;
-    p->current_size = 0;
-    p->entries = NULL;
-    p->metrics = metrics;
-    p->logger = logger;
+    strncpy(server->bind_addr, bind_addr, sizeof(server->bind_addr) - 1);
+    server->port = port;
+    server->metrics = metrics;
+    server->logger = logger;
+    atomic_init(&server->running, false);
+    atomic_init(&server->connection_id_counter, 1);
     
-    atomic_init(&p->hits, 0);
-    atomic_init(&p->misses, 0);
-    atomic_init(&p->shutting_down, false);
+    /* Create listening socket */
+    server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server->listen_fd < 0) {
+        if (logger) {
+            LOG_ERROR(logger, "tcp_server", "Failed to create socket", 
+                     "errno", strerror(errno), NULL);
+        }
+        free(server);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
     
-    pthread_mutex_init(&p->lock, NULL);
+    set_nonblocking(server->listen_fd);
+    set_reuseaddr(server->listen_fd);
     
+    /* Bind */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, bind_addr, &addr.sin_addr);
+    
+    if (bind(server->listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        if (logger) {
+            LOG_ERROR(logger, "tcp_server", "Bind failed", 
+                     "bind_addr", bind_addr, "errno", strerror(errno), NULL);
+        }
+        close(server->listen_fd);
+        free(server);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Listen */
+    if (listen(server->listen_fd, 128) < 0) {
+        if (logger) {
+            LOG_ERROR(logger, "tcp_server", "Listen failed", 
+                     "errno", strerror(errno), NULL);
+        }
+        close(server->listen_fd);
+        free(server);
+        return DISTRIC_ERR_INIT_FAILED;
+    }
+    
+    /* Register metrics */
     if (metrics) {
-        metrics_register_gauge(metrics, "tcp_pool_size",
-                              "TCP connection pool size", NULL, 0, &p->pool_size_metric);
-        metrics_register_counter(metrics, "tcp_pool_hits_total",
-                                "TCP pool cache hits", NULL, 0, &p->pool_hits_metric);
-        metrics_register_counter(metrics, "tcp_pool_misses_total",
-                                "TCP pool cache misses", NULL, 0, &p->pool_misses_metric);
+        metrics_register_counter(metrics, "tcp_server_connections_total",
+                                "Total TCP server connections", NULL, 0,
+                                &server->connections_total_metric);
+        metrics_register_gauge(metrics, "tcp_server_active_connections",
+                              "Active TCP server connections", NULL, 0,
+                              &server->active_connections_metric);
+        metrics_register_counter(metrics, "tcp_server_errors_total",
+                                "Total TCP server errors", NULL, 0,
+                                &server->errors_metric);
     }
     
     if (logger) {
-        char max_str[32];
-        snprintf(max_str, sizeof(max_str), "%zu", max_connections);
-        
-        LOG_INFO(logger, "tcp_pool", "Connection pool created",
-                "max_connections", max_str, NULL);
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%u", port);
+        LOG_INFO(logger, "tcp_server", "Server created", 
+                "bind_addr", bind_addr, "port", port_str, NULL);
     }
     
-    *pool = p;
+    *server_out = server;
     return DISTRIC_OK;
 }
 
-distric_err_t tcp_pool_acquire(
-    tcp_pool_t* pool,
-    const char* host,
-    uint16_t port,
-    tcp_connection_t** conn
+distric_err_t tcp_server_start(
+    tcp_server_t* server,
+    tcp_connection_callback_t callback,
+    void* userdata
 ) {
-    if (!pool || !host || !conn) {
+    if (!server || !callback) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    if (atomic_load(&pool->shutting_down)) {
-        return DISTRIC_ERR_INIT_FAILED;
-    }
+    server->callback = callback;
+    server->userdata = userdata;
     
-    pthread_mutex_lock(&pool->lock);
+    atomic_store(&server->running, true);
     
-    if (atomic_load(&pool->shutting_down)) {
-        pthread_mutex_unlock(&pool->lock);
-        return DISTRIC_ERR_INIT_FAILED;
-    }
-    
-    cleanup_invalid_entries(pool);
-    
-    pool_entry_t* entry = find_entry(pool, host, port);
-    if (entry && atomic_load(&entry->valid) && entry->conn) {
-        atomic_store(&entry->in_use, true);
-        entry->last_used = get_timestamp_ms();
-        *conn = entry->conn;
-        
-        atomic_fetch_add(&pool->hits, 1);
-        if (pool->pool_hits_metric) {
-            metrics_counter_inc(pool->pool_hits_metric);
+    /* Start accept thread */
+    if (pthread_create(&server->accept_thread, NULL, accept_thread_func, server) != 0) {
+        if (server->logger) {
+            LOG_ERROR(server->logger, "tcp_server", "Failed to create accept thread", NULL);
         }
-        
-        if (pool->logger) {
-            char port_str[16];
-            snprintf(port_str, sizeof(port_str), "%u", port);
-            
-            LOG_DEBUG(pool->logger, "tcp_pool", "Connection reused",
-                     "host", host,
-                     "port", port_str, NULL);
-        }
-        
-        pthread_mutex_unlock(&pool->lock);
-        return DISTRIC_OK;
-    }
-    
-    atomic_fetch_add(&pool->misses, 1);
-    if (pool->pool_misses_metric) {
-        metrics_counter_inc(pool->pool_misses_metric);
-    }
-    
-    pthread_mutex_unlock(&pool->lock);
-
-    tcp_connection_t* new_conn;
-    distric_err_t err = tcp_connect(host, port, 5000, pool->metrics, pool->logger, &new_conn);
-    if (err != DISTRIC_OK) {
-        return err;
-    }
-    
-    if (!new_conn) {
+        atomic_store(&server->running, false);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
-    pthread_mutex_lock(&pool->lock);
-    
-    if (atomic_load(&pool->shutting_down)) {
-        pthread_mutex_unlock(&pool->lock);
-        tcp_close(new_conn);
-        return DISTRIC_ERR_INIT_FAILED;
+    if (server->logger) {
+        LOG_INFO(server->logger, "tcp_server", "Server started", NULL);
     }
-    
-    pool_entry_t* new_entry = calloc(1, sizeof(pool_entry_t));
-    if (!new_entry) {
-        pthread_mutex_unlock(&pool->lock);
-        tcp_close(new_conn);
-        return DISTRIC_ERR_ALLOC_FAILURE;
-    }
-    
-    new_entry->conn = new_conn;
-    strncpy(new_entry->host, host, sizeof(new_entry->host) - 1);
-    new_entry->host[sizeof(new_entry->host) - 1] = '\0';
-    new_entry->port = port;
-    new_entry->last_used = get_timestamp_ms();
-    atomic_init(&new_entry->in_use, true);   /* CHANGED: atomic init */
-    atomic_init(&new_entry->valid, true);    /* CHANGED: atomic init */
-    new_entry->next = pool->entries;
-    
-    pool->entries = new_entry;
-    pool->current_size++;
-
-    if (pool->pool_size_metric) {
-        metrics_gauge_set(pool->pool_size_metric, pool->current_size);
-    }
-    
-    if (pool->logger) {
-        char port_str[16];
-        snprintf(port_str, sizeof(port_str), "%u", port);
-        char size_str[32];
-        snprintf(size_str, sizeof(size_str), "%zu", pool->current_size);
-        
-        LOG_DEBUG(pool->logger, "tcp_pool", "New connection created",
-                 "host", host,
-                 "port", port_str,
-                 "pool_size", size_str, NULL);
-    }
-    
-    *conn = new_conn;
-    pthread_mutex_unlock(&pool->lock);
     
     return DISTRIC_OK;
 }
 
-void tcp_pool_release(tcp_pool_t* pool, tcp_connection_t* conn) {
-    if (!pool || !conn) return;
+void tcp_server_stop(tcp_server_t* server) {
+    if (!server) return;
     
-    pthread_mutex_lock(&pool->lock);
-
-    pool_entry_t* entry = pool->entries;
-    pool_entry_t* found = NULL;
+    atomic_store(&server->running, false);
     
-    while (entry) {
-        /* CRITICAL: Safely check if this is our connection AND it's valid */
-        if (entry->conn == conn && atomic_load(&entry->valid)) {
-            found = entry;
-            break;
-        }
-        entry = entry->next;
+    /* Wait for accept thread */
+    pthread_join(server->accept_thread, NULL);
+    
+    if (server->logger) {
+        LOG_INFO(server->logger, "tcp_server", "Server stopped", NULL);
     }
-    
-    if (found) {
-        atomic_store(&found->in_use, false);
-        found->last_used = get_timestamp_ms();
-        
-        /* If shutting down, close the valid connection */
-        if (atomic_load(&pool->shutting_down)) {
-            tcp_close(conn);
-            found->conn = NULL;
-            atomic_store(&found->valid, false);
-            cleanup_invalid_entries(pool);
-            
-            if (pool->pool_size_metric) {
-                metrics_gauge_set(pool->pool_size_metric, pool->current_size);
-            }
-            
-            pthread_mutex_unlock(&pool->lock);
-            return;
-        }
-        
-        /* Enforce max_connections limit */
-        size_t valid_count = count_valid_entries(pool);
-        
-        if (valid_count > pool->max_connections) {
-            /* Pool over capacity - close this connection */
-            tcp_close(conn);
-            found->conn = NULL;
-            atomic_store(&found->valid, false);
-            
-            cleanup_invalid_entries(pool);
-            
-            if (pool->pool_size_metric) {
-                metrics_gauge_set(pool->pool_size_metric, pool->current_size);
-            }
-        }
-        
-        pthread_mutex_unlock(&pool->lock);
-        return;
-    }
-    
-    /* Connection not in pool OR was already marked invalid */
-    pthread_mutex_unlock(&pool->lock);
-    
-    if (pool->logger) {
-        LOG_DEBUG(pool->logger, "tcp_pool", 
-                "Released connection not found in pool or already invalid", NULL);
-    }
-    
-    /* DO NOT close the connection here - it might already be closed */
 }
 
-void tcp_pool_mark_failed(tcp_pool_t* pool, tcp_connection_t* conn) {
-    if (!pool || !conn) return;
+void tcp_server_destroy(tcp_server_t* server) {
+    if (!server) return;
     
-    pthread_mutex_lock(&pool->lock);
-    
-    pool_entry_t* entry = pool->entries;
-    while (entry) {
-        if (entry->conn == conn) {
-            /* CRITICAL: Mark invalid AND NULL the pointer atomically */
-            atomic_store(&entry->valid, false);
-            entry->conn = NULL;  /* Prevent use-after-free */
-            break;
-        }
-        entry = entry->next;
+    if (atomic_load(&server->running)) {
+        tcp_server_stop(server);
     }
     
-    pthread_mutex_unlock(&pool->lock);
+    close(server->listen_fd);
+    free(server);
 }
 
-void tcp_pool_get_stats(
-    tcp_pool_t* pool,
-    size_t* size_out,
-    uint64_t* hits_out,
-    uint64_t* misses_out
-) {
-    if (!pool) return;
-    
-    pthread_mutex_lock(&pool->lock);
-    
-    size_t valid_count = count_valid_entries(pool);
-    
-    if (size_out) *size_out = valid_count;
-    if (hits_out) *hits_out = atomic_load(&pool->hits);
-    if (misses_out) *misses_out = atomic_load(&pool->misses);
-    
-    pthread_mutex_unlock(&pool->lock);
-}
-
-void tcp_pool_destroy(tcp_pool_t* pool) {
-    if (!pool) return;
-    
-    /* CRITICAL: Set shutdown flag FIRST */
-    atomic_store(&pool->shutting_down, true);
-    
-    /* CRITICAL: Wait longer for in-flight operations */
-    usleep(50000); /* 50ms - increased from 10ms */
-    
-    pthread_mutex_lock(&pool->lock);
-
-    pool_entry_t* entry = pool->entries;
-    while (entry) {
-        pool_entry_t* next = entry->next;
-        
-        /* CRITICAL: Wait for entry to be released if in use */
-        int retry_count = 0;
-        while (atomic_load(&entry->in_use) && retry_count < 100) {
-            pthread_mutex_unlock(&pool->lock);
-            usleep(1000); /* 1ms */
-            pthread_mutex_lock(&pool->lock);
-            retry_count++;
-        }
-        
-        /* CRITICAL: Only close if valid AND not NULL AND not in use */
-        if (atomic_load(&entry->valid) && 
-            entry->conn != NULL && 
-            !atomic_load(&entry->in_use)) {
-            tcp_close(entry->conn);
-        }
-        /* If still in use or invalid, connection was already closed or leaked */
-        
-        free(entry);
-        entry = next;
-    }
-    
-    pool->entries = NULL;
-    pool->current_size = 0;
-    
-    if (pool->logger) {
-        LOG_INFO(pool->logger, "tcp_pool", "Connection pool destroyed", NULL);
-    }
-    
-    pthread_mutex_unlock(&pool->lock);
-    pthread_mutex_destroy(&pool->lock);
-    
-    free(pool);
+uint16_t tcp_server_get_port(const tcp_server_t* server) {
+    return server ? server->port : 0;
 }
