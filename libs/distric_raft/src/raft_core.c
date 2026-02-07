@@ -24,6 +24,7 @@
 #include "distric_raft/raft_persistence.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <time.h>
 #include <sys/time.h>
@@ -1339,7 +1340,8 @@ distric_err_t raft_handle_append_entries_response(
     if (peer_term > node->current_term) {
         pthread_rwlock_unlock(&node->lock);
         
-        char our_term_str[16], peer_term_str[16];
+        char our_term_str[32];
+        char peer_term_str[32];
         snprintf(our_term_str, sizeof(our_term_str), "%u", node->current_term);
         snprintf(peer_term_str, sizeof(peer_term_str), "%u", peer_term);
         LOG_INFO(node->config.logger, "raft", "Stepping down due to higher term in AppendEntries response",
@@ -1360,7 +1362,8 @@ distric_err_t raft_handle_append_entries_response(
         node->next_index[peer_index] = match_index + 1;
         node->match_index[peer_index] = match_index;
         
-        char peer_str[16], match_str[16];
+        char peer_str[32];
+        char match_str[32];
         snprintf(peer_str, sizeof(peer_str), "%zu", peer_index);
         snprintf(match_str, sizeof(match_str), "%u", match_index);
         
@@ -1373,7 +1376,8 @@ distric_err_t raft_handle_append_entries_response(
             node->next_index[peer_index]--;
         }
         
-        char peer_str[16], next_str[16];
+        char peer_str[32];
+        char next_str[32];
         snprintf(peer_str, sizeof(peer_str), "%zu", peer_index);
         snprintf(next_str, sizeof(next_str), "%u", node->next_index[peer_index]);
         
@@ -1483,7 +1487,10 @@ distric_err_t raft_handle_log_conflict(
     
     node->next_index[peer_index] = new_next_index;
     
-    char peer_str[16], conflict_idx_str[16], conflict_term_str[16], next_str[16];
+    char peer_str[32];
+    char conflict_idx_str[32];
+    char conflict_term_str[32];
+    char next_str[32];
     snprintf(peer_str, sizeof(peer_str), "%zu", peer_index);
     snprintf(conflict_idx_str, sizeof(conflict_idx_str), "%u", conflict_index);
     snprintf(conflict_term_str, sizeof(conflict_term_str), "%u", conflict_term);
