@@ -318,6 +318,14 @@ static void transition_to_candidate(raft_node_t* node) {
     node->state = RAFT_STATE_CANDIDATE;
     strncpy(node->voted_for, node->config.node_id, sizeof(node->voted_for) - 1);
     memset(node->current_leader, 0, sizeof(node->current_leader));
+
+    int votes_needed = (node->config.peer_count + 1) / 2 + 1;
+    char votes_str[32];
+    snprintf(votes_str, sizeof(votes_str), "1/%d", votes_needed);
+    LOG_INFO(node->config.logger, "raft", "Voted for self",
+            "votes", votes_str,
+            "term", &(int){node->current_term}, NULL);
+            
     node->last_election_ms = get_time_ms();
     node->election_timeout_ms = random_election_timeout(
         node->config.election_timeout_min_ms,
@@ -803,6 +811,15 @@ distric_err_t raft_tick(raft_node_t* node) {
             pthread_rwlock_unlock(&node->lock);
             
             if (elapsed > timeout) {
+                char elapsed_str[32], timeout_str[32];
+                snprintf(elapsed_str, sizeof(elapsed_str), "%llu", 
+                        (unsigned long long)elapsed);
+                snprintf(timeout_str, sizeof(timeout_str), "%llu",
+                        (unsigned long long)timeout);
+                LOG_INFO(node->config.logger, "raft", "Election timeout triggered",
+                        "elapsed_ms", elapsed_str,
+                        "timeout_ms", timeout_str, NULL);
+
                 start_election(node);
             }
             
@@ -882,6 +899,10 @@ distric_err_t raft_handle_request_vote(
         strncpy(node->voted_for, candidate_id, sizeof(node->voted_for) - 1);
         node->last_heartbeat_ms = get_time_ms();  /* Reset election timer */
         
+        LOG_DEBUG(node->config.logger, "raft", "Reset election timeout",
+             "reason", "VoteGranted",
+             "candidate", candidate_id, NULL);
+
         /* Persist state BEFORE responding (Session 3.4) */
         persist_state(node);
         
@@ -936,6 +957,10 @@ distric_err_t raft_handle_append_entries(
     /* Valid leader - reset election timer */
     node->last_heartbeat_ms = get_time_ms();
     strncpy(node->current_leader, leader_id, sizeof(node->current_leader) - 1);
+
+    LOG_DEBUG(node->config.logger, "raft", "Reset election timeout",
+         "reason", "AppendEntries",
+         "leader", leader_id, NULL);
     
     /* If we were candidate, become follower */
     if (node->state == RAFT_STATE_CANDIDATE) {

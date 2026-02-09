@@ -82,6 +82,12 @@ static int handle_request_vote_rpc(
         metrics_counter_inc(context->rpc_errors_metric);
         return -1;
     }
+
+    char req_term_str[16];
+    snprintf(req_term_str, sizeof(req_term_str), "%u", request_vote.term);
+    LOG_DEBUG(context->config.logger, "raft_rpc", "Received RequestVote",
+            "from", request_vote.candidate_id,
+            "term", req_term_str, NULL);
     
     /* Update metrics */
     metrics_counter_inc(context->request_vote_received_metric);
@@ -99,6 +105,13 @@ static int handle_request_vote_rpc(
         &vote_granted,
         &term
     );
+
+    char resp_term_str[16];
+    snprintf(resp_term_str, sizeof(resp_term_str), "%u", term);
+    LOG_INFO(context->config.logger, "raft_rpc", 
+            vote_granted ? "RequestVote → GRANT" : "RequestVote → REJECT",
+            "from", request_vote.candidate_id,
+            "term", resp_term_str, NULL);
     
     if (err != DISTRIC_OK) {
         LOG_ERROR(context->config.logger, "raft_rpc", "raft_handle_request_vote failed");
@@ -512,6 +525,15 @@ distric_err_t raft_rpc_send_request_vote(
     uint32_t retries = 0;
     
     while (retries <= context->config.max_retries) {
+
+        char term_str[16];
+        snprintf(term_str, sizeof(term_str), "%u", term);
+        LOG_DEBUG(context->config.logger, "raft_rpc", "Sending RequestVote",
+                "to", peer_address,
+                "term", term_str,
+                "last_log_index", &(int){last_log_index},
+                "last_log_term", &(int){last_log_term}, NULL);
+                
         err = rpc_call(
             context->rpc_client,
             peer_address,
