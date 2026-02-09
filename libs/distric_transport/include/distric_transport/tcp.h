@@ -89,7 +89,7 @@ distric_err_t tcp_server_start(
  * 
  * @param server The server instance
  */
-void tcp_server_stop(tcp_server_t* server);
+distric_err_t tcp_server_stop(tcp_server_t* server);
 
 /**
  * @brief Destroy the TCP server and free all resources

@@ -109,6 +109,9 @@ static void* tick_thread_func(void* arg) {
             uint32_t votes = 0;
             raft_rpc_broadcast_request_vote(ctx->rpc, ctx->node, &votes);
             last_broadcast_term = current_term;
+            
+            /* ✅ FIX: Process election result */
+            raft_process_election_result(ctx->node, votes);
         }
         
         /* Send heartbeats as leader */

@@ -590,17 +590,39 @@ distric_err_t tcp_server_start(
     return DISTRIC_OK;
 }
 
-void tcp_server_stop(tcp_server_t* server) {
-    if (!server) return;
+distric_err_t tcp_server_stop(tcp_server_t* server) {
+    if (!server) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    if (!atomic_load(&server->running)) {
+        return DISTRIC_OK;  /* Already stopped */
+    }
+    
+    if (server->logger) {
+        LOG_INFO(server->logger, "tcp_server", "Stopping TCP server");
+    }
     
     atomic_store(&server->running, false);
     
-    /* Wait for accept thread */
+    /* Close listening socket to stop accepting new connections */
+    if (server->listen_fd >= 0) {
+        shutdown(server->listen_fd, SHUT_RDWR);
+    }
+    
+    /* Wait for accept thread to exit */
     pthread_join(server->accept_thread, NULL);
     
-    if (server->logger) {
-        LOG_INFO(server->logger, "tcp_server", "Server stopped", NULL);
+    /* Give connection handler threads time to complete (max 2 seconds) */
+    for (int i = 0; i < 20; i++) {
+        usleep(100000);  /* 100ms */
     }
+    
+    if (server->logger) {
+        LOG_INFO(server->logger, "tcp_server", "TCP server stopped");
+    }
+    
+    return DISTRIC_OK;
 }
 
 void tcp_server_destroy(tcp_server_t* server) {

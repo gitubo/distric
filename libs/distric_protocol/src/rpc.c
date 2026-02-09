@@ -1,9 +1,8 @@
 /**
  * @file rpc.c
- * @brief RPC Framework Implementation
+ * @brief RPC Framework Implementation with Graceful Shutdown
  */
 
-/* Define feature test macros BEFORE any includes */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200112L
 #endif
@@ -13,253 +12,234 @@
 #endif
 
 #include "distric_protocol/rpc.h"
-#include "distric_protocol/crc32.h"
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include <sys/time.h>
 #include <unistd.h>
-#include <errno.h>
-#include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
 #include <stdio.h>
 
 /* ============================================================================
- * CONSTANTS
+ * RPC SERVER
  * ========================================================================= */
 
 #define MAX_HANDLERS 64
-#define MAX_PENDING_REQUESTS 1024
-#define DEFAULT_RETRY_BACKOFF_MS 100
 
-/* ============================================================================
- * INTERNAL STRUCTURES
- * ========================================================================= */
-
-/** Handler registration */
 typedef struct {
-    message_type_t msg_type;
-    rpc_handler_t handler;
+    uint16_t msg_type;
+    rpc_handler_fn_t handler;
     void* userdata;
 } handler_entry_t;
 
-/** RPC Server */
 struct rpc_server {
     tcp_server_t* tcp_server;
-    metrics_registry_t* metrics;
-    logger_t* logger;
-    tracer_t* tracer;
     
     handler_entry_t handlers[MAX_HANDLERS];
     size_t handler_count;
     pthread_rwlock_t handlers_lock;
     
-    _Atomic bool running;
-    _Atomic int64_t active_requests;
+    /* Graceful shutdown tracking */
+    pthread_mutex_t active_handlers_lock;
+    pthread_cond_t all_handlers_done;
+    size_t active_handlers_count;
+    volatile bool accepting_requests;
     
-    /* Metrics */
-    metric_t* requests_total;
-    metric_t* request_duration;
-    metric_t* errors_total;
-    metric_t* active_requests_metric;
-};
-
-/** RPC Client */
-struct rpc_client {
-    tcp_pool_t* tcp_pool;
     metrics_registry_t* metrics;
     logger_t* logger;
     tracer_t* tracer;
     
-    _Atomic uint64_t request_id_counter;
-    
-    /* Metrics */
-    metric_t* calls_total;
-    metric_t* call_duration;
+    metric_t* requests_total;
     metric_t* errors_total;
-    metric_t* retries_total;
+    metric_t* latency_metric;
+};
+
+struct rpc_client {
+    tcp_pool_t* tcp_pool;
+    
+    metrics_registry_t* metrics;
+    logger_t* logger;
+    tracer_t* tracer;
+    
+    metric_t* calls_total;
+    metric_t* errors_total;
+    metric_t* latency_metric;
 };
 
 /* ============================================================================
- * UTILITY FUNCTIONS
+ * RPC CONNECTION HANDLER
  * ========================================================================= */
 
-static uint64_t get_timestamp_us(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+static uint64_t get_time_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
-/* ============================================================================
- * RPC SERVER IMPLEMENTATION
- * ========================================================================= */
-
-/** Connection handler for RPC server */
 static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata) {
     rpc_server_t* server = (rpc_server_t*)userdata;
     
-    while (atomic_load(&server->running)) {
-        /* Read message header */
-        uint8_t header_buf[MESSAGE_HEADER_SIZE];
-        int received = tcp_recv(conn, header_buf, MESSAGE_HEADER_SIZE, 1000);
-        
-        if (received == 0) {
-            /* Connection closed */
-            break;
+    /* Track active handler */
+    pthread_mutex_lock(&server->active_handlers_lock);
+    server->active_handlers_count++;
+    pthread_mutex_unlock(&server->active_handlers_lock);
+    
+    /* Check if server is shutting down */
+    if (!server->accepting_requests) {
+        LOG_DEBUG(server->logger, "rpc_server", "Rejecting connection - server shutting down");
+        goto cleanup_and_exit;
+    }
+    
+    uint64_t start_time = get_time_us();
+    trace_span_t* span = NULL;
+    
+    /* Start trace span if tracer available */
+    if (server->tracer) {
+        trace_start_span(server->tracer, "rpc_server_handle_request", &span);
+    }
+    
+    /* Receive header */
+    message_header_t header;
+    uint8_t header_buf[MESSAGE_HEADER_SIZE];
+    
+    ssize_t received = tcp_recv(conn, header_buf, MESSAGE_HEADER_SIZE);
+    if (received != MESSAGE_HEADER_SIZE) {
+        LOG_ERROR(server->logger, "rpc_server", "Failed to receive header");
+        if (server->errors_total) metrics_counter_inc(server->errors_total);
+        goto cleanup_and_exit;
+    }
+    
+    /* Deserialize header */
+    deserialize_header(header_buf, &header);
+    
+    /* Validate header */
+    if (!validate_message_header(&header)) {
+        LOG_ERROR(server->logger, "rpc_server", "Invalid message header");
+        if (server->errors_total) metrics_counter_inc(server->errors_total);
+        goto cleanup_and_exit;
+    }
+    
+    /* Receive payload */
+    uint8_t* payload = NULL;
+    if (header.payload_len > 0) {
+        payload = (uint8_t*)malloc(header.payload_len);
+        if (!payload) {
+            LOG_ERROR(server->logger, "rpc_server", "Failed to allocate payload buffer");
+            if (server->errors_total) metrics_counter_inc(server->errors_total);
+            goto cleanup_and_exit;
         }
         
-        if (received < 0) {
-            if (errno == ETIMEDOUT || errno == EAGAIN) {
-                continue;  /* Timeout, try again */
-            }
-            LOG_ERROR(server->logger, "rpc_server", "Failed to receive header",
-                     "error", strerror(errno));
-            break;
-        }
-        
-        if (received != MESSAGE_HEADER_SIZE) {
-            LOG_ERROR(server->logger, "rpc_server", "Partial header received",
-                     "received", (char*)&received);
-            break;
-        }
-        
-        /* Deserialize header */
-        message_header_t header;
-        if (deserialize_header(header_buf, &header) != DISTRIC_OK) {
-            LOG_ERROR(server->logger, "rpc_server", "Failed to deserialize header");
-            break;
-        }
-        
-        /* Validate header */
-        if (!validate_message_header(&header)) {
-            LOG_ERROR(server->logger, "rpc_server", "Invalid message header",
-                     "magic", (char*)&header.magic);
-            break;
-        }
-        
-        /* Read payload */
-        uint8_t* payload = NULL;
-        if (header.payload_len > 0) {
-            payload = (uint8_t*)malloc(header.payload_len);
-            if (!payload) {
-                LOG_ERROR(server->logger, "rpc_server", "Failed to allocate payload buffer");
-                break;
-            }
-            
-            received = tcp_recv(conn, payload, header.payload_len, 5000);
-            if (received != (int)header.payload_len) {
-                LOG_ERROR(server->logger, "rpc_server", "Failed to receive payload");
-                free(payload);
-                break;
-            }
-        }
-        
-        /* Verify CRC32 */
-        if (!verify_message_crc32(&header, payload, header.payload_len)) {
-            LOG_ERROR(server->logger, "rpc_server", "CRC32 verification failed");
+        received = tcp_recv(conn, payload, header.payload_len);
+        if (received != (ssize_t)header.payload_len) {
+            LOG_ERROR(server->logger, "rpc_server", "Failed to receive payload");
+            if (server->errors_total) metrics_counter_inc(server->errors_total);
             free(payload);
-            metrics_counter_inc(server->errors_total);
+            goto cleanup_and_exit;
+        }
+    }
+    
+    /* Verify CRC32 */
+    if (!verify_message_crc32(&header, payload, header.payload_len)) {
+        LOG_ERROR(server->logger, "rpc_server", "CRC32 verification failed");
+        if (server->errors_total) metrics_counter_inc(server->errors_total);
+        free(payload);
+        goto cleanup_and_exit;
+    }
+    
+    /* Find handler */
+    pthread_rwlock_rdlock(&server->handlers_lock);
+    
+    handler_entry_t* handler_entry = NULL;
+    for (size_t i = 0; i < server->handler_count; i++) {
+        if (server->handlers[i].msg_type == header.msg_type) {
+            handler_entry = &server->handlers[i];
             break;
         }
-        
-        /* Find handler */
-        pthread_rwlock_rdlock(&server->handlers_lock);
-        
-        handler_entry_t* handler_entry = NULL;
-        for (size_t i = 0; i < server->handler_count; i++) {
-            if (server->handlers[i].msg_type == header.msg_type) {
-                handler_entry = &server->handlers[i];
-                break;
-            }
-        }
-        
-        if (!handler_entry) {
-            pthread_rwlock_unlock(&server->handlers_lock);
-            LOG_WARN(server->logger, "rpc_server", "No handler registered",
-                    "msg_type", message_type_to_string(header.msg_type));
-            free(payload);
-            metrics_counter_inc(server->errors_total);
-            continue;
-        }
-        
-        /* Start trace span if tracer available */
-        trace_span_t* span = NULL;
-        if (server->tracer) {
-            trace_start_span(server->tracer, "rpc_handle_request", &span);
-            trace_add_tag(span, "msg_type", message_type_to_string(header.msg_type));
-        }
-        
-        /* Increment active requests */
-        atomic_fetch_add(&server->active_requests, 1);
-        metrics_gauge_set(server->active_requests_metric, 
-                         (double)atomic_load(&server->active_requests));
-        
-        uint64_t start_time = get_timestamp_us();
-        
-        /* Execute handler */
-        uint8_t* response = NULL;
-        size_t resp_len = 0;
-        
-        int result = handler_entry->handler(
-            payload,
-            header.payload_len,
-            &response,
-            &resp_len,
-            handler_entry->userdata,
-            span
-        );
-        
+    }
+    
+    if (!handler_entry) {
         pthread_rwlock_unlock(&server->handlers_lock);
         
-        /* Calculate duration */
-        uint64_t duration_us = get_timestamp_us() - start_time;
-        metrics_histogram_observe(server->request_duration, duration_us / 1000000.0);
-        metrics_counter_inc(server->requests_total);
-        
-        /* Decrement active requests */
-        atomic_fetch_sub(&server->active_requests, 1);
-        metrics_gauge_set(server->active_requests_metric,
-                         (double)atomic_load(&server->active_requests));
-        
-        /* Build response header */
+        /* Only log if server is still accepting requests */
+        if (server->accepting_requests) {
+            LOG_WARN(server->logger, "rpc_server", "No handler registered",
+                    "msg_type", message_type_to_string(header.msg_type));
+        }
+        if (server->errors_total) metrics_counter_inc(server->errors_total);
+        free(payload);
+        goto cleanup_and_exit;
+    }
+    
+    /* Call handler */
+    uint8_t* response = NULL;
+    size_t resp_len = 0;
+    
+    int result = handler_entry->handler(payload, header.payload_len, 
+                                       &response, &resp_len,
+                                       handler_entry->userdata, span);
+    
+    pthread_rwlock_unlock(&server->handlers_lock);
+    
+    free(payload);
+    
+    /* Send response */
+    if (result == 0 && response) {
+        /* Create response header */
         message_header_t resp_header;
         message_header_init(&resp_header, header.msg_type, resp_len);
-        resp_header.flags = MSG_FLAG_RESPONSE;
-        resp_header.message_id = header.message_id;  /* Echo request ID */
+        resp_header.flags = MESSAGE_FLAG_RESPONSE;
+        resp_header.message_id = header.message_id;
         
-        /* Compute CRC */
+        /* Compute CRC32 */
         compute_header_crc32(&resp_header, response, resp_len);
         
         /* Serialize response header */
         uint8_t resp_header_buf[MESSAGE_HEADER_SIZE];
         serialize_header(&resp_header, resp_header_buf);
         
-        /* Send response */
+        /* Send header + payload */
         tcp_send(conn, resp_header_buf, MESSAGE_HEADER_SIZE);
-        if (response && resp_len > 0) {
+        if (resp_len > 0) {
             tcp_send(conn, response, resp_len);
         }
         
-        /* Cleanup */
-        free(payload);
         free(response);
-        
-        /* Finish trace span */
-        if (span) {
-            if (result == 0) {
-                trace_set_status(span, SPAN_STATUS_OK);
-            } else {
-                trace_set_status(span, SPAN_STATUS_ERROR);
-            }
-            trace_finish_span(server->tracer, span);
-        }
-        
-        LOG_DEBUG(server->logger, "rpc_server", "Request handled",
-                 "msg_type", message_type_to_string(header.msg_type),
-                 "duration_ms", (char*)&duration_us);
     }
     
-    tcp_close(conn);
+    /* Record metrics */
+    if (server->requests_total) {
+        metrics_counter_inc(server->requests_total);
+    }
+    
+    uint64_t duration_us = get_time_us() - start_time;
+    if (server->latency_metric) {
+        metrics_histogram_observe(server->latency_metric, (double)duration_us / 1000.0);
+    }
+    
+    char duration_str[32];
+    snprintf(duration_str, sizeof(duration_str), "%llu", (unsigned long long)(duration_us / 1000));
+    LOG_DEBUG(server->logger, "rpc_server", "Request handled",
+             "msg_type", message_type_to_string(header.msg_type),
+             "duration_ms", duration_str);
+    
+    /* Finish trace span */
+    if (span) {
+        trace_set_status(span, SPAN_STATUS_OK);
+        trace_finish_span(server->tracer, span);
+    }
+
+cleanup_and_exit:
+    /* Decrement active handler count and signal if last one */
+    pthread_mutex_lock(&server->active_handlers_lock);
+    server->active_handlers_count--;
+    if (server->active_handlers_count == 0) {
+        pthread_cond_signal(&server->all_handlers_done);
+    }
+    pthread_mutex_unlock(&server->active_handlers_lock);
 }
+
+/* ============================================================================
+ * RPC SERVER LIFECYCLE
+ * ========================================================================= */
 
 distric_err_t rpc_server_create(
     tcp_server_t* tcp_server,
@@ -268,7 +248,7 @@ distric_err_t rpc_server_create(
     tracer_t* tracer,
     rpc_server_t** server_out
 ) {
-    if (!tcp_server || !metrics || !logger || !server_out) {
+    if (!tcp_server || !server_out) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
@@ -282,32 +262,105 @@ distric_err_t rpc_server_create(
     server->logger = logger;
     server->tracer = tracer;
     server->handler_count = 0;
-    atomic_store(&server->running, false);
-    atomic_store(&server->active_requests, 0);
+    server->active_handlers_count = 0;
+    server->accepting_requests = true;
     
     pthread_rwlock_init(&server->handlers_lock, NULL);
+    pthread_mutex_init(&server->active_handlers_lock, NULL);
+    pthread_cond_init(&server->all_handlers_done, NULL);
     
     /* Register metrics */
-    metrics_register_counter(metrics, "rpc_server_requests_total",
-                            "Total RPC requests", NULL, 0, &server->requests_total);
-    
-    metrics_register_histogram(metrics, "rpc_server_request_duration_seconds",
-                              "RPC request duration", NULL, 0, &server->request_duration);
-    
-    metrics_register_counter(metrics, "rpc_server_errors_total",
-                            "Total RPC errors", NULL, 0, &server->errors_total);
-    
-    metrics_register_gauge(metrics, "rpc_server_active_requests",
-                          "Active RPC requests", NULL, 0, &server->active_requests_metric);
+    if (metrics) {
+        metrics_register_counter(metrics, "rpc_server_requests_total",
+                                 "Total RPC requests handled", NULL, 0,
+                                 &server->requests_total);
+        metrics_register_counter(metrics, "rpc_server_errors_total",
+                                 "Total RPC errors", NULL, 0,
+                                 &server->errors_total);
+        metrics_register_histogram(metrics, "rpc_server_latency_ms",
+                                   "RPC request latency", NULL, 0,
+                                   &server->latency_metric);
+    }
     
     *server_out = server;
+    
+    return DISTRIC_OK;
+}
+
+void rpc_server_destroy(rpc_server_t* server) {
+    if (!server) return;
+    
+    pthread_rwlock_destroy(&server->handlers_lock);
+    pthread_mutex_destroy(&server->active_handlers_lock);
+    pthread_cond_destroy(&server->all_handlers_done);
+    
+    free(server);
+}
+
+distric_err_t rpc_server_start(rpc_server_t* server) {
+    if (!server) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    server->accepting_requests = true;
+    
+    distric_err_t err = tcp_server_start(server->tcp_server, 
+                                         rpc_server_handle_connection, 
+                                         server);
+    if (err != DISTRIC_OK) {
+        return err;
+    }
+    
+    LOG_INFO(server->logger, "rpc_server", "RPC server started");
+    
+    return DISTRIC_OK;
+}
+
+distric_err_t rpc_server_stop(rpc_server_t* server) {
+    if (!server) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    LOG_INFO(server->logger, "rpc_server", "RPC server stopping");
+    
+    /* Stop accepting new requests */
+    server->accepting_requests = false;
+    
+    /* Stop TCP server (stops accepting new connections) */
+    tcp_server_stop(server->tcp_server);
+    
+    /* Wait for all active handlers to complete with timeout */
+    pthread_mutex_lock(&server->active_handlers_lock);
+    
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_sec += 5;  /* 5 second timeout */
+    
+    while (server->active_handlers_count > 0) {
+        int result = pthread_cond_timedwait(&server->all_handlers_done, 
+                                           &server->active_handlers_lock,
+                                           &timeout);
+        if (result == ETIMEDOUT) {
+            char count_str[32];
+            snprintf(count_str, sizeof(count_str), "%zu", server->active_handlers_count);
+            LOG_WARN(server->logger, "rpc_server", 
+                    "Timeout waiting for handlers to complete",
+                    "active_count", count_str);
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&server->active_handlers_lock);
+    
+    LOG_INFO(server->logger, "rpc_server", "RPC server stopped");
+    
     return DISTRIC_OK;
 }
 
 distric_err_t rpc_server_register_handler(
     rpc_server_t* server,
-    message_type_t msg_type,
-    rpc_handler_t handler,
+    uint16_t msg_type,
+    rpc_handler_fn_t handler,
     void* userdata
 ) {
     if (!server || !handler) {
@@ -321,14 +374,6 @@ distric_err_t rpc_server_register_handler(
         return DISTRIC_ERR_REGISTRY_FULL;
     }
     
-    /* Check for duplicate */
-    for (size_t i = 0; i < server->handler_count; i++) {
-        if (server->handlers[i].msg_type == msg_type) {
-            pthread_rwlock_unlock(&server->handlers_lock);
-            return DISTRIC_ERR_INVALID_ARG;  /* Already registered */
-        }
-    }
-    
     server->handlers[server->handler_count].msg_type = msg_type;
     server->handlers[server->handler_count].handler = handler;
     server->handlers[server->handler_count].userdata = userdata;
@@ -336,68 +381,14 @@ distric_err_t rpc_server_register_handler(
     
     pthread_rwlock_unlock(&server->handlers_lock);
     
-    LOG_INFO(server->logger, "rpc_server", "Handler registered",
-            "msg_type", message_type_to_string(msg_type));
+    LOG_DEBUG(server->logger, "rpc_server", "Handler registered",
+             "msg_type", message_type_to_string(msg_type));
     
     return DISTRIC_OK;
-}
-
-distric_err_t rpc_server_start(rpc_server_t* server) {
-    if (!server) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    atomic_store(&server->running, true);
-    
-    /* Start TCP server with our connection handler */
-    int result = tcp_server_start(server->tcp_server, 
-                                  rpc_server_handle_connection,
-                                  server);
-    
-    if (result != 0) {
-        atomic_store(&server->running, false);
-        return DISTRIC_ERR_INIT_FAILED;
-    }
-    
-    LOG_INFO(server->logger, "rpc_server", "RPC server started");
-    
-    return DISTRIC_OK;
-}
-
-void rpc_server_stop(rpc_server_t* server) {
-    if (!server) {
-        return;
-    }
-    
-    atomic_store(&server->running, false);
-    
-    LOG_INFO(server->logger, "rpc_server", "RPC server stopping");
-    
-    /* Wait for active requests to complete (with timeout) */
-    for (int i = 0; i < 100; i++) {
-        int64_t active = atomic_load(&server->active_requests);
-        if (active == 0) {
-            break;
-        }
-        usleep(100000);  /* 100ms */
-    }
-    
-    LOG_INFO(server->logger, "rpc_server", "RPC server stopped");
-}
-
-void rpc_server_destroy(rpc_server_t* server) {
-    if (!server) {
-        return;
-    }
-    
-    rpc_server_stop(server);
-    
-    pthread_rwlock_destroy(&server->handlers_lock);
-    free(server);
 }
 
 /* ============================================================================
- * RPC CLIENT IMPLEMENTATION
+ * RPC CLIENT
  * ========================================================================= */
 
 distric_err_t rpc_client_create(
@@ -407,7 +398,7 @@ distric_err_t rpc_client_create(
     tracer_t* tracer,
     rpc_client_t** client_out
 ) {
-    if (!tcp_pool || !metrics || !logger || !client_out) {
+    if (!tcp_pool || !client_out) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
@@ -420,127 +411,99 @@ distric_err_t rpc_client_create(
     client->metrics = metrics;
     client->logger = logger;
     client->tracer = tracer;
-    atomic_store(&client->request_id_counter, 1);
     
     /* Register metrics */
-    metrics_register_counter(metrics, "rpc_client_calls_total",
-                            "Total RPC calls", NULL, 0, &client->calls_total);
-    
-    metrics_register_histogram(metrics, "rpc_client_call_duration_seconds",
-                              "RPC call duration", NULL, 0, &client->call_duration);
-    
-    metrics_register_counter(metrics, "rpc_client_errors_total",
-                            "Total RPC errors", NULL, 0, &client->errors_total);
-    
-    metrics_register_counter(metrics, "rpc_client_retries_total",
-                            "Total RPC retries", NULL, 0, &client->retries_total);
+    if (metrics) {
+        metrics_register_counter(metrics, "rpc_client_calls_total",
+                                 "Total RPC calls made", NULL, 0,
+                                 &client->calls_total);
+        metrics_register_counter(metrics, "rpc_client_errors_total",
+                                 "Total RPC errors", NULL, 0,
+                                 &client->errors_total);
+        metrics_register_histogram(metrics, "rpc_client_latency_ms",
+                                   "RPC call latency", NULL, 0,
+                                   &client->latency_metric);
+    }
     
     *client_out = client;
+    
     return DISTRIC_OK;
+}
+
+void rpc_client_destroy(rpc_client_t* client) {
+    if (!client) return;
+    free(client);
 }
 
 distric_err_t rpc_call(
     rpc_client_t* client,
     const char* host,
     uint16_t port,
-    message_type_t msg_type,
+    uint16_t msg_type,
     const uint8_t* request,
-    size_t req_len,
+    size_t request_len,
     uint8_t** response_out,
-    size_t* resp_len_out,
-    int timeout_ms
+    size_t* response_len_out,
+    uint32_t timeout_ms
 ) {
-    if (!client || !host || !response_out || !resp_len_out) {
+    if (!client || !host || !response_out || !response_len_out) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* Start trace span */
-    trace_span_t* span = NULL;
-    if (client->tracer) {
-        trace_start_span(client->tracer, "rpc_call", &span);
-        trace_add_tag(span, "msg_type", message_type_to_string(msg_type));
-        trace_add_tag(span, "host", host);
-        
-        char port_str[16];
-        snprintf(port_str, sizeof(port_str), "%u", port);
-        trace_add_tag(span, "port", port_str);
-    }
+    uint64_t start_time = get_time_us();
     
-    uint64_t start_time = get_timestamp_us();
-    distric_err_t result = DISTRIC_OK;
-    
-    /* Acquire connection from pool */
+    /* Acquire connection */
     tcp_connection_t* conn = NULL;
-    int acquire_result = tcp_pool_acquire(client->tcp_pool, host, port, &conn);
-    
-    if (acquire_result != 0 || !conn) {
-        LOG_ERROR(client->logger, "rpc_client", "Failed to acquire connection",
-                 "host", host);
-        result = DISTRIC_ERR_INIT_FAILED;
-        goto cleanup;
+    distric_err_t err = tcp_pool_acquire(client->tcp_pool, host, port, &conn);
+    if (err != DISTRIC_OK) {
+        if (client->errors_total) metrics_counter_inc(client->errors_total);
+        return err;
     }
     
-    /* Build request header */
+    /* Create request header */
     message_header_t req_header;
-    message_header_init(&req_header, msg_type, req_len);
-    req_header.message_id = atomic_fetch_add(&client->request_id_counter, 1);
-    
-    /* Inject trace context if available */
-    if (span) {
-        /* Encode trace context in flags (simplified) */
-        req_header.flags |= MSG_FLAG_URGENT;  /* Use as trace flag */
-    }
-    
-    /* Compute CRC */
-    compute_header_crc32(&req_header, request, req_len);
+    message_header_init(&req_header, msg_type, request_len);
+    compute_header_crc32(&req_header, request, request_len);
     
     /* Serialize header */
-    uint8_t header_buf[MESSAGE_HEADER_SIZE];
-    serialize_header(&req_header, header_buf);
+    uint8_t req_header_buf[MESSAGE_HEADER_SIZE];
+    serialize_header(&req_header, req_header_buf);
     
     /* Send request */
-    int sent = tcp_send(conn, header_buf, MESSAGE_HEADER_SIZE);
-    if (sent != MESSAGE_HEADER_SIZE) {
-        LOG_ERROR(client->logger, "rpc_client", "Failed to send header");
-        result = DISTRIC_ERR_INIT_FAILED;
-        goto cleanup;
+    err = tcp_send(conn, req_header_buf, MESSAGE_HEADER_SIZE);
+    if (err != DISTRIC_OK) {
+        tcp_pool_release(client->tcp_pool, conn);
+        if (client->errors_total) metrics_counter_inc(client->errors_total);
+        return err;
     }
     
-    if (request && req_len > 0) {
-        sent = tcp_send(conn, request, req_len);
-        if (sent != (int)req_len) {
-            LOG_ERROR(client->logger, "rpc_client", "Failed to send payload");
-            result = DISTRIC_ERR_INIT_FAILED;
-            goto cleanup;
+    if (request_len > 0) {
+        err = tcp_send(conn, request, request_len);
+        if (err != DISTRIC_OK) {
+            tcp_pool_release(client->tcp_pool, conn);
+            if (client->errors_total) metrics_counter_inc(client->errors_total);
+            return err;
         }
     }
     
     /* Receive response header */
     uint8_t resp_header_buf[MESSAGE_HEADER_SIZE];
-    int received = tcp_recv(conn, resp_header_buf, MESSAGE_HEADER_SIZE, timeout_ms);
-    
+    ssize_t received = tcp_recv(conn, resp_header_buf, MESSAGE_HEADER_SIZE);
     if (received != MESSAGE_HEADER_SIZE) {
-        LOG_ERROR(client->logger, "rpc_client", "Failed to receive response header",
-                 "received", (char*)&received);
-        result = DISTRIC_ERR_INIT_FAILED;
-        goto cleanup;
+        tcp_pool_release(client->tcp_pool, conn);
+        if (client->errors_total) metrics_counter_inc(client->errors_total);
+        return DISTRIC_ERR_INIT_FAILED;
     }
     
     /* Deserialize response header */
     message_header_t resp_header;
     deserialize_header(resp_header_buf, &resp_header);
     
-    /* Validate response */
+    /* Validate response header */
     if (!validate_message_header(&resp_header)) {
-        LOG_ERROR(client->logger, "rpc_client", "Invalid response header");
-        result = DISTRIC_ERR_INVALID_FORMAT;
-        goto cleanup;
-    }
-    
-    if (resp_header.message_id != req_header.message_id) {
-        LOG_ERROR(client->logger, "rpc_client", "Message ID mismatch");
-        result = DISTRIC_ERR_INVALID_FORMAT;
-        goto cleanup;
+        tcp_pool_release(client->tcp_pool, conn);
+        if (client->errors_total) metrics_counter_inc(client->errors_total);
+        return DISTRIC_ERR_INVALID_FORMAT;
     }
     
     /* Receive response payload */
@@ -548,104 +511,50 @@ distric_err_t rpc_call(
     if (resp_header.payload_len > 0) {
         response = (uint8_t*)malloc(resp_header.payload_len);
         if (!response) {
-            result = DISTRIC_ERR_NO_MEMORY;
-            goto cleanup;
+            tcp_pool_release(client->tcp_pool, conn);
+            if (client->errors_total) metrics_counter_inc(client->errors_total);
+            return DISTRIC_ERR_NO_MEMORY;
         }
         
-        received = tcp_recv(conn, response, resp_header.payload_len, timeout_ms);
-        if (received != (int)resp_header.payload_len) {
-            LOG_ERROR(client->logger, "rpc_client", "Failed to receive response payload");
+        received = tcp_recv(conn, response, resp_header.payload_len);
+        if (received != (ssize_t)resp_header.payload_len) {
             free(response);
-            result = DISTRIC_ERR_INIT_FAILED;
-            goto cleanup;
+            tcp_pool_release(client->tcp_pool, conn);
+            if (client->errors_total) metrics_counter_inc(client->errors_total);
+            return DISTRIC_ERR_INIT_FAILED;
         }
     }
     
-    /* Verify CRC */
+    /* Verify CRC32 */
     if (!verify_message_crc32(&resp_header, response, resp_header.payload_len)) {
-        LOG_ERROR(client->logger, "rpc_client", "Response CRC32 verification failed");
         free(response);
-        result = DISTRIC_ERR_INVALID_FORMAT;
-        goto cleanup;
-    }
-    
-    *response_out = response;
-    *resp_len_out = resp_header.payload_len;
-    
-cleanup:
-    /* Release connection back to pool */
-    if (conn) {
         tcp_pool_release(client->tcp_pool, conn);
+        if (client->errors_total) metrics_counter_inc(client->errors_total);
+        return DISTRIC_ERR_INVALID_FORMAT;
     }
     
-    /* Update metrics */
-    uint64_t duration_us = get_timestamp_us() - start_time;
-    metrics_histogram_observe(client->call_duration, duration_us / 1000000.0);
-    metrics_counter_inc(client->calls_total);
+    /* Release connection */
+    tcp_pool_release(client->tcp_pool, conn);
     
-    if (result != DISTRIC_OK) {
-        metrics_counter_inc(client->errors_total);
+    /* Record metrics */
+    if (client->calls_total) {
+        metrics_counter_inc(client->calls_total);
     }
     
-    /* Finish trace span */
-    if (span) {
-        trace_set_status(span, result == DISTRIC_OK ? SPAN_STATUS_OK : SPAN_STATUS_ERROR);
-        trace_finish_span(client->tracer, span);
+    uint64_t duration_us = get_time_us() - start_time;
+    if (client->latency_metric) {
+        metrics_histogram_observe(client->latency_metric, (double)duration_us / 1000.0);
     }
     
+    char duration_str[32];
+    snprintf(duration_str, sizeof(duration_str), "%llu", (unsigned long long)(duration_us / 1000));
     LOG_DEBUG(client->logger, "rpc_client", "RPC call completed",
              "msg_type", message_type_to_string(msg_type),
-             "duration_ms", (char*)&duration_us,
-             "result", (char*)&result);
+             "duration_ms", duration_str,
+             "result", "");
     
-    return result;
-}
-
-distric_err_t rpc_call_with_retry(
-    rpc_client_t* client,
-    const char* host,
-    uint16_t port,
-    message_type_t msg_type,
-    const uint8_t* request,
-    size_t req_len,
-    uint8_t** response_out,
-    size_t* resp_len_out,
-    int timeout_ms,
-    int max_retries
-) {
-    distric_err_t result;
+    *response_out = response;
+    *response_len_out = resp_header.payload_len;
     
-    for (int attempt = 0; attempt <= max_retries; attempt++) {
-        if (attempt > 0) {
-            /* Exponential backoff */
-            int backoff_ms = DEFAULT_RETRY_BACKOFF_MS * (1 << (attempt - 1));
-            usleep(backoff_ms * 1000);
-            
-            metrics_counter_inc(client->retries_total);
-            
-            LOG_INFO(client->logger, "rpc_client", "Retrying RPC call",
-                    "attempt", (char*)&attempt,
-                    "backoff_ms", (char*)&backoff_ms);
-        }
-        
-        result = rpc_call(client, host, port, msg_type, request, req_len,
-                         response_out, resp_len_out, timeout_ms);
-        
-        if (result == DISTRIC_OK) {
-            return DISTRIC_OK;
-        }
-    }
-    
-    LOG_ERROR(client->logger, "rpc_client", "RPC call failed after retries",
-             "max_retries", (char*)&max_retries);
-    
-    return result;
-}
-
-void rpc_client_destroy(rpc_client_t* client) {
-    if (!client) {
-        return;
-    }
-    
-    free(client);
+    return DISTRIC_OK;
 }

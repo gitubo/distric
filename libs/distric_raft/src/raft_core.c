@@ -1622,6 +1622,106 @@ distric_err_t raft_get_replication_stats(
 }
 
 /* ============================================================================
+ * ELECTION COMPLETION (Session 3.6)
+ * ========================================================================= */
+
+distric_err_t raft_process_election_result(raft_node_t* node, uint32_t votes_received) {
+    if (!node) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    pthread_rwlock_wrlock(&node->lock);
+    
+    /* Only process if we're still a candidate */
+    if (node->state != RAFT_STATE_CANDIDATE) {
+        pthread_rwlock_unlock(&node->lock);
+        return DISTRIC_OK;
+    }
+    
+    /* Calculate majority */
+    uint32_t total_nodes = node->config.peer_count + 1;  /* +1 for self */
+    uint32_t majority = (total_nodes / 2) + 1;
+    
+    char votes_str[32], majority_str[32], term_str[32];
+    snprintf(votes_str, sizeof(votes_str), "%u", votes_received);
+    snprintf(majority_str, sizeof(majority_str), "%u", majority);
+    snprintf(term_str, sizeof(term_str), "%u", node->current_term);
+    
+    LOG_DEBUG(node->config.logger, "raft", "Processing election result",
+             "votes", votes_str,
+             "majority", majority_str,
+             "term", term_str);
+    
+    /* Check if we won */
+    if (votes_received >= majority) {
+        LOG_INFO(node->config.logger, "raft", "Election won - transitioning to LEADER",
+                "votes", votes_str,
+                "majority", majority_str,
+                "term", term_str);
+        
+        transition_to_leader(node);
+    } else {
+        LOG_DEBUG(node->config.logger, "raft", "Election incomplete - need more votes",
+                 "votes", votes_str,
+                 "majority", majority_str);
+    }
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
+ * ELECTION COMPLETION (Session 3.6)
+ * ========================================================================= */
+
+distric_err_t raft_process_election_result(raft_node_t* node, uint32_t votes_received) {
+    if (!node) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    pthread_rwlock_wrlock(&node->lock);
+    
+    /* Only process if we're still a candidate */
+    if (node->state != RAFT_STATE_CANDIDATE) {
+        pthread_rwlock_unlock(&node->lock);
+        return DISTRIC_OK;
+    }
+    
+    /* Calculate majority */
+    uint32_t total_nodes = node->config.peer_count + 1;  /* +1 for self */
+    uint32_t majority = (total_nodes / 2) + 1;
+    
+    char votes_str[32], majority_str[32], term_str[32];
+    snprintf(votes_str, sizeof(votes_str), "%u", votes_received);
+    snprintf(majority_str, sizeof(majority_str), "%u", majority);
+    snprintf(term_str, sizeof(term_str), "%u", node->current_term);
+    
+    LOG_DEBUG(node->config.logger, "raft", "Processing election result",
+             "votes", votes_str,
+             "majority", majority_str,
+             "term", term_str);
+    
+    /* Check if we won */
+    if (votes_received >= majority) {
+        LOG_INFO(node->config.logger, "raft", "Election won - transitioning to LEADER",
+                "votes", votes_str,
+                "majority", majority_str,
+                "term", term_str);
+        
+        transition_to_leader(node);
+    } else {
+        LOG_DEBUG(node->config.logger, "raft", "Election incomplete - need more votes",
+                 "votes", votes_str,
+                 "majority", majority_str);
+    }
+    
+    pthread_rwlock_unlock(&node->lock);
+    
+    return DISTRIC_OK;
+}
+
+/* ============================================================================
  * SNAPSHOT API (Session 3.4 Integration)
  * ========================================================================= */
 
