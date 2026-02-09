@@ -96,8 +96,27 @@ static uint64_t now_ms(void) {
 
 static void* tick_thread_func(void* arg) {
     node_ctx_t* ctx = (node_ctx_t*)arg;
+    uint32_t last_broadcast_term = 0;
+    
     while (atomic_load(&ctx->running)) {
         raft_tick(ctx->node);
+        
+        raft_state_t state = raft_get_state(ctx->node);
+        uint32_t current_term = raft_get_term(ctx->node);
+        
+        /* Broadcast votes when new election starts */
+        if (state == RAFT_STATE_CANDIDATE && current_term > last_broadcast_term) {
+            uint32_t votes = 0;
+            raft_rpc_broadcast_request_vote(ctx->rpc, ctx->node, &votes);
+            last_broadcast_term = current_term;
+        }
+        
+        /* Send heartbeats as leader */
+        if (state == RAFT_STATE_LEADER && raft_should_send_heartbeat(ctx->node)) {
+            raft_rpc_broadcast_append_entries(ctx->rpc, ctx->node);
+            raft_mark_heartbeat_sent(ctx->node);
+        }
+        
         usleep(TICK_INTERVAL_MS * 1000);
     }
     return NULL;

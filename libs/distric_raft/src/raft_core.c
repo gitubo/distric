@@ -321,10 +321,12 @@ static void transition_to_candidate(raft_node_t* node) {
 
     int votes_needed = (node->config.peer_count + 1) / 2 + 1;
     char votes_str[32];
+    char term_str[16];  // ✓ FIX: Format term as string
     snprintf(votes_str, sizeof(votes_str), "1/%d", votes_needed);
+    snprintf(term_str, sizeof(term_str), "%u", node->current_term);  // ✓ FIX
     LOG_INFO(node->config.logger, "raft", "Voted for self",
             "votes", votes_str,
-            "term", &(int){node->current_term}, NULL);
+            "term", term_str, NULL);  // ✓ FIX: Use formatted string
             
     node->last_election_ms = get_time_ms();
     node->election_timeout_ms = random_election_timeout(
@@ -334,7 +336,7 @@ static void transition_to_candidate(raft_node_t* node) {
     /* Persist state change (Session 3.4) */
     persist_state(node);
     
-    char term_str[16], timeout_str[16];
+    char timeout_str[16];
     snprintf(term_str, sizeof(term_str), "%u", node->current_term);
     snprintf(timeout_str, sizeof(timeout_str), "%llu", 
             (unsigned long long)node->election_timeout_ms);
@@ -802,9 +804,8 @@ distric_err_t raft_tick(raft_node_t* node) {
     
     /* State-specific logic */
     switch (state) {
-        case RAFT_STATE_FOLLOWER:
-        case RAFT_STATE_CANDIDATE: {
-            /* Check election timeout */
+        case RAFT_STATE_FOLLOWER: {
+            /* ✓ FIX: Use last_heartbeat_ms for FOLLOWER */
             pthread_rwlock_rdlock(&node->lock);
             uint64_t elapsed = now - node->last_heartbeat_ms;
             uint64_t timeout = node->election_timeout_ms;
@@ -824,6 +825,32 @@ distric_err_t raft_tick(raft_node_t* node) {
             }
             
             /* Apply committed entries (follower) */
+            apply_committed_entries(node);
+            
+            break;
+        }
+        
+        case RAFT_STATE_CANDIDATE: {
+            /* ✓ FIX: Use last_election_ms for CANDIDATE */
+            pthread_rwlock_rdlock(&node->lock);
+            uint64_t elapsed = now - node->last_election_ms;  // ✓ FIX: Changed from last_heartbeat_ms
+            uint64_t timeout = node->election_timeout_ms;
+            pthread_rwlock_unlock(&node->lock);
+            
+            if (elapsed > timeout) {
+                char elapsed_str[32], timeout_str[32];
+                snprintf(elapsed_str, sizeof(elapsed_str), "%llu", 
+                        (unsigned long long)elapsed);
+                snprintf(timeout_str, sizeof(timeout_str), "%llu",
+                        (unsigned long long)timeout);
+                LOG_INFO(node->config.logger, "raft", "Election timeout triggered",
+                        "elapsed_ms", elapsed_str,
+                        "timeout_ms", timeout_str, NULL);
+
+                start_election(node);
+            }
+            
+            /* Apply committed entries (candidate) */
             apply_committed_entries(node);
             
             break;
