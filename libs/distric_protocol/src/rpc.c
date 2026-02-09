@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <stdio.h>
+#include <errno.h>
 
 /* ============================================================================
  * RPC SERVER
@@ -26,8 +27,8 @@
 #define MAX_HANDLERS 64
 
 typedef struct {
-    uint16_t msg_type;
-    rpc_handler_fn_t handler;
+    message_type_t msg_type;
+    rpc_handler_t handler;
     void* userdata;
 } handler_entry_t;
 
@@ -101,7 +102,7 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
     message_header_t header;
     uint8_t header_buf[MESSAGE_HEADER_SIZE];
     
-    ssize_t received = tcp_recv(conn, header_buf, MESSAGE_HEADER_SIZE);
+    ssize_t received = tcp_recv(conn, header_buf, MESSAGE_HEADER_SIZE, 5000);
     if (received != MESSAGE_HEADER_SIZE) {
         LOG_ERROR(server->logger, "rpc_server", "Failed to receive header");
         if (server->errors_total) metrics_counter_inc(server->errors_total);
@@ -128,7 +129,7 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
             goto cleanup_and_exit;
         }
         
-        received = tcp_recv(conn, payload, header.payload_len);
+        received = tcp_recv(conn, payload, header.payload_len, 5000);
         if (received != (ssize_t)header.payload_len) {
             LOG_ERROR(server->logger, "rpc_server", "Failed to receive payload");
             if (server->errors_total) metrics_counter_inc(server->errors_total);
@@ -186,7 +187,7 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
         /* Create response header */
         message_header_t resp_header;
         message_header_init(&resp_header, header.msg_type, resp_len);
-        resp_header.flags = MESSAGE_FLAG_RESPONSE;
+        resp_header.flags = MSG_FLAG_RESPONSE;
         resp_header.message_id = header.message_id;
         
         /* Compute CRC32 */
@@ -316,9 +317,9 @@ distric_err_t rpc_server_start(rpc_server_t* server) {
     return DISTRIC_OK;
 }
 
-distric_err_t rpc_server_stop(rpc_server_t* server) {
+void rpc_server_stop(rpc_server_t* server) {
     if (!server) {
-        return DISTRIC_ERR_INVALID_ARG;
+        return;
     }
     
     LOG_INFO(server->logger, "rpc_server", "RPC server stopping");
@@ -353,14 +354,12 @@ distric_err_t rpc_server_stop(rpc_server_t* server) {
     pthread_mutex_unlock(&server->active_handlers_lock);
     
     LOG_INFO(server->logger, "rpc_server", "RPC server stopped");
-    
-    return DISTRIC_OK;
 }
 
 distric_err_t rpc_server_register_handler(
     rpc_server_t* server,
-    uint16_t msg_type,
-    rpc_handler_fn_t handler,
+    message_type_t msg_type,
+    rpc_handler_t handler,
     void* userdata
 ) {
     if (!server || !handler) {
@@ -439,12 +438,12 @@ distric_err_t rpc_call(
     rpc_client_t* client,
     const char* host,
     uint16_t port,
-    uint16_t msg_type,
+    message_type_t msg_type,
     const uint8_t* request,
     size_t request_len,
     uint8_t** response_out,
     size_t* response_len_out,
-    uint32_t timeout_ms
+    int timeout_ms
 ) {
     if (!client || !host || !response_out || !response_len_out) {
         return DISTRIC_ERR_INVALID_ARG;
@@ -488,7 +487,7 @@ distric_err_t rpc_call(
     
     /* Receive response header */
     uint8_t resp_header_buf[MESSAGE_HEADER_SIZE];
-    ssize_t received = tcp_recv(conn, resp_header_buf, MESSAGE_HEADER_SIZE);
+    ssize_t received = tcp_recv(conn, resp_header_buf, MESSAGE_HEADER_SIZE, timeout_ms);
     if (received != MESSAGE_HEADER_SIZE) {
         tcp_pool_release(client->tcp_pool, conn);
         if (client->errors_total) metrics_counter_inc(client->errors_total);
@@ -516,7 +515,7 @@ distric_err_t rpc_call(
             return DISTRIC_ERR_NO_MEMORY;
         }
         
-        received = tcp_recv(conn, response, resp_header.payload_len);
+        received = tcp_recv(conn, response, resp_header.payload_len, timeout_ms);
         if (received != (ssize_t)resp_header.payload_len) {
             free(response);
             tcp_pool_release(client->tcp_pool, conn);
