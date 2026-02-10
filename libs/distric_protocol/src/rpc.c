@@ -1,6 +1,10 @@
 /**
  * @file rpc.c
- * @brief RPC Framework Implementation with Graceful Shutdown
+ * @brief RPC Framework Implementation - FIXED CONNECTION HANDLER
+ * 
+ * CRITICAL FIX:
+ * Handler now loops to process multiple requests on the same connection.
+ * This matches the connection pooling behavior where connections are reused.
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -27,8 +31,8 @@
 #define MAX_HANDLERS 64
 
 typedef struct {
-    message_type_t msg_type;
-    rpc_handler_t handler;
+    uint16_t msg_type;
+    rpc_handler_fn_t handler;
     void* userdata;
 } handler_entry_t;
 
@@ -76,6 +80,13 @@ static uint64_t get_time_us(void) {
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
+/**
+ * ✓ CRITICAL FIX: Handler now LOOPS to process multiple requests
+ * 
+ * This matches the connection pooling behavior where connections are reused.
+ * Previous implementation processed ONE request and exited, leaving connection
+ * alive but with no thread to read subsequent requests.
+ */
 static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata) {
     rpc_server_t* server = (rpc_server_t*)userdata;
     
@@ -90,145 +101,185 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
         goto cleanup_and_exit;
     }
     
-    uint64_t start_time = get_time_us();
-    trace_span_t* span = NULL;
-    
-    /* Start trace span if tracer available */
-    if (server->tracer) {
-        trace_start_span(server->tracer, "rpc_server_handle_request", &span);
-    }
-    
-    /* Receive header */
-    message_header_t header;
-    uint8_t header_buf[MESSAGE_HEADER_SIZE];
-    
-    ssize_t received = tcp_recv(conn, header_buf, MESSAGE_HEADER_SIZE, 5000);
-    if (received != MESSAGE_HEADER_SIZE) {
-        LOG_ERROR(server->logger, "rpc_server", "Failed to receive header");
-        if (server->errors_total) metrics_counter_inc(server->errors_total);
-        goto cleanup_and_exit;
-    }
-    
-    /* Deserialize header */
-    deserialize_header(header_buf, &header);
-    
-    /* Validate header */
-    if (!validate_message_header(&header)) {
-        LOG_ERROR(server->logger, "rpc_server", "Invalid message header");
-        if (server->errors_total) metrics_counter_inc(server->errors_total);
-        goto cleanup_and_exit;
-    }
-    
-    /* Receive payload */
-    uint8_t* payload = NULL;
-    if (header.payload_len > 0) {
-        payload = (uint8_t*)malloc(header.payload_len);
-        if (!payload) {
-            LOG_ERROR(server->logger, "rpc_server", "Failed to allocate payload buffer");
-            if (server->errors_total) metrics_counter_inc(server->errors_total);
-            goto cleanup_and_exit;
+    /* ✓ CRITICAL FIX: Process multiple requests in a loop */
+    while (server->accepting_requests) {
+        uint64_t start_time = get_time_us();
+        trace_span_t* span = NULL;
+        
+        /* Start trace span if tracer available */
+        if (server->tracer) {
+            trace_start_span(server->tracer, "rpc_server_handle_request", &span);
         }
         
-        received = tcp_recv(conn, payload, header.payload_len, 5000);
-        if (received != (ssize_t)header.payload_len) {
-            LOG_ERROR(server->logger, "rpc_server", "Failed to receive payload");
-            if (server->errors_total) metrics_counter_inc(server->errors_total);
-            free(payload);
-            goto cleanup_and_exit;
-        }
-    }
-    
-    /* Verify CRC32 */
-    if (!verify_message_crc32(&header, payload, header.payload_len)) {
-        LOG_ERROR(server->logger, "rpc_server", "CRC32 verification failed");
-        if (server->errors_total) metrics_counter_inc(server->errors_total);
-        free(payload);
-        goto cleanup_and_exit;
-    }
-    
-    /* Find handler */
-    pthread_rwlock_rdlock(&server->handlers_lock);
-    
-    handler_entry_t* handler_entry = NULL;
-    for (size_t i = 0; i < server->handler_count; i++) {
-        if (server->handlers[i].msg_type == header.msg_type) {
-            handler_entry = &server->handlers[i];
+        /* Receive header with short timeout to allow checking shutdown flag */
+        message_header_t header;
+        uint8_t header_buf[MESSAGE_HEADER_SIZE];
+        
+        int received = tcp_recv(conn, header_buf, MESSAGE_HEADER_SIZE, 1000); /* 1s timeout */
+        
+        if (received == 0) {
+            /* Connection closed by peer - normal exit */
+            if (span) {
+                trace_set_status(span, SPAN_STATUS_OK);
+                trace_finish_span(server->tracer, span);
+            }
             break;
         }
-    }
-    
-    if (!handler_entry) {
+        
+        if (received < 0) {
+            if (received == -ETIMEDOUT) {
+                /* Timeout - check if server is shutting down, otherwise continue */
+                if (span) trace_finish_span(server->tracer, span);
+                
+                if (!server->accepting_requests) {
+                    break;
+                }
+                continue;
+            }
+            
+            /* Real error - close connection */
+            LOG_ERROR(server->logger, "rpc_server", "Failed to receive header");
+            if (server->errors_total) metrics_counter_inc(server->errors_total);
+            if (span) trace_finish_span(server->tracer, span);
+            break;
+        }
+        
+        if (received != MESSAGE_HEADER_SIZE) {
+            LOG_ERROR(server->logger, "rpc_server", "Incomplete header");
+            if (server->errors_total) metrics_counter_inc(server->errors_total);
+            if (span) trace_finish_span(server->tracer, span);
+            break;
+        }
+        
+        /* Deserialize header */
+        deserialize_header(header_buf, &header);
+        
+        /* Validate header */
+        if (!validate_message_header(&header)) {
+            LOG_ERROR(server->logger, "rpc_server", "Invalid message header");
+            if (server->errors_total) metrics_counter_inc(server->errors_total);
+            if (span) trace_finish_span(server->tracer, span);
+            break;
+        }
+        
+        /* Receive payload */
+        uint8_t* payload = NULL;
+        if (header.payload_len > 0) {
+            payload = (uint8_t*)malloc(header.payload_len);
+            if (!payload) {
+                LOG_ERROR(server->logger, "rpc_server", "Failed to allocate payload buffer");
+                if (server->errors_total) metrics_counter_inc(server->errors_total);
+                if (span) trace_finish_span(server->tracer, span);
+                break;
+            }
+            
+            received = tcp_recv(conn, payload, header.payload_len, 5000); /* 5s timeout */
+            if (received != (int)header.payload_len) {
+                LOG_ERROR(server->logger, "rpc_server", "Failed to receive payload");
+                if (server->errors_total) metrics_counter_inc(server->errors_total);
+                free(payload);
+                if (span) trace_finish_span(server->tracer, span);
+                break;
+            }
+        }
+        
+        /* Verify CRC32 */
+        if (!verify_message_crc32(&header, payload, header.payload_len)) {
+            LOG_ERROR(server->logger, "rpc_server", "CRC32 verification failed");
+            if (server->errors_total) metrics_counter_inc(server->errors_total);
+            free(payload);
+            if (span) trace_finish_span(server->tracer, span);
+            break;
+        }
+        
+        /* Find handler */
+        pthread_rwlock_rdlock(&server->handlers_lock);
+        
+        handler_entry_t* handler_entry = NULL;
+        for (size_t i = 0; i < server->handler_count; i++) {
+            if (server->handlers[i].msg_type == header.msg_type) {
+                handler_entry = &server->handlers[i];
+                break;
+            }
+        }
+        
+        if (!handler_entry) {
+            pthread_rwlock_unlock(&server->handlers_lock);
+            
+            /* Only log if server is still accepting requests */
+            if (server->accepting_requests) {
+                LOG_WARN(server->logger, "rpc_server", "No handler registered",
+                        "msg_type", message_type_to_string(header.msg_type));
+            }
+            if (server->errors_total) metrics_counter_inc(server->errors_total);
+            free(payload);
+            if (span) trace_finish_span(server->tracer, span);
+            break;
+        }
+        
+        /* Call handler */
+        uint8_t* response = NULL;
+        size_t resp_len = 0;
+        
+        int result = handler_entry->handler(payload, header.payload_len, 
+                                           &response, &resp_len,
+                                           handler_entry->userdata, span);
+        
         pthread_rwlock_unlock(&server->handlers_lock);
         
-        /* Only log if server is still accepting requests */
-        if (server->accepting_requests) {
-            LOG_WARN(server->logger, "rpc_server", "No handler registered",
-                    "msg_type", message_type_to_string(header.msg_type));
-        }
-        if (server->errors_total) metrics_counter_inc(server->errors_total);
         free(payload);
-        goto cleanup_and_exit;
-    }
-    
-    /* Call handler */
-    uint8_t* response = NULL;
-    size_t resp_len = 0;
-    
-    int result = handler_entry->handler(payload, header.payload_len, 
-                                       &response, &resp_len,
-                                       handler_entry->userdata, span);
-    
-    pthread_rwlock_unlock(&server->handlers_lock);
-    
-    free(payload);
-    
-    /* Send response */
-    if (result == 0 && response) {
-        /* Create response header */
-        message_header_t resp_header;
-        message_header_init(&resp_header, header.msg_type, resp_len);
-        resp_header.flags = MSG_FLAG_RESPONSE;
-        resp_header.message_id = header.message_id;
         
-        /* Compute CRC32 */
-        compute_header_crc32(&resp_header, response, resp_len);
-        
-        /* Serialize response header */
-        uint8_t resp_header_buf[MESSAGE_HEADER_SIZE];
-        serialize_header(&resp_header, resp_header_buf);
-        
-        /* Send header + payload */
-        tcp_send(conn, resp_header_buf, MESSAGE_HEADER_SIZE);
-        if (resp_len > 0) {
-            tcp_send(conn, response, resp_len);
+        /* Send response */
+        if (result == 0 && response) {
+            /* Create response header */
+            message_header_t resp_header;
+            message_header_init(&resp_header, header.msg_type, resp_len);
+            resp_header.flags = MSG_FLAG_RESPONSE;
+            resp_header.message_id = header.message_id;
+            
+            /* Compute CRC32 */
+            compute_header_crc32(&resp_header, response, resp_len);
+            
+            /* Serialize response header */
+            uint8_t resp_header_buf[MESSAGE_HEADER_SIZE];
+            serialize_header(&resp_header, resp_header_buf);
+            
+            /* Send header + payload */
+            int sent = tcp_send(conn, resp_header_buf, MESSAGE_HEADER_SIZE);
+            if (sent > 0 && resp_len > 0) {
+                tcp_send(conn, response, resp_len);
+            }
+            
+            free(response);
         }
         
-        free(response);
-    }
-    
-    /* Record metrics */
-    if (server->requests_total) {
-        metrics_counter_inc(server->requests_total);
-    }
-    
-    uint64_t duration_us = get_time_us() - start_time;
-    if (server->latency_metric) {
-        metrics_histogram_observe(server->latency_metric, (double)duration_us / 1000.0);
-    }
-    
-    char duration_str[32];
-    snprintf(duration_str, sizeof(duration_str), "%llu", (unsigned long long)(duration_us / 1000));
-    LOG_DEBUG(server->logger, "rpc_server", "Request handled",
-             "msg_type", message_type_to_string(header.msg_type),
-             "duration_ms", duration_str);
-    
-    /* Finish trace span */
-    if (span) {
-        trace_set_status(span, SPAN_STATUS_OK);
-        trace_finish_span(server->tracer, span);
-    }
+        /* Record metrics */
+        if (server->requests_total) {
+            metrics_counter_inc(server->requests_total);
+        }
+        
+        uint64_t duration_us = get_time_us() - start_time;
+        if (server->latency_metric) {
+            metrics_histogram_observe(server->latency_metric, (double)duration_us / 1000.0);
+        }
+        
+        char duration_str[32];
+        snprintf(duration_str, sizeof(duration_str), "%llu", (unsigned long long)(duration_us / 1000));
+        LOG_DEBUG(server->logger, "rpc_server", "Request handled",
+                 "msg_type", message_type_to_string(header.msg_type),
+                 "duration_ms", duration_str);
+        
+        /* Finish trace span */
+        if (span) {
+            trace_set_status(span, SPAN_STATUS_OK);
+            trace_finish_span(server->tracer, span);
+        }
+    } /* End of request processing loop */
 
 cleanup_and_exit:
+    /* Close connection when done */
+    tcp_close(conn);
+    
     /* Decrement active handler count and signal if last one */
     pthread_mutex_lock(&server->active_handlers_lock);
     server->active_handlers_count--;
@@ -440,12 +491,12 @@ distric_err_t rpc_call(
     uint16_t port,
     message_type_t msg_type,
     const uint8_t* request,
-    size_t request_len,
+    size_t req_len,
     uint8_t** response_out,
-    size_t* response_len_out,
+    size_t* resp_len_out,
     int timeout_ms
 ) {
-    if (!client || !host || !response_out || !response_len_out) {
+    if (!client || !host || !response_out || !resp_len_out) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
@@ -461,8 +512,8 @@ distric_err_t rpc_call(
     
     /* Create request header */
     message_header_t req_header;
-    message_header_init(&req_header, msg_type, request_len);
-    compute_header_crc32(&req_header, request, request_len);
+    message_header_init(&req_header, msg_type, req_len);
+    compute_header_crc32(&req_header, request, req_len);
     
     /* Serialize header */
     uint8_t req_header_buf[MESSAGE_HEADER_SIZE];
@@ -470,25 +521,28 @@ distric_err_t rpc_call(
     
     /* Send request */
     err = tcp_send(conn, req_header_buf, MESSAGE_HEADER_SIZE);
-    if (err != DISTRIC_OK) {
+    if (err < 0) {
+        tcp_pool_mark_failed(client->tcp_pool, conn);
         tcp_pool_release(client->tcp_pool, conn);
         if (client->errors_total) metrics_counter_inc(client->errors_total);
-        return err;
+        return DISTRIC_ERR_INIT_FAILED;
     }
     
-    if (request_len > 0) {
-        err = tcp_send(conn, request, request_len);
-        if (err != DISTRIC_OK) {
+    if (req_len > 0) {
+        err = tcp_send(conn, request, req_len);
+        if (err < 0) {
+            tcp_pool_mark_failed(client->tcp_pool, conn);
             tcp_pool_release(client->tcp_pool, conn);
             if (client->errors_total) metrics_counter_inc(client->errors_total);
-            return err;
+            return DISTRIC_ERR_INIT_FAILED;
         }
     }
     
     /* Receive response header */
     uint8_t resp_header_buf[MESSAGE_HEADER_SIZE];
-    ssize_t received = tcp_recv(conn, resp_header_buf, MESSAGE_HEADER_SIZE, timeout_ms);
+    int received = tcp_recv(conn, resp_header_buf, MESSAGE_HEADER_SIZE, timeout_ms);
     if (received != MESSAGE_HEADER_SIZE) {
+        tcp_pool_mark_failed(client->tcp_pool, conn);
         tcp_pool_release(client->tcp_pool, conn);
         if (client->errors_total) metrics_counter_inc(client->errors_total);
         return DISTRIC_ERR_INIT_FAILED;
@@ -500,6 +554,7 @@ distric_err_t rpc_call(
     
     /* Validate response header */
     if (!validate_message_header(&resp_header)) {
+        tcp_pool_mark_failed(client->tcp_pool, conn);
         tcp_pool_release(client->tcp_pool, conn);
         if (client->errors_total) metrics_counter_inc(client->errors_total);
         return DISTRIC_ERR_INVALID_FORMAT;
@@ -516,8 +571,9 @@ distric_err_t rpc_call(
         }
         
         received = tcp_recv(conn, response, resp_header.payload_len, timeout_ms);
-        if (received != (ssize_t)resp_header.payload_len) {
+        if (received != (int)resp_header.payload_len) {
             free(response);
+            tcp_pool_mark_failed(client->tcp_pool, conn);
             tcp_pool_release(client->tcp_pool, conn);
             if (client->errors_total) metrics_counter_inc(client->errors_total);
             return DISTRIC_ERR_INIT_FAILED;
@@ -527,12 +583,13 @@ distric_err_t rpc_call(
     /* Verify CRC32 */
     if (!verify_message_crc32(&resp_header, response, resp_header.payload_len)) {
         free(response);
+        tcp_pool_mark_failed(client->tcp_pool, conn);
         tcp_pool_release(client->tcp_pool, conn);
         if (client->errors_total) metrics_counter_inc(client->errors_total);
         return DISTRIC_ERR_INVALID_FORMAT;
     }
     
-    /* Release connection */
+    /* Release connection back to pool */
     tcp_pool_release(client->tcp_pool, conn);
     
     /* Record metrics */
@@ -549,11 +606,10 @@ distric_err_t rpc_call(
     snprintf(duration_str, sizeof(duration_str), "%llu", (unsigned long long)(duration_us / 1000));
     LOG_DEBUG(client->logger, "rpc_client", "RPC call completed",
              "msg_type", message_type_to_string(msg_type),
-             "duration_ms", duration_str,
-             "result", "");
+             "duration_ms", duration_str);
     
     *response_out = response;
-    *response_len_out = resp_header.payload_len;
+    *resp_len_out = resp_header.payload_len;
     
     return DISTRIC_OK;
 }

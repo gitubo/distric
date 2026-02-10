@@ -250,14 +250,6 @@ distric_err_t raft_update_peer_indices(
 distric_err_t raft_decrement_peer_next_index(raft_node_t* node, size_t peer_index);
 distric_err_t raft_step_down(raft_node_t* node, uint32_t term);
 
-/**
- * @brief Process RequestVote responses and complete election if won
- * 
- * @param node Raft node
- * @param votes_received Total votes received (including self)
- * @return DISTRIC_OK on success
- */
-distric_err_t raft_process_election_result(raft_node_t* node, uint32_t votes_received);
 
 /* ============================================================================
  * ELECTION COMPLETION (Session 3.6)
