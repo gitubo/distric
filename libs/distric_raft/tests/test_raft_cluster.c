@@ -663,7 +663,7 @@ int main(void) {
     }
     
     printf("\n  Waiting for RPC servers to settle (1s)...\n");
-    usleep(1000000);
+    usleep(500000);
     
     /* Start Raft nodes */
     printf("\n═══ STARTING RAFT NODES ═══\n");
@@ -677,8 +677,10 @@ int main(void) {
         pthread_create(&nodes[i].tick_thread, NULL, tick_thread_func, &nodes[i]);
         
         printf("  ✓ Started: node-%zu\n", i);
-        usleep(250000);
     }
+
+    printf("\n  Waiting for tick threads to initialize (100ms)...\n");
+    usleep(100000);
     
     /* BARRIER */
     printf("\n═══ STARTUP BARRIER ═══\n");

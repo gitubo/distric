@@ -32,7 +32,7 @@
 
 typedef struct {
     uint16_t msg_type;
-    rpc_handler_fn_t handler;
+    rpc_handler_t handler;
     void* userdata;
 } handler_entry_t;
 

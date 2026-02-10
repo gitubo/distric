@@ -109,11 +109,17 @@ distric_err_t tcp_connect(
         return DISTRIC_ERR_INVALID_ARG;
     }
     
+    /* Format port as string for logging */
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+    
     /* Resolve hostname */
     struct hostent* he = gethostbyname(host);
     if (!he) {
         if (logger) {
-            LOG_ERROR(logger, "tcp", "Failed to resolve host", "host", host, NULL);
+            LOG_ERROR(logger, "tcp", "Failed to resolve host", 
+                     "host", host, 
+                     "port", port_str, NULL);
         }
         return DISTRIC_ERR_INIT_FAILED;
     }
@@ -122,7 +128,10 @@ distric_err_t tcp_connect(
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         if (logger) {
-            LOG_ERROR(logger, "tcp", "Failed to create socket", "errno", strerror(errno), NULL);
+            LOG_ERROR(logger, "tcp", "Failed to create socket", 
+                     "host", host,
+                     "port", port_str,
+                     "errno", strerror(errno), NULL);
         }
         return DISTRIC_ERR_INIT_FAILED;
     }
@@ -142,7 +151,9 @@ distric_err_t tcp_connect(
     if (result < 0 && errno != EINPROGRESS) {
         if (logger) {
             LOG_ERROR(logger, "tcp", "Connect failed immediately", 
-                     "host", host, "errno", strerror(errno), NULL);
+                     "host", host, 
+                     "port", port_str,
+                     "errno", strerror(errno), NULL);
         }
         close(fd);
         return DISTRIC_ERR_INIT_FAILED;
@@ -158,7 +169,9 @@ distric_err_t tcp_connect(
         
         if (poll_result <= 0) {
             if (logger) {
-                LOG_ERROR(logger, "tcp", "Connect timeout", "host", host, NULL);
+                LOG_ERROR(logger, "tcp", "Connect timeout", 
+                         "host", host, 
+                         "port", port_str, NULL);
             }
             close(fd);
             return DISTRIC_ERR_TIMEOUT;
@@ -170,7 +183,9 @@ distric_err_t tcp_connect(
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
             if (logger) {
                 LOG_ERROR(logger, "tcp", "Connect failed", 
-                         "host", host, "error", strerror(error), NULL);
+                         "host", host, 
+                         "port", port_str,
+                         "error", strerror(error), NULL);
             }
             close(fd);
             return DISTRIC_ERR_INIT_FAILED;
@@ -200,8 +215,6 @@ distric_err_t tcp_connect(
     }
     
     if (logger) {
-        char port_str[16];
-        snprintf(port_str, sizeof(port_str), "%u", port);
         LOG_DEBUG(logger, "tcp", "Connected", 
                  "host", host, "port", port_str, NULL);
     }
@@ -305,8 +318,11 @@ void tcp_close(tcp_connection_t* conn) {
     if (!conn) return;
     
     if (conn->logger) {
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%u", conn->remote_port);
         LOG_DEBUG(conn->logger, "tcp", "Connection closed", 
-                 "remote", conn->remote_addr, NULL);
+                 "remote", conn->remote_addr,
+                 "port", port_str, NULL);
     }
     
     close(conn->fd);
@@ -498,7 +514,11 @@ distric_err_t tcp_server_create(
     server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server->listen_fd < 0) {
         if (logger) {
+            char port_str[16];
+            snprintf(port_str, sizeof(port_str), "%u", port);
             LOG_ERROR(logger, "tcp_server", "Failed to create socket", 
+                     "bind_addr", bind_addr,
+                     "port", port_str,
                      "errno", strerror(errno), NULL);
         }
         free(server);
@@ -517,8 +537,12 @@ distric_err_t tcp_server_create(
     
     if (bind(server->listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         if (logger) {
+            char port_str[16];
+            snprintf(port_str, sizeof(port_str), "%u", port);
             LOG_ERROR(logger, "tcp_server", "Bind failed", 
-                     "bind_addr", bind_addr, "errno", strerror(errno), NULL);
+                     "bind_addr", bind_addr, 
+                     "port", port_str,
+                     "errno", strerror(errno), NULL);
         }
         close(server->listen_fd);
         free(server);
@@ -528,7 +552,11 @@ distric_err_t tcp_server_create(
     /* Listen */
     if (listen(server->listen_fd, 128) < 0) {
         if (logger) {
+            char port_str[16];
+            snprintf(port_str, sizeof(port_str), "%u", port);
             LOG_ERROR(logger, "tcp_server", "Listen failed", 
+                     "bind_addr", bind_addr,
+                     "port", port_str,
                      "errno", strerror(errno), NULL);
         }
         close(server->listen_fd);
@@ -584,7 +612,11 @@ distric_err_t tcp_server_start(
     }
     
     if (server->logger) {
-        LOG_INFO(server->logger, "tcp_server", "Server started", NULL);
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%u", server->port);
+        LOG_INFO(server->logger, "tcp_server", "Server started",
+                "bind_addr", server->bind_addr,
+                "port", port_str, NULL);
     }
     
     return DISTRIC_OK;
