@@ -12,7 +12,7 @@
  * @date 2026-02-11
  */
 
-#include "gossip_internal.h"
+#include "distric_gossip/gossip_core.h"
 #include "distric_obs.h"
 #include <stdlib.h>
 #include <string.h>

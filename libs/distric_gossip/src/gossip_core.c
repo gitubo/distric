@@ -14,7 +14,7 @@
  */
 
 #include "distric_gossip.h"
-#include "gossip_internal.h"
+#include "distric_gossip/gossip_core.h"
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>

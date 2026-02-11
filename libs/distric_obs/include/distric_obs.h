@@ -46,8 +46,13 @@ typedef enum {
     DISTRIC_ERR_EOF = -8,                 
     DISTRIC_ERR_INVALID_FORMAT = -9,      
     DISTRIC_ERR_TYPE_MISMATCH = -10,
-    DISTRIC_ERR_TIMEOUT = -11     
+    DISTRIC_ERR_TIMEOUT = -11,     
+    DISTRIC_ERR_MEMORY = -12,
+    DISTRIC_ERR_IO = -13,
+    DISTRIC_ERR_INVALID_STATE = -14,
+    DISTRIC_ERR_THREAD = -15
 } distric_err_t;
+
 
 const char* distric_strerror(distric_err_t err);
 
