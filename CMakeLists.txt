@@ -24,6 +24,5 @@ add_subdirectory(libs/distric_protocol)
 # Add raft library
 add_subdirectory(libs/distric_raft)
 
-# Future libraries can be added here
-# add_subdirectory(libs/distric_core)
-# add_subdirectory(libs/distric_net)
+# Add gossip library
+add_subdirectory(libs/distric_gossip)
