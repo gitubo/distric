@@ -26,8 +26,7 @@
 #include <assert.h>
 #include <time.h>
 
-#include "raft.h"
-#include "test_framework.h"
+#include "raft_test_framework.h"
 
 #define NUM_NODES 5
 #define TEST_TIMEOUT_MS 30000  // Generous timeout for multiple election rounds

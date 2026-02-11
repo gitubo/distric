@@ -24,8 +24,7 @@
 #include <string.h>
 #include <assert.h>
 
-#include "raft.h"
-#include "test_framework.h"
+#include "raft_test_framework.h"
 
 #define NUM_NODES 5
 #define TEST_TIMEOUT_MS 10000
