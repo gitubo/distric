@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdio.h>
 
 /* ============================================================================
  * INITIALIZATION
@@ -128,25 +129,44 @@ distric_err_t gossip_init(const gossip_config_t* config, gossip_state_t** state_
     if (config->metrics) {
         metrics_registry_t* metrics = (metrics_registry_t*)config->metrics;
         
-        state->ping_sent_metric = metrics_register_counter(
+        metric_t* metric;
+        distric_err_t err;
+        
+        err = metrics_register_counter(
             metrics, "gossip_pings_sent_total",
-            "Total PING messages sent", NULL
+            "Total PING messages sent", 
+            NULL, 0, &metric
         );
+        if (err == DISTRIC_OK) {
+            state->ping_sent_metric = metric;
+        }
         
-        state->ping_recv_metric = metrics_register_counter(
+        err = metrics_register_counter(
             metrics, "gossip_pings_received_total",
-            "Total PING messages received", NULL
+            "Total PING messages received", 
+            NULL, 0, &metric
         );
+        if (err == DISTRIC_OK) {
+            state->ping_recv_metric = metric;
+        }
         
-        state->suspicions_metric = metrics_register_counter(
+        err = metrics_register_counter(
             metrics, "gossip_suspicions_total",
-            "Total node suspicions", NULL
+            "Total node suspicions", 
+            NULL, 0, &metric
         );
+        if (err == DISTRIC_OK) {
+            state->suspicions_metric = metric;
+        }
         
-        state->failures_metric = metrics_register_counter(
+        err = metrics_register_counter(
             metrics, "gossip_failures_total",
-            "Total node failures", NULL
+            "Total node failures", 
+            NULL, 0, &metric
         );
+        if (err == DISTRIC_OK) {
+            state->failures_metric = metric;
+        }
     }
     
     /* Log initialization */

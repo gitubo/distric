@@ -13,6 +13,7 @@
 #define DISTRIC_GOSSIP_INTERNAL_H
 
 #include "distric_gossip.h"
+#include "distric_gossip/messages.h"
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -193,7 +194,7 @@ void gossip_get_updates_to_broadcast(
  */
 void gossip_update_node_from_message(
     gossip_state_t* state,
-    const struct gossip_message_s* msg,
+    const gossip_message_t* msg,
     const char* src_addr,
     uint16_t src_port
 );

@@ -3,9 +3,10 @@
  * @brief Basic test to verify gossip library structure and compilation
  */
 
-#include "distric_gossip.h"
+#include <distric_gossip.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 int main(void) {
     printf("=== DistriC Gossip Library - Basic Structure Test ===\n\n");
