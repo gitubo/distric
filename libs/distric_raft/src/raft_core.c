@@ -717,15 +717,9 @@ distric_err_t raft_start(raft_node_t* node) {
     
     atomic_store(&node->running, true);
     
-    /* CRITICAL FIX: Reset election timer to prevent stale clock issue
-     * 
-     * The node may have been created long before start() is called.
-     * If we don't reset last_heartbeat_ms here, the node will immediately
-     * time out and start an election before it's ready.
-     */
     pthread_rwlock_wrlock(&node->lock);
     node->last_heartbeat_ms = get_time_ms();
-    node->last_election_ms = get_time_ms();  // Also reset last_election_ms
+    node->last_election_ms = get_time_ms(); 
     pthread_rwlock_unlock(&node->lock);
     
     char timeout_str[32];

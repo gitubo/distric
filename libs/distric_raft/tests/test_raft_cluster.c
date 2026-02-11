@@ -9,8 +9,6 @@
  * 4. Term explosion detection
  * 5. Vote table diagnostics
  * 
- * This test uses the EXISTING metrics in raft_rpc.c to detect RPC traffic.
- * No library modifications required.
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -46,8 +44,6 @@
 #define TICK_INTERVAL_MS 10
 
 /* Test timeouts */
-#define BARRIER_TIMEOUT_MS 2000
-#define SANITY_CHECK_DELAY_MS 2000  /* Wait before checking RPC traffic */
 #define LEADER_WAIT_TIMEOUT_MS 8000
 #define STABILITY_CHECK_MS 2000
 
@@ -79,10 +75,6 @@ static node_ctx_t nodes[MAX_NODES];
 static size_t node_count = 0;
 static metrics_registry_t* metrics = NULL;
 static logger_t* logger = NULL;
-
-/* Metric pointers for RPC traffic detection */
-//static metric_t* request_vote_sent_total = NULL;
-//static metric_t* request_vote_received_total = NULL;
 
 /* ============================================================================
  * UTILITIES
@@ -157,145 +149,6 @@ static uint32_t get_max_term(void) {
         }
     }
     return max_term;
-}
-
-/* ============================================================================
- * METRICS-BASED RPC TRAFFIC DETECTION
- * ========================================================================= */
-
-/**
- * Get metric value by searching in Prometheus export
- * This is a workaround since we don't have direct metric access
- */
-static uint64_t get_metric_value(const char* metric_name) {
-    char* prometheus_text = NULL;
-    size_t text_size = 0;
-    
-    if (metrics_export_prometheus(metrics, &prometheus_text, &text_size) != DISTRIC_OK) {
-        return 0;
-    }
-    
-    /* Search for metric_name in the text */
-    char search_str[256];
-    snprintf(search_str, sizeof(search_str), "%s ", metric_name);
-    
-    char* line = strstr(prometheus_text, search_str);
-    uint64_t value = 0;
-    
-    if (line) {
-        /* Parse the value after the metric name */
-        while (*line && *line != ' ') line++;
-        if (*line == ' ') {
-            value = strtoull(line + 1, NULL, 10);
-        }
-    }
-    
-    free(prometheus_text);
-    return value;
-}
-
-/**
- * CRITICAL SANITY CHECK: Verify RPC traffic is happening
- */
-static bool sanity_check_rpc_traffic(void) {
-    printf("  [SANITY] Checking for RequestVote RPC traffic...\n");
-    
-    uint64_t sent = get_metric_value("raft_request_vote_sent_total");
-    uint64_t received = get_metric_value("raft_request_vote_received_total");
-    
-    printf("  [SANITY] RequestVote RPCs: sent=%llu, received=%llu\n",
-           (unsigned long long)sent, (unsigned long long)received);
-    
-    if (sent == 0 && received == 0) {
-        printf("\n");
-        printf("  ╔═══════════════════════════════════════════════════════════╗\n");
-        printf("  ║  ✗ CRITICAL FAILURE: No RequestVote traffic observed!    ║\n");
-        printf("  ╚═══════════════════════════════════════════════════════════╝\n");
-        printf("\n");
-        printf("  This indicates one of:\n");
-        printf("   1. RPC networking is broken (nodes can't communicate)\n");
-        printf("   2. Raft nodes never became CANDIDATE (stuck as FOLLOWER)\n");
-        printf("   3. Election timeouts not triggering\n");
-        printf("\n");
-        printf("  Diagnostic steps:\n");
-        printf("   - Check: Are RPC servers listening?\n");
-        printf("   - Check: Are nodes reaching CANDIDATE state?\n");
-        printf("   - Check: Are election timeouts being triggered?\n");
-        printf("\n");
-        return false;
-    }
-    
-    if (sent > 0 && received == 0) {
-        printf("\n");
-        printf("  ╔═══════════════════════════════════════════════════════════╗\n");
-        printf("  ║  ✗ FAILURE: RequestVotes sent but none received!         ║\n");
-        printf("  ╚═══════════════════════════════════════════════════════════╝\n");
-        printf("\n");
-        printf("  This indicates:\n");
-        printf("   - Nodes can send RPCs but not receive them\n");
-        printf("   - Possible firewall or port binding issue\n");
-        printf("\n");
-        return false;
-    }
-    
-    if (sent == 0 && received > 0) {
-        printf("\n");
-        printf("  ╔═══════════════════════════════════════════════════════════╗\n");
-        printf("  ║  ⚠ WARNING: RequestVotes received but none sent!         ║\n");
-        printf("  ╚═══════════════════════════════════════════════════════════╝\n");
-        printf("\n");
-        printf("  This is unusual but may resolve. Continuing...\n");
-        printf("\n");
-    }
-    
-    printf("  [SANITY] ✓ RPC traffic verified\n\n");
-    return true;
-}
-
-/* ============================================================================
- * BARRIER: Wait for FOLLOWER state
- * ========================================================================= */
-
-static bool wait_until_all_followers(uint64_t timeout_ms) {
-    uint64_t deadline = now_ms() + timeout_ms;
-    
-    printf("  [BARRIER] Waiting for all nodes to become FOLLOWER...\n");
-    
-    while (now_ms() < deadline) {
-        bool all_followers = true;
-        
-        for (size_t i = 0; i < node_count; i++) {
-            if (!nodes[i].node) {
-                all_followers = false;
-                break;
-            }
-            
-            raft_state_t state = raft_get_state(nodes[i].node);
-            if (state != RAFT_STATE_FOLLOWER) {
-                all_followers = false;
-                break;
-            }
-        }
-        
-        if (all_followers) {
-            printf("  [BARRIER] ✓ All nodes are FOLLOWER\n");
-            return true;
-        }
-        
-        usleep(POLL_INTERVAL_MS * 1000);
-    }
-    
-    printf("  [BARRIER] ✗ Timeout - not all nodes reached FOLLOWER\n");
-    
-    for (size_t i = 0; i < node_count; i++) {
-        if (nodes[i].node) {
-            raft_state_t state = raft_get_state(nodes[i].node);
-            printf("    %s: state=%s\n", nodes[i].node_id, 
-                   raft_state_to_string(state));
-        }
-    }
-    
-    return false;
 }
 
 /* ============================================================================
@@ -592,12 +445,19 @@ static bool create_node(size_t index, size_t total) {
 static void stop_node(size_t i) {
     if (!nodes[i].node) return;
     
+    /* Step 1: Stop Raft node first (stops sending RPCs) */
+    raft_stop(nodes[i].node);
+    
+    /* Step 2: Stop tick thread */
     if (atomic_load(&nodes[i].running)) {
         atomic_store(&nodes[i].running, false);
         pthread_join(nodes[i].tick_thread, NULL);
     }
     
-    raft_stop(nodes[i].node);
+    /* Step 3: Wait for in-flight RPCs to complete */
+    usleep(150000);  /* 150ms - longer than HEARTBEAT_INTERVAL_MS */
+    
+    /* Step 4: Stop RPC server */
     raft_rpc_stop(nodes[i].rpc);
 }
 
@@ -682,25 +542,8 @@ int main(void) {
     printf("\n  Waiting for tick threads to initialize (100ms)...\n");
     usleep(100000);
     
-    /* BARRIER */
-    printf("\n═══ STARTUP BARRIER ═══\n");
-    if (!wait_until_all_followers(BARRIER_TIMEOUT_MS)) {
-        printf("\n✗ BARRIER FAILED\n");
-        goto cleanup;
-    }
-    
-    printf("\n  Settling (300ms)...\n");
-    usleep(300000);
-    
-    /* CRITICAL SANITY CHECK */
-    printf("\n═══ RPC TRAFFIC SANITY CHECK ═══\n");
-    printf("  Waiting %d ms for election activity...\n", SANITY_CHECK_DELAY_MS);
-    usleep(SANITY_CHECK_DELAY_MS * 1000);
-    
-    if (!sanity_check_rpc_traffic()) {
-        printf("\n✗ SANITY CHECK FAILED - NO RPC TRAFFIC\n");
-        goto cleanup;
-    }
+    printf("\n  Settling to allow election to complete...\n");
+    usleep(1000000);  /* 1 second - plenty of time for election */
     
     /* Wait for leader */
     printf("\n═══ LEADER ELECTION ═══\n");

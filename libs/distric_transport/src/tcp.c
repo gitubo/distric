@@ -109,23 +109,34 @@ distric_err_t tcp_connect(
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* Format port as string for logging */
+    /* Format port as string for logging and getaddrinfo */
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%u", port);
     
-    /* Resolve hostname */
-    struct hostent* he = gethostbyname(host);
-    if (!he) {
+    /* ========================================================================
+     * FIX: Use thread-safe getaddrinfo() instead of gethostbyname()
+     * ======================================================================== */
+    
+    /* Resolve hostname using thread-safe getaddrinfo() */
+    struct addrinfo hints, *result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;       /* IPv4 */
+    hints.ai_socktype = SOCK_STREAM;  /* TCP */
+    
+    int gai_err = getaddrinfo(host, port_str, &hints, &result);
+    if (gai_err != 0 || !result) {
         if (logger) {
             LOG_ERROR(logger, "tcp", "Failed to resolve host", 
                      "host", host, 
-                     "port", port_str, NULL);
+                     "port", port_str,
+                     "error", gai_strerror(gai_err), NULL);
         }
+        if (result) freeaddrinfo(result);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
-    /* Create socket */
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    /* Create socket using resolved address info */
+    int fd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     if (fd < 0) {
         if (logger) {
             LOG_ERROR(logger, "tcp", "Failed to create socket", 
@@ -133,22 +144,27 @@ distric_err_t tcp_connect(
                      "port", port_str,
                      "errno", strerror(errno), NULL);
         }
+        freeaddrinfo(result);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
     set_nonblocking(fd);
     set_tcp_nodelay(fd);
     
-    /* Connect */
+    /* Connect using the resolved address */
+    int result_connect = connect(fd, result->ai_addr, result->ai_addrlen);
+    
+    /* Save address info before freeing result */
     struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+    memcpy(&addr, result->ai_addr, sizeof(struct sockaddr_in));
     
-    int result = connect(fd, (struct sockaddr*)&addr, sizeof(addr));
+    freeaddrinfo(result);  /* Free immediately after use */
     
-    if (result < 0 && errno != EINPROGRESS) {
+    /* ========================================================================
+     * UNCHANGED: Original timeout and connection handling logic below
+     * ======================================================================== */
+    
+    if (result_connect < 0 && errno != EINPROGRESS) {
         if (logger) {
             LOG_ERROR(logger, "tcp", "Connect failed immediately", 
                      "host", host, 
