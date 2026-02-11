@@ -29,3 +29,33 @@ add_test(NAME test_raft_snapshot COMMAND test_raft_snapshot)
 add_executable(test_raft_cluster test_raft_cluster.c)
 target_link_libraries(test_raft_cluster distric_raft distric_protocol distric_transport distric_obs Threads::Threads)
 add_test(NAME test_raft_cluster COMMAND test_raft_cluster)
+
+# Test: Multi-Node Cluster Integration (Session 3.6)
+add_executable(test_raft_higher_term test_raft_higher_term.c)
+target_link_libraries(test_raft_higher_term distric_raft distric_protocol distric_transport distric_obs Threads::Threads)
+add_test(NAME test_raft_higher_term COMMAND test_raft_higher_term)
+
+# Test: Multi-Node Cluster Integration (Session 3.6)
+add_executable(test_raft_leader_completeness test_raft_leader_completeness.c)
+target_link_libraries(test_raft_leader_completeness distric_raft distric_protocol distric_transport distric_obs Threads::Threads)
+add_test(NAME test_raft_leader_completeness COMMAND test_raft_leader_completeness)
+
+# Test: Multi-Node Cluster Integration (Session 3.6)
+add_executable(test_raft_conflicting_logs test_raft_conflicting_logs.c)
+target_link_libraries(test_raft_conflicting_logs distric_raft distric_protocol distric_transport distric_obs Threads::Threads)
+add_test(NAME test_raft_conflicting_logs COMMAND test_raft_conflicting_logs)
+
+# Test: Multi-Node Cluster Integration (Session 3.6)
+add_executable(test_raft_split_vote test_raft_split_vote.c)
+target_link_libraries(test_raft_split_vote distric_raft distric_protocol distric_transport distric_obs Threads::Threads)
+add_test(NAME test_raft_split_vote COMMAND test_raft_split_vote)
+
+# Test: Multi-Node Cluster Integration (Session 3.6)
+add_executable(test_raft_leader_stability test_raft_leader_stability.c)
+target_link_libraries(test_raft_leader_stability distric_raft distric_protocol distric_transport distric_obs Threads::Threads)
+add_test(NAME test_raft_leader_stability COMMAND test_raft_leader_stability)
+
+# Test: Multi-Node Cluster Integration (Session 3.6)
+add_executable(test_raft_minority_no_leader test_raft_minority_no_leader.c)
+target_link_libraries(test_raft_minority_no_leader distric_raft distric_protocol distric_transport distric_obs Threads::Threads)
+add_test(NAME test_raft_minority_no_leader COMMAND test_raft_minority_no_leader)
