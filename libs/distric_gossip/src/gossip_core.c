@@ -14,7 +14,9 @@
  */
 
 #include "distric_gossip.h"
-#include "distric_gossip/gossip_core.h"
+#include "distric_gossip/gossip_internal.h"
+#include "distric_gossip/messages.h"
+
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -25,29 +27,6 @@
 #include <time.h>
 #include <sys/time.h>
 #include <errno.h>
-
-/* ============================================================================
- * INTERNAL MESSAGE TYPES
- * ========================================================================= */
-
-typedef enum {
-    GOSSIP_MSG_PING = 1,
-    GOSSIP_MSG_ACK,
-    GOSSIP_MSG_PING_REQ,      /* Indirect ping request */
-    GOSSIP_MSG_MEMBERSHIP,     /* Piggybacked membership updates */
-    GOSSIP_MSG_LEAVE          /* Graceful departure */
-} gossip_msg_type_t;
-
-typedef struct {
-    gossip_msg_type_t type;
-    char sender_id[64];
-    uint64_t incarnation;
-    uint32_t sequence;        /* For matching requests/responses */
-    
-    /* Piggybacked membership updates */
-    gossip_node_info_t* updates;
-    uint32_t update_count;
-} gossip_message_t;
 
 /* ============================================================================
  * HELPER FUNCTIONS
@@ -266,49 +245,59 @@ static int receive_message(
         return -1;  /* Error */
     }
     
-    /* Extract source address */
+    /* Parse source address */
     inet_ntop(AF_INET, &addr.sin_addr, src_addr, INET_ADDRSTRLEN);
     *src_port = ntohs(addr.sin_port);
     
-    /* Deserialize */
-    return deserialize_message(buffer, (size_t)received, msg);
+    /* Deserialize message */
+    if (deserialize_message(buffer, received, msg) != 0) {
+        return -1;
+    }
+    
+    return 0;  /* Success */
 }
 
 /* ============================================================================
- * SWIM PROTOCOL LOGIC
+ * PROTOCOL LOGIC
  * ========================================================================= */
 
 /**
- * @brief Select a random node (excluding self and recently probed)
+ * @brief Select a random alive node to probe
+ * @return Pointer to membership entry or NULL if no nodes available
  */
 static membership_entry_t* select_probe_target(gossip_state_t* state) {
     pthread_mutex_lock(&state->membership_lock);
     
-    if (state->membership_count == 0) {
+    /* Count alive non-local nodes */
+    size_t alive_count = 0;
+    for (size_t i = 0; i < state->membership_count; i++) {
+        if (state->membership[i].info.status == GOSSIP_NODE_ALIVE &&
+            !state->membership[i].local_node) {
+            alive_count++;
+        }
+    }
+    
+    if (alive_count == 0) {
         pthread_mutex_unlock(&state->membership_lock);
         return NULL;
     }
     
-    /* Build list of candidates (alive nodes, excluding self) */
-    membership_entry_t** candidates = (membership_entry_t**)malloc(
-        sizeof(membership_entry_t*) * state->membership_count);
-    size_t candidate_count = 0;
+    /* Select random target */
+    size_t target_idx = (size_t)rand() % alive_count;
+    membership_entry_t* target = NULL;
     
+    size_t current = 0;
     for (size_t i = 0; i < state->membership_count; i++) {
-        membership_entry_t* entry = &state->membership[i];
-        if (entry->info.status == GOSSIP_NODE_ALIVE &&
-            strcmp(entry->info.node_id, state->config.node_id) != 0) {
-            candidates[candidate_count++] = entry;
+        if (state->membership[i].info.status == GOSSIP_NODE_ALIVE &&
+            !state->membership[i].local_node) {
+            if (current == target_idx) {
+                target = &state->membership[i];
+                break;
+            }
+            current++;
         }
     }
     
-    membership_entry_t* target = NULL;
-    if (candidate_count > 0) {
-        size_t idx = (size_t)rand() % candidate_count;
-        target = candidates[idx];
-    }
-    
-    free(candidates);
     pthread_mutex_unlock(&state->membership_lock);
     
     return target;
@@ -325,27 +314,44 @@ static void select_indirect_probers(
 ) {
     pthread_mutex_lock(&state->membership_lock);
     
-    /* Build list of candidates */
-    membership_entry_t** candidates = (membership_entry_t**)malloc(
-        sizeof(membership_entry_t*) * state->membership_count);
+    /* Collect candidates (alive, non-local, not the target) */
     size_t candidate_count = 0;
-    
     for (size_t i = 0; i < state->membership_count; i++) {
-        membership_entry_t* entry = &state->membership[i];
-        if (entry->info.status == GOSSIP_NODE_ALIVE &&
-            strcmp(entry->info.node_id, state->config.node_id) != 0 &&
-            strcmp(entry->info.node_id, exclude_id) != 0) {
-            candidates[candidate_count++] = entry;
+        if (state->membership[i].info.status == GOSSIP_NODE_ALIVE &&
+            !state->membership[i].local_node &&
+            strcmp(state->membership[i].info.node_id, exclude_id) != 0) {
+            candidate_count++;
         }
     }
     
-    /* Select up to K random nodes */
-    size_t k = state->config.indirect_probes;
-    if (k > candidate_count) {
-        k = candidate_count;
+    if (candidate_count == 0) {
+        pthread_mutex_unlock(&state->membership_lock);
+        *probers_out = NULL;
+        *count_out = 0;
+        return;
     }
     
-    membership_entry_t** probers = (membership_entry_t**)malloc(sizeof(membership_entry_t*) * k);
+    /* Allocate candidate array */
+    membership_entry_t** candidates = (membership_entry_t**)malloc(
+        candidate_count * sizeof(membership_entry_t*)
+    );
+    
+    size_t idx = 0;
+    for (size_t i = 0; i < state->membership_count; i++) {
+        if (state->membership[i].info.status == GOSSIP_NODE_ALIVE &&
+            !state->membership[i].local_node &&
+            strcmp(state->membership[i].info.node_id, exclude_id) != 0) {
+            candidates[idx++] = &state->membership[i];
+        }
+    }
+    
+    /* Select min(K, candidate_count) probers */
+    size_t k = (state->config.indirect_probes < candidate_count) ?
+               state->config.indirect_probes : candidate_count;
+    
+    membership_entry_t** probers = (membership_entry_t**)malloc(
+        k * sizeof(membership_entry_t*)
+    );
     
     /* Fisher-Yates shuffle for random selection */
     for (size_t i = 0; i < k; i++) {

@@ -12,7 +12,10 @@
  * @date 2026-02-11
  */
 
-#include "distric_gossip/gossip_core.h"
+#include "distric_gossip.h"
+#include "distric_gossip/gossip_internal.h"
+#include "distric_gossip/messages.h"
+
 #include "distric_obs.h"
 #include <stdlib.h>
 #include <string.h>
@@ -232,7 +235,7 @@ void gossip_mark_node_suspected(gossip_state_t* state, const char* node_id) {
         
         /* Update metrics */
         if (state->suspicions_metric) {
-            metrics_counter_inc((metrics_counter_t*)state->suspicions_metric);
+            metrics_counter_inc(state->suspicions_metric);
         }
         
         /* Log suspicion */
@@ -278,7 +281,7 @@ void gossip_mark_node_failed(gossip_state_t* state, const char* node_id) {
         
         /* Update metrics */
         if (state->failures_metric) {
-            metrics_counter_inc((metrics_counter_t*)state->failures_metric);
+            metrics_counter_inc(state->failures_metric);
         }
         
         /* Log failure */
@@ -293,7 +296,7 @@ void gossip_mark_node_failed(gossip_state_t* state, const char* node_id) {
 }
 
 /**
- * @brief Handle a node gracefully leaving
+ * @brief Handle a node's graceful departure
  */
 void gossip_handle_node_leave(gossip_state_t* state, const char* node_id) {
     pthread_mutex_lock(&state->membership_lock);

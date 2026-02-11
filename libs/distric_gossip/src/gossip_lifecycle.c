@@ -12,7 +12,9 @@
  * @date 2026-02-11
  */
 
-#include "distric_gossip/gossip_core.h"
+#include "distric_gossip.h"
+#include "distric_gossip/gossip_internal.h"
+
 #include "distric_obs.h"
 #include <stdlib.h>
 #include <string.h>
@@ -273,26 +275,17 @@ void gossip_destroy(gossip_state_t* state) {
     }
     
     /* Free membership */
-    pthread_mutex_lock(&state->membership_lock);
-    free(state->membership);
-    state->membership = NULL;
-    state->membership_count = 0;
-    state->membership_capacity = 0;
-    pthread_mutex_unlock(&state->membership_lock);
-    
     pthread_mutex_destroy(&state->membership_lock);
-    
-    /* Log destruction */
-    if (state->config.logger) {
-        logger_t* logger = (logger_t*)state->config.logger;
-        LOG_INFO(logger, "gossip", "Gossip destroyed", NULL);
+    if (state->membership) {
+        free(state->membership);
     }
     
+    /* Free state */
     free(state);
 }
 
 /* ============================================================================
- * MEMBERSHIP QUERIES
+ * QUERY FUNCTIONS
  * ========================================================================= */
 
 distric_err_t gossip_get_alive_nodes(
@@ -321,14 +314,13 @@ distric_err_t gossip_get_alive_nodes(
         return DISTRIC_OK;
     }
     
-    /* Allocate array */
+    /* Allocate and copy */
     gossip_node_info_t* nodes = (gossip_node_info_t*)malloc(alive_count * sizeof(gossip_node_info_t));
     if (!nodes) {
         pthread_mutex_unlock(&state->membership_lock);
         return DISTRIC_ERR_MEMORY;
     }
     
-    /* Copy alive nodes */
     size_t idx = 0;
     for (size_t i = 0; i < state->membership_count; i++) {
         if (state->membership[i].info.status == GOSSIP_NODE_ALIVE) {

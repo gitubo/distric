@@ -11,7 +11,6 @@ set(CMAKE_C_EXTENSIONS OFF)
 # Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic -Werror")
 
-
 # Find pthread
 find_package(Threads REQUIRED)
 
@@ -39,10 +38,11 @@ set_target_properties(distric_gossip PROPERTIES
 # Include directories
 target_include_directories(distric_gossip
     PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
     PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
 # Link dependencies
@@ -53,7 +53,6 @@ target_link_libraries(distric_gossip
     PRIVATE
         m  # Math library
 )
-
 
 # Add tests
 if(BUILD_TESTING)
@@ -73,8 +72,13 @@ install(TARGETS distric_gossip
     INCLUDES DESTINATION include
 )
 
-# Install headers
-install(DIRECTORY include/
+# Install public header (root level)
+install(FILES distric_gossip.h
+    DESTINATION include
+)
+
+# Install internal headers (for library development only, optional)
+install(DIRECTORY include/distric_gossip
     DESTINATION include
     FILES_MATCHING PATTERN "*.h"
 )
