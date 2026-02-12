@@ -491,6 +491,33 @@ int test_cluster_find_leader(test_cluster_t* cluster) {
     return -1;
 }
 
+bool test_cluster_elect_leader(test_cluster_t* cluster, int preferred_node) {
+    (void)preferred_node; // Ignored for now - any node can become leader
+    
+    if (!cluster) {
+        return false;
+    }
+    
+    // Check if cluster is already running
+    bool already_started = false;
+    for (size_t i = 0; i < cluster->num_nodes; i++) {
+        if (atomic_load(&cluster->nodes[i].running)) {
+            already_started = true;
+            break;
+        }
+    }
+    
+    // Start cluster if not running
+    if (!already_started) {
+        if (!test_cluster_start(cluster)) {
+            return false;
+        }
+    }
+    
+    // Wait for leader election (5 second timeout)
+    return test_cluster_wait_for_leader(cluster, 5000) >= 0;
+}
+
 /* ============================================================================
  * LOG REPLICATION HELPERS
  * ========================================================================= */

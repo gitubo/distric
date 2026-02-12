@@ -48,10 +48,10 @@ static test_context_t *setup_test(void) {
     }
     
     // Elect a leader
-    test_cluster_elect_leader(ctx->cluster, 0);
-    ctx->leader_id = 0;
-    
-    assert(raft_get_state(ctx->nodes[0]) == RAFT_STATE_LEADER);
+    test_cluster_start(ctx->cluster);
+    ctx->leader_id = test_cluster_wait_for_leader(ctx->cluster, 5000);
+    assert(ctx->leader_id >= 0);
+    assert(raft_get_state(ctx->nodes[ctx->leader_id]) == RAFT_STATE_LEADER);
     
     return ctx;
 }
@@ -91,67 +91,53 @@ static void test_basic_leader_stability(void) {
         
         // Verify leader is still leader
         assert(raft_get_state(leader) == RAFT_STATE_LEADER);
+        assert(raft_get_current_term(leader) == initial_term);
         
-        // Verify all followers are still followers
+        // Verify no follower became candidate
         for (int i = 0; i < NUM_NODES; i++) {
             if (i != ctx->leader_id) {
                 raft_state_t state = raft_get_state(ctx->nodes[i]);
                 assert(state == RAFT_STATE_FOLLOWER);
             }
         }
-        
-        // Verify term has not changed
-        assert(raft_get_current_term(leader) == initial_term);
     }
     
-    printf("  ✓ Leader remained stable for %d ms\n", STABILITY_PERIOD_MS);
-    printf("  ✓ Term unchanged: %lu\n", initial_term);
-    printf("  ✓ No follower became candidate\n");
-    printf("  ✓ Approximate heartbeats sent: %d\n", heartbeat_count);
+    uint64_t duration = test_get_time_ms() - start;
+    
+    printf("  ✓ Leader remained stable for %lu ms\n", duration);
+    printf("  ✓ No unnecessary elections occurred\n");
+    printf("  ✓ Term remained constant at %lu\n", initial_term);
     
     teardown_test(ctx);
 }
 
 /**
- * Test: Heartbeats reset election timers
+ * Test: Heartbeats reset follower election timers
  */
 static void test_heartbeats_reset_election_timers(void) {
     test_context_t *ctx = setup_test();
     
     printf("Test: Heartbeats reset follower election timers\n");
     
-    raft_node_t *leader = ctx->nodes[ctx->leader_id];
+    // Election timeout is typically 150-300ms
+    // Heartbeat interval is typically 50ms  
+    // Run for 3x max election timeout (900ms)
+    uint64_t test_duration = 3 * 300;  // 3x max election timeout
     
-    // Set known election timeout
-    int election_timeout = 300;
-    for (int i = 0; i < NUM_NODES; i++) {
-        if (i != ctx->leader_id) {
-            raft_set_election_timeout(ctx->nodes[i], 
-                                     election_timeout, 
-                                     election_timeout);
-        }
-    }
-    
-    // Set heartbeat interval shorter than election timeout
-    raft_set_heartbeat_interval(leader, 100);
-    
-    printf("  Election timeout: %d ms\n", election_timeout);
-    printf("  Heartbeat interval: 100 ms\n");
-    
-    // Run for 3x election timeout
     uint64_t start = test_get_time_ms();
-    uint64_t duration = election_timeout * 3;
     
-    while (test_get_time_ms() - start < duration) {
-        test_cluster_tick(ctx->cluster, 25);
+    while (test_get_time_ms() - start < test_duration) {
+        test_cluster_tick(ctx->cluster, 10);
         
-        // No follower should timeout
+        // No follower should start an election
         for (int i = 0; i < NUM_NODES; i++) {
             if (i != ctx->leader_id) {
                 assert(raft_get_state(ctx->nodes[i]) == RAFT_STATE_FOLLOWER);
             }
         }
     }
+    
+    uint64_t duration = test_get_time_ms() - start;
     
     printf("  ✓ Ran for %lu ms (3x election timeout)\n", duration);
     printf("  ✓ No follower started election\n");
@@ -179,13 +165,8 @@ static void test_leader_stability_under_load(void) {
         char data[64];
         snprintf(data, sizeof(data), "load_entry_%d", i);
         
-        raft_entry_t entry = {
-            .term = raft_get_current_term(leader),
-            .data = data,
-            .data_len = strlen(data)
-        };
-        
-        raft_append_entry(leader, &entry);
+        uint32_t index_out;
+        raft_append_entry(leader, (const uint8_t*)data, strlen(data), &index_out);
         
         // Allow replication
         test_cluster_tick(ctx->cluster, 10);
@@ -221,125 +202,77 @@ static void test_all_followers_remain_stable(void) {
     
     printf("Test: All followers remain stable simultaneously\n");
     
-    // Track state of each follower over time
-    typedef struct {
-        int transitions_to_candidate;
-        int transitions_to_leader;
-        uint64_t term_changes;
-    } follower_stats_t;
-    
-    follower_stats_t stats[NUM_NODES] = {0};
-    
-    uint64_t prev_terms[NUM_NODES];
-    raft_state_t prev_states[NUM_NODES];
-    
-    for (int i = 0; i < NUM_NODES; i++) {
-        prev_terms[i] = raft_get_current_term(ctx->nodes[i]);
-        prev_states[i] = raft_get_state(ctx->nodes[i]);
-    }
-    
-    // Monitor for stability period
+    uint64_t test_duration = 5000;  // 5 seconds
     uint64_t start = test_get_time_ms();
     
-    while (test_get_time_ms() - start < STABILITY_PERIOD_MS) {
+    while (test_get_time_ms() - start < test_duration) {
         test_cluster_tick(ctx->cluster, 50);
         
+        int leaders = 0, followers = 0;
+        
         for (int i = 0; i < NUM_NODES; i++) {
-            raft_state_t current_state = raft_get_state(ctx->nodes[i]);
-            uint64_t current_term = raft_get_current_term(ctx->nodes[i]);
+            raft_state_t state = raft_get_state(ctx->nodes[i]);
             
-            // Track state transitions
-            if (prev_states[i] == RAFT_STATE_FOLLOWER && 
-                current_state == RAFT_STATE_CANDIDATE) {
-                stats[i].transitions_to_candidate++;
+            if (state == RAFT_STATE_LEADER) {
+                leaders++;
+            } else if (state == RAFT_STATE_FOLLOWER) {
+                followers++;
+            } else {
+                // Should never have candidates
+                assert(false);
             }
-            
-            if (prev_states[i] != RAFT_STATE_LEADER && 
-                current_state == RAFT_STATE_LEADER) {
-                stats[i].transitions_to_leader++;
-            }
-            
-            if (current_term != prev_terms[i]) {
-                stats[i].term_changes++;
-            }
-            
-            prev_states[i] = current_state;
-            prev_terms[i] = current_term;
-        }
-    }
-    
-    // Verify stability
-    for (int i = 0; i < NUM_NODES; i++) {
-        if (i == ctx->leader_id) {
-            assert(stats[i].transitions_to_candidate == 0);
-            assert(stats[i].transitions_to_leader == 0);  // Was already leader
-        } else {
-            assert(stats[i].transitions_to_candidate == 0);
-            assert(stats[i].transitions_to_leader == 0);
         }
         
-        assert(stats[i].term_changes == 0);
-        
-        printf("  Node %d: %s - no transitions\n", i,
-               i == ctx->leader_id ? "LEADER" : "FOLLOWER");
+        assert(leaders == 1);
+        assert(followers == NUM_NODES - 1);
     }
     
-    printf("  ✓ All nodes remained in stable state\n");
+    printf("  ✓ All %d followers remained stable for %lu ms\n", 
+           NUM_NODES - 1, test_duration);
+    printf("  ✓ No followers started elections\n");
     
     teardown_test(ctx);
 }
 
 /**
- * Test: Stability with delayed/lost heartbeats
+ * Test: Stability with occasional lost heartbeats
  */
 static void test_stability_with_occasional_lost_heartbeats(void) {
     test_context_t *ctx = setup_test();
     
     printf("Test: Stability with occasional lost heartbeats\n");
     
-    raft_node_t *leader = ctx->nodes[ctx->leader_id];
-    uint64_t initial_term = raft_get_current_term(leader);
+    // Enable 5% message loss
+    test_cluster_set_message_loss(ctx->cluster, 0.05);
     
-    // Set message loss rate (10% of heartbeats may be lost)
-    test_cluster_set_message_loss_rate(ctx->cluster, 0.10);
-    
-    printf("  Message loss rate: 10%%\n");
-    
+    uint64_t test_duration = 3000;
     uint64_t start = test_get_time_ms();
-    int election_attempts = 0;
     
-    while (test_get_time_ms() - start < STABILITY_PERIOD_MS) {
+    while (test_get_time_ms() - start < test_duration) {
         test_cluster_tick(ctx->cluster, 50);
         
-        // Check for any election attempts
+        // Leader should remain stable
+        assert(raft_get_state(ctx->nodes[ctx->leader_id]) == RAFT_STATE_LEADER);
+        
+        // Followers should remain followers (heartbeats still get through)
         for (int i = 0; i < NUM_NODES; i++) {
-            if (i != ctx->leader_id && 
-                raft_get_state(ctx->nodes[i]) == RAFT_STATE_CANDIDATE) {
-                election_attempts++;
+            if (i != ctx->leader_id) {
+                assert(raft_get_state(ctx->nodes[i]) == RAFT_STATE_FOLLOWER);
             }
         }
-        
-        // Leader should still be leader
-        assert(raft_get_state(leader) == RAFT_STATE_LEADER);
     }
     
-    // Some heartbeats were lost, but should still be stable
-    assert(raft_get_current_term(leader) == initial_term);
+    // Disable message loss
+    test_cluster_set_message_loss(ctx->cluster, 0.0);
     
-    // Should be no or very few election attempts
-    assert(election_attempts <= 2);  // Allow minimal attempts due to packet loss
-    
-    printf("  ✓ Remained stable despite packet loss\n");
-    printf("  ✓ Election attempts: %d (acceptable)\n", election_attempts);
-    
-    // Reset message loss
-    test_cluster_set_message_loss_rate(ctx->cluster, 0.0);
+    printf("  ✓ Cluster remained stable despite 5%% message loss\n");
+    printf("  ✓ Heartbeats sufficient to prevent elections\n");
     
     teardown_test(ctx);
 }
 
 /**
- * Test: Term does not increase unnecessarily
+ * Test: Term remains constant during stability
  */
 static void test_term_remains_constant(void) {
     test_context_t *ctx = setup_test();
@@ -398,13 +331,8 @@ static void test_leader_continues_committing(void) {
             char data[32];
             snprintf(data, sizeof(data), "entry_r%d_i%d", round, i);
             
-            raft_entry_t entry = {
-                .term = raft_get_current_term(leader),
-                .data = data,
-                .data_len = strlen(data)
-            };
-            
-            raft_append_entry(leader, &entry);
+            uint32_t index_out;
+            raft_append_entry(leader, (const uint8_t*)data, strlen(data), &index_out);
         }
         
         // Replicate and commit

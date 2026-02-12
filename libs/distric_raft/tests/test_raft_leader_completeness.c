@@ -136,7 +136,7 @@ static void test_new_leader_has_committed_entries(void) {
     
     // Step cluster to allow election in majority partition
     for (int i = 0; i < 100; i++) {
-        test_cluster_step(ctx->cluster);
+        test_cluster_tick(ctx->cluster, 10);
     }
     
     // Heal partition to check new leader
@@ -236,7 +236,7 @@ static void test_incomplete_log_loses_election(void) {
     
     // Step to allow election
     for (int i = 0; i < 100; i++) {
-        test_cluster_step(ctx->cluster);
+        test_cluster_tick(ctx->cluster, 10);
     }
     
     // Heal and check leader
@@ -315,7 +315,7 @@ static void test_most_uptodate_log_wins(void) {
     
     // Step to trigger election in majority partition
     for (int i = 0; i < 100; i++) {
-        test_cluster_step(ctx->cluster);
+        test_cluster_tick(ctx->cluster, 10);
     }
     
     // Heal partition
@@ -387,7 +387,7 @@ static void test_committed_entries_survive_leader_change(void) {
         
         // Step to allow new election
         for (int i = 0; i < 100; i++) {
-            test_cluster_step(ctx->cluster);
+            test_cluster_tick(ctx->cluster, 10);
         }
         
         // Heal partition
@@ -461,7 +461,7 @@ static void test_higher_term_preferred(void) {
     
     // Step to trigger new election with higher term
     for (int i = 0; i < 100; i++) {
-        test_cluster_step(ctx->cluster);
+        test_cluster_tick(ctx->cluster, 10);
     }
     
     // Heal partition
