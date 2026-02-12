@@ -204,7 +204,7 @@ static void test_minority_loses_existing_leader(void) {
     assert(initial_leader >= 0);
     assert(raft_get_state(ctx->nodes[initial_leader]) == RAFT_STATE_LEADER);
     
-    uint64_t term_before = raft_get_current_term(ctx->nodes[initial_leader]);
+    uint64_t term_before = raft_get_term(ctx->nodes[initial_leader]);
     
     printf("  Initial leader: node %d (term %lu)\n", initial_leader, term_before);
     
@@ -255,7 +255,7 @@ static void test_minority_loses_existing_leader(void) {
     assert(majority_leader != -1);
     assert(majority_leader != initial_leader);
     
-    uint64_t new_term = raft_get_current_term(ctx->nodes[majority_leader]);
+    uint64_t new_term = raft_get_term(ctx->nodes[majority_leader]);
     assert(new_term > term_before);
     
     printf("  ✓ Majority elected new leader: node %d (term %lu)\n", 
@@ -456,13 +456,13 @@ static void test_minority_term_increases_without_leader(void) {
     
     test_cluster_start(ctx->cluster);
     
-    uint64_t initial_term = raft_get_current_term(ctx->nodes[0]);
+    uint64_t initial_term = raft_get_term(ctx->nodes[0]);
     
     // Run for a while
     test_cluster_tick(ctx->cluster, 3000);
     
     // Terms may have increased due to failed elections
-    uint64_t final_term = raft_get_current_term(ctx->nodes[0]);
+    uint64_t final_term = raft_get_term(ctx->nodes[0]);
     
     printf("  Term progression: %lu → %lu\n", initial_term, final_term);
     

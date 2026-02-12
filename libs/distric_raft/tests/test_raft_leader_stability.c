@@ -72,7 +72,7 @@ static void test_basic_leader_stability(void) {
     printf("Test: Leader stability with regular heartbeats\n");
     
     raft_node_t *leader = ctx->nodes[ctx->leader_id];
-    uint64_t initial_term = raft_get_current_term(leader);
+    uint64_t initial_term = raft_get_term(leader);
     
     printf("  Initial state: Node %d is leader in term %lu\n", 
            ctx->leader_id, initial_term);
@@ -91,7 +91,7 @@ static void test_basic_leader_stability(void) {
         
         // Verify leader is still leader
         assert(raft_get_state(leader) == RAFT_STATE_LEADER);
-        assert(raft_get_current_term(leader) == initial_term);
+        assert(raft_get_term(leader) == initial_term);
         
         // Verify no follower became candidate
         for (int i = 0; i < NUM_NODES; i++) {
@@ -155,7 +155,7 @@ static void test_leader_stability_under_load(void) {
     printf("Test: Leader stability while replicating entries\n");
     
     raft_node_t *leader = ctx->nodes[ctx->leader_id];
-    uint64_t initial_term = raft_get_current_term(leader);
+    uint64_t initial_term = raft_get_term(leader);
     
     const int num_entries = 100;
     int committed_count = 0;
@@ -173,7 +173,7 @@ static void test_leader_stability_under_load(void) {
         
         // Verify leader is still leader
         assert(raft_get_state(leader) == RAFT_STATE_LEADER);
-        assert(raft_get_current_term(leader) == initial_term);
+        assert(raft_get_term(leader) == initial_term);
         
         // Verify no follower became candidate
         for (int j = 0; j < NUM_NODES; j++) {
@@ -279,7 +279,7 @@ static void test_term_remains_constant(void) {
     
     printf("Test: Term remains constant during stability\n");
     
-    uint64_t initial_term = raft_get_current_term(ctx->nodes[0]);
+    uint64_t initial_term = raft_get_term(ctx->nodes[0]);
     
     printf("  Initial term: %lu\n", initial_term);
     
@@ -292,7 +292,7 @@ static void test_term_remains_constant(void) {
         test_cluster_tick(ctx->cluster, 100);
         
         for (int i = 0; i < NUM_NODES; i++) {
-            uint64_t node_term = raft_get_current_term(ctx->nodes[i]);
+            uint64_t node_term = raft_get_term(ctx->nodes[i]);
             
             if (node_term > max_term) {
                 max_term = node_term;

@@ -26,28 +26,6 @@ typedef struct {
 } test_context_t;
 
 /**
- * Helper to get current term from a node via a dummy request
- * Since raft_get_current_term doesn't exist, we use a side effect
- */
-static uint32_t get_node_term(raft_node_t* node) {
-    bool vote_granted = false;
-    uint32_t term_out = 0;
-    
-    // Make a dummy request vote call to get current term in response
-    raft_handle_request_vote(
-        node,
-        "dummy_candidate",
-        0,  // Term 0 will be rejected but returns current term
-        0,
-        0,
-        &vote_granted,
-        &term_out
-    );
-    
-    return term_out;
-}
-
-/**
  * Setup test context
  */
 static test_context_t* setup_test(void) {
@@ -72,7 +50,7 @@ static test_context_t* setup_test(void) {
     assert(test_cluster_find_leader(ctx->cluster) >= 0);
     
     // Store initial term
-    ctx->initial_term = get_node_term(ctx->nodes[0]);
+    ctx->initial_term = raft_get_term(ctx->nodes[0]);
     
     return ctx;
 }
@@ -124,7 +102,7 @@ static void test_higher_term_request_vote(void) {
     assert(rv == DISTRIC_OK);
     
     // Verify node updated to higher term
-    uint32_t current_term = get_node_term(leader);
+    uint32_t current_term = raft_get_term(leader);
     assert(current_term == higher_term);
     
     // Verify node stepped down to follower
@@ -177,7 +155,7 @@ static void test_higher_term_append_entries(void) {
     assert(rv == DISTRIC_OK);
     
     // Verify node updated to higher term
-    uint32_t current_term = get_node_term(leader);
+    uint32_t current_term = raft_get_term(leader);
     assert(current_term == higher_term);
     
     // Verify node stepped down to follower
@@ -247,7 +225,7 @@ static void test_higher_term_outdated_log(void) {
     assert(rv == DISTRIC_OK);
     
     // Verify node updated to higher term
-    uint32_t current_term = get_node_term(leader);
+    uint32_t current_term = raft_get_term(leader);
     assert(current_term == higher_term);
     
     // Verify vote was NOT granted (log is outdated)
@@ -285,12 +263,12 @@ static void test_higher_term_persistence(void) {
     );
     
     // Verify term was updated
-    uint32_t current_term = get_node_term(leader);
+    uint32_t current_term = raft_get_term(leader);
     assert(current_term == higher_term);
     
     // Simulate restart by getting state again
     // In a real implementation, this would reload from persistent storage
-    uint32_t reloaded_term = get_node_term(leader);
+    uint32_t reloaded_term = raft_get_term(leader);
     assert(reloaded_term == higher_term);
     
     teardown_test(ctx);
@@ -333,7 +311,7 @@ static void test_multiple_higher_terms(void) {
         );
         
         // Verify term increased
-        uint32_t node_term = get_node_term(node);
+        uint32_t node_term = raft_get_term(node);
         assert(node_term == new_term);
         assert(node_term > current_term);
         

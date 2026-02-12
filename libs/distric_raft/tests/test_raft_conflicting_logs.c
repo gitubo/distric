@@ -70,7 +70,7 @@ static void test_basic_conflict_resolution(void) {
     assert(leader_idx >= 0);
     
     raft_node_t *leader1 = ctx->nodes[leader_idx];
-    uint64_t term1 = raft_get_current_term(leader1);
+    uint64_t term1 = raft_get_term(leader1);
     
     // Append and commit baseline entries
     for (int i = 0; i < 3; i++) {
@@ -114,7 +114,7 @@ static void test_basic_conflict_resolution(void) {
     }
     
     if (leader2) {
-        uint64_t term2 = raft_get_current_term(leader2);
+        uint64_t term2 = raft_get_term(leader2);
         assert(term2 > term1);
         
         printf("  ✓ Majority elected new leader (node %d) in term %lu\n", 
@@ -255,7 +255,7 @@ static void test_overlapping_conflicting_logs(void) {
     assert(leader_idx >= 0);
     
     raft_node_t *leader1 = ctx->nodes[leader_idx];
-    uint64_t term1 = raft_get_current_term(leader1);
+    uint64_t term1 = raft_get_term(leader1);
     
     for (int i = 0; i < 4; i++) {
         char data[32];
@@ -287,7 +287,7 @@ static void test_overlapping_conflicting_logs(void) {
         }
     }
     
-    uint64_t term2 = leader2 ? raft_get_current_term(leader2) : term1 + 1;
+    uint64_t term2 = leader2 ? raft_get_term(leader2) : (term1 + 1);
     (void)term2;
     
     // Leader 2 appends fewer but conflicting entries

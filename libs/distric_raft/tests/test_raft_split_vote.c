@@ -90,7 +90,7 @@ static void test_basic_split_vote(void) {
     printf("  ✓ Election initiated (leader or candidates present)\n");
     
     // Track term before potential new election
-    uint64_t term_before = raft_get_current_term(ctx->nodes[0]);
+    uint64_t term_before = raft_get_term(ctx->nodes[0]);
     
     // Allow time for randomized timeouts to trigger election resolution
     uint64_t start = test_get_time_ms();
@@ -109,7 +109,7 @@ static void test_basic_split_vote(void) {
     
     assert(leader_elected);
     
-    uint64_t term_after = raft_get_current_term(ctx->nodes[0]);
+    uint64_t term_after = raft_get_term(ctx->nodes[0]);
     
     printf("  ✓ Leader eventually elected\n");
     printf("  ✓ Term progression: %lu → %lu\n", term_before, term_after);
@@ -154,12 +154,12 @@ static void test_three_way_split(void) {
     uint64_t start = test_get_time_ms();
     bool leader_elected = false;
     int election_rounds = 0;
-    uint64_t last_term = raft_get_current_term(ctx->nodes[0]);
+    uint64_t last_term = raft_get_term(ctx->nodes[0]);
     
     while (test_get_time_ms() - start < TEST_TIMEOUT_MS) {
         test_cluster_tick(ctx->cluster, 50);
         
-        uint64_t current_term = raft_get_current_term(ctx->nodes[0]);
+        uint64_t current_term = raft_get_term(ctx->nodes[0]);
         if (current_term > last_term) {
             election_rounds++;
             last_term = current_term;
@@ -255,7 +255,7 @@ static void test_repeated_split_votes(void) {
     while (test_get_time_ms() - start < TEST_TIMEOUT_MS) {
         test_cluster_tick(ctx->cluster, 50);
         
-        uint64_t current_term = raft_get_current_term(ctx->nodes[0]);
+        uint64_t current_term = raft_get_term(ctx->nodes[0]);
         
         // Count election rounds (term increases)
         if (current_term > last_term) {
@@ -284,7 +284,7 @@ static void test_repeated_split_votes(void) {
     
     assert(final_leaders == 1);
     printf("  ✓ Resolved with eventual leader election\n");
-    printf("  ✓ Final term: %lu\n", raft_get_current_term(ctx->nodes[0]));
+    printf("  ✓ Final term: %lu\n", raft_get_term(ctx->nodes[0]));
     
     teardown_test(ctx);
 }
@@ -315,7 +315,7 @@ static void test_term_monotonicity_split_vote(void) {
         
         // Record current terms
         for (int i = 0; i < NUM_NODES; i++) {
-            uint64_t current_term = raft_get_current_term(ctx->nodes[i]);
+            uint64_t current_term = raft_get_term(ctx->nodes[i]);
             
             int count = term_counts[i];
             if (count == 0 || terms[i][count - 1] != current_term) {
