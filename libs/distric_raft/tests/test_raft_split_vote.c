@@ -186,14 +186,9 @@ static void test_split_vote_with_delays(void) {
     
     printf("Test: Split vote with message delays\n");
     
-    // Enable network delays
-    test_cluster_set_message_delay(ctx->cluster, 10, 50);  // 10-50ms delay
-    
-    // Note: raft_set_election_timeout not implemented - using defaults
-    // Simultaneous candidate starts would be:
-    // for (int i = 0; i < NUM_NODES; i++) {
-    //     raft_set_election_timeout(ctx->nodes[i], 150, 150);
-    // }
+    for (size_t i = 0; i < ctx->cluster->num_nodes; i++) {
+        test_cluster_set_message_delay(ctx->cluster, i, 10, 50);
+    }
     
     test_cluster_start(ctx->cluster);
     test_cluster_tick(ctx->cluster, 150);
@@ -223,7 +218,9 @@ static void test_split_vote_with_delays(void) {
     printf("  ✓ Converged to single leader despite message delays\n");
     
     // Disable delays
-    test_cluster_set_message_delay(ctx->cluster, 0, 0);
+    for (int i = 0; i < ctx->cluster->num_nodes; i++) {
+        test_cluster_set_message_delay(ctx->cluster, i, 0, 0);
+    }
     
     teardown_test(ctx);
 }
@@ -238,14 +235,6 @@ static void test_repeated_split_votes(void) {
     
     uint64_t initial_term = 1;
     int split_vote_rounds = 0;
-    const int max_split_rounds = 10;
-    
-    // Note: raft_set_election_timeout not implemented
-    // Very similar timeouts would encourage splits:
-    // for (int i = 0; i < NUM_NODES; i++) {
-    //     int timeout = 150 + (i % 2) * 5;
-    //     raft_set_election_timeout(ctx->nodes[i], timeout, timeout);
-    // }
     
     test_cluster_start(ctx->cluster);
     
@@ -284,7 +273,7 @@ static void test_repeated_split_votes(void) {
     
     assert(final_leaders == 1);
     printf("  ✓ Resolved with eventual leader election\n");
-    printf("  ✓ Final term: %lu\n", raft_get_term(ctx->nodes[0]));
+    printf("  ✓ Final term: %u\n", raft_get_term(ctx->nodes[0]));
     
     teardown_test(ctx);
 }
