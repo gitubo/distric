@@ -12,6 +12,7 @@
 #include "worker_pool.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -55,8 +56,7 @@ struct cluster_coordinator_s {
  * FORWARD DECLARATIONS
  * ========================================================================= */
 
-static void on_raft_became_leader(raft_node_t* raft, void* userdata);
-static void on_raft_became_follower(raft_node_t* raft, void* userdata);
+static void on_raft_state_change(raft_state_t old_state, raft_state_t new_state, void* userdata);
 static void on_gossip_node_joined(const gossip_node_info_t* node, void* userdata);
 static void on_gossip_node_suspected(const gossip_node_info_t* node, void* userdata);
 static void on_gossip_node_failed(const gossip_node_info_t* node, void* userdata);
@@ -103,8 +103,8 @@ distric_err_t cluster_coordinator_create(
         .protocol_period_ms = config->gossip_interval_ms > 0 ?
                              config->gossip_interval_ms : 1000,
         .probe_timeout_ms = 500,
-        .indirect_probe_count = 3,
-        .suspicion_multiplier = 3,
+        .indirect_probes = 3,
+        .suspicion_mult = 3,
         .max_transmissions = 3,
         .metrics = config->metrics,
         .logger = config->logger
@@ -113,7 +113,7 @@ distric_err_t cluster_coordinator_create(
     strncpy(gossip_cfg.node_id, config->node_id, sizeof(gossip_cfg.node_id) - 1);
     strncpy(gossip_cfg.bind_address, config->bind_address, sizeof(gossip_cfg.bind_address) - 1);
     
-    distric_err_t err = gossip_create(&gossip_cfg, &coord->gossip);
+    distric_err_t err = gossip_init(&gossip_cfg, &coord->gossip);
     if (err != DISTRIC_OK) {
         if (coord->logger) {
             LOG_ERROR(coord->logger, "cluster", "Failed to create gossip", NULL);
@@ -152,14 +152,14 @@ distric_err_t cluster_coordinator_create(
             .peers = NULL,
             .peer_count = 0,
             .apply_fn = NULL,  /* TODO: Implement state machine */
-            .apply_userdata = NULL,
+            .state_change_fn = on_raft_state_change,
+            .user_data = coord,
             .metrics = config->metrics,
             .logger = config->logger,
-            .storage_path = ""
+            .persistence_data_dir = (strlen(config->storage_path) > 0) ? config->storage_path : NULL
         };
         
         strncpy(raft_cfg.node_id, config->node_id, sizeof(raft_cfg.node_id) - 1);
-        strncpy(raft_cfg.storage_path, config->storage_path, sizeof(raft_cfg.storage_path) - 1);
         
         /* Parse Raft peers */
         raft_peer_t* peers = NULL;
@@ -202,12 +202,6 @@ distric_err_t cluster_coordinator_create(
             free(coord);
             return err;
         }
-        
-        /* Set Raft callbacks */
-        raft_set_leadership_callbacks(coord->raft,
-                                     on_raft_became_leader,
-                                     on_raft_became_follower,
-                                     coord);
         
         /* Create worker pool (leaders use this) */
         err = worker_pool_create(config->metrics, config->logger, &coord->worker_pool);
@@ -354,48 +348,45 @@ void cluster_coordinator_destroy(cluster_coordinator_t* coord) {
  * RAFT CALLBACKS
  * ========================================================================= */
 
-static void on_raft_became_leader(raft_node_t* raft, void* userdata) {
-    (void)raft;
+static void on_raft_state_change(raft_state_t old_state, raft_state_t new_state, void* userdata) {
     cluster_coordinator_t* coord = (cluster_coordinator_t*)userdata;
     
-    pthread_mutex_lock(&coord->leadership_lock);
-    coord->is_leader = true;
-    pthread_mutex_unlock(&coord->leadership_lock);
-    
-    if (coord->logger) {
-        LOG_INFO(coord->logger, "cluster", "Became Raft leader", NULL);
+    /* Handle transition to leader */
+    if (new_state == RAFT_STATE_LEADER && old_state != RAFT_STATE_LEADER) {
+        pthread_mutex_lock(&coord->leadership_lock);
+        coord->is_leader = true;
+        pthread_mutex_unlock(&coord->leadership_lock);
+        
+        if (coord->logger) {
+            LOG_INFO(coord->logger, "cluster", "Became Raft leader", NULL);
+        }
+        
+        if (coord->is_leader_metric) {
+            metrics_gauge_set(coord->is_leader_metric, 1.0);
+        }
+        
+        if (coord->on_became_leader) {
+            coord->on_became_leader(coord, coord->leadership_callback_data);
+        }
     }
     
-    if (coord->is_leader_metric) {
-        metrics_gauge_set(coord->is_leader_metric, 1);
-    }
-    
-    /* Invoke user callback */
-    if (coord->on_became_leader) {
-        coord->on_became_leader(coord, coord->leadership_callback_data);
-    }
-}
-
-static void on_raft_became_follower(raft_node_t* raft, void* userdata) {
-    (void)raft;
-    cluster_coordinator_t* coord = (cluster_coordinator_t*)userdata;
-    
-    pthread_mutex_lock(&coord->leadership_lock);
-    bool was_leader = coord->is_leader;
-    coord->is_leader = false;
-    pthread_mutex_unlock(&coord->leadership_lock);
-    
-    if (coord->logger) {
-        LOG_INFO(coord->logger, "cluster", "Lost Raft leadership", NULL);
-    }
-    
-    if (coord->is_leader_metric) {
-        metrics_gauge_set(coord->is_leader_metric, 0);
-    }
-    
-    /* Invoke user callback */
-    if (was_leader && coord->on_lost_leadership) {
-        coord->on_lost_leadership(coord, coord->leadership_callback_data);
+    /* Handle transition from leader */
+    if (old_state == RAFT_STATE_LEADER && new_state != RAFT_STATE_LEADER) {
+        pthread_mutex_lock(&coord->leadership_lock);
+        coord->is_leader = false;
+        pthread_mutex_unlock(&coord->leadership_lock);
+        
+        if (coord->logger) {
+            LOG_INFO(coord->logger, "cluster", "Lost Raft leadership", NULL);
+        }
+        
+        if (coord->is_leader_metric) {
+            metrics_gauge_set(coord->is_leader_metric, 0.0);
+        }
+        
+        if (coord->on_lost_leadership) {
+            coord->on_lost_leadership(coord, coord->leadership_callback_data);
+        }
     }
 }
 
@@ -407,27 +398,41 @@ static void on_gossip_node_joined(const gossip_node_info_t* node, void* userdata
     cluster_coordinator_t* coord = (cluster_coordinator_t*)userdata;
     
     if (coord->logger) {
-        LOG_INFO(coord->logger, "cluster", "Node joined via gossip",
+        LOG_INFO(coord->logger, "cluster", "Node joined cluster",
                 "node_id", node->node_id,
                 "role", gossip_role_to_string(node->role),
                 NULL);
     }
     
-    /* Update worker pool if this is a worker */
-    if (node->role == GOSSIP_ROLE_WORKER && coord->worker_pool) {
-        worker_pool_update_from_gossip(coord->worker_pool, node);
+    /* Update metrics */
+    if (node->role == GOSSIP_ROLE_COORDINATOR && coord->coordinator_count_metric) {
+        size_t count = 0;
+        gossip_get_node_count(coord->gossip, GOSSIP_NODE_ALIVE, &count);
+        metrics_gauge_set(coord->coordinator_count_metric, (double)count);
+    } else if (node->role == GOSSIP_ROLE_WORKER && coord->worker_count_metric) {
+        gossip_node_info_t* workers = NULL;
+        size_t worker_count = 0;
+        gossip_get_nodes_by_role(coord->gossip, GOSSIP_ROLE_WORKER, &workers, &worker_count);
+        metrics_gauge_set(coord->worker_count_metric, (double)worker_count);
+        free(workers);
+    }
+    
+    /* Add worker to pool if we're a coordinator and node is a worker */
+    if (coord->worker_pool && node->role == GOSSIP_ROLE_WORKER) {
+        worker_pool_add_worker(coord->worker_pool, node->node_id,
+                              node->address, node->port, 100);  /* max_tasks from gossip metadata */
         
-        /* Invoke user callback */
         if (coord->on_worker_joined) {
-            cluster_node_t worker_node;
-            memset(&worker_node, 0, sizeof(worker_node));
-            strncpy(worker_node.node_id, node->node_id, sizeof(worker_node.node_id) - 1);
-            strncpy(worker_node.address, node->address, sizeof(worker_node.address) - 1);
-            worker_node.gossip_port = node->port;
-            worker_node.node_type = CLUSTER_NODE_WORKER;
-            worker_node.gossip_status = node->status;
+            cluster_node_t cluster_node;
+            strncpy(cluster_node.node_id, node->node_id, sizeof(cluster_node.node_id) - 1);
+            strncpy(cluster_node.address, node->address, sizeof(cluster_node.address) - 1);
+            cluster_node.gossip_port = node->port;
+            cluster_node.node_type = CLUSTER_NODE_WORKER;
+            cluster_node.gossip_status = node->status;
+            cluster_node.last_seen_ms = node->last_seen_ms;
+            cluster_node.load = node->load;
             
-            coord->on_worker_joined(coord, &worker_node, coord->worker_callback_data);
+            coord->on_worker_joined(coord, &cluster_node, coord->worker_callback_data);
         }
     }
 }
@@ -436,14 +441,15 @@ static void on_gossip_node_suspected(const gossip_node_info_t* node, void* userd
     cluster_coordinator_t* coord = (cluster_coordinator_t*)userdata;
     
     if (coord->logger) {
-        LOG_WARN(coord->logger, "cluster", "Node suspected via gossip",
+        LOG_WARN(coord->logger, "cluster", "Node suspected",
                 "node_id", node->node_id,
+                "role", gossip_role_to_string(node->role),
                 NULL);
     }
     
-    /* Update worker pool */
-    if (node->role == GOSSIP_ROLE_WORKER && coord->worker_pool) {
-        worker_pool_update_from_gossip(coord->worker_pool, node);
+    /* Mark worker as unhealthy in pool */
+    if (coord->worker_pool && node->role == GOSSIP_ROLE_WORKER) {
+        worker_pool_mark_worker_unhealthy(coord->worker_pool, node->node_id);
     }
 }
 
@@ -451,27 +457,40 @@ static void on_gossip_node_failed(const gossip_node_info_t* node, void* userdata
     cluster_coordinator_t* coord = (cluster_coordinator_t*)userdata;
     
     if (coord->logger) {
-        LOG_ERROR(coord->logger, "cluster", "Node failed via gossip",
-                 "node_id", node->node_id,
-                 "role", gossip_role_to_string(node->role),
-                 NULL);
+        LOG_ERROR(coord->logger, "cluster", "Node failed",
+                "node_id", node->node_id,
+                "role", gossip_role_to_string(node->role),
+                NULL);
     }
     
-    /* Update worker pool if this is a worker */
-    if (node->role == GOSSIP_ROLE_WORKER && coord->worker_pool) {
-        worker_pool_mark_failed(coord->worker_pool, node->node_id);
+    /* Update metrics */
+    if (node->role == GOSSIP_ROLE_COORDINATOR && coord->coordinator_count_metric) {
+        size_t count = 0;
+        gossip_get_node_count(coord->gossip, GOSSIP_NODE_ALIVE, &count);
+        metrics_gauge_set(coord->coordinator_count_metric, (double)count);
+    } else if (node->role == GOSSIP_ROLE_WORKER && coord->worker_count_metric) {
+        gossip_node_info_t* workers = NULL;
+        size_t worker_count = 0;
+        gossip_get_nodes_by_role(coord->gossip, GOSSIP_ROLE_WORKER, &workers, &worker_count);
+        metrics_gauge_set(coord->worker_count_metric, (double)worker_count);
+        free(workers);
+    }
+    
+    /* Remove worker from pool if we're a coordinator */
+    if (coord->worker_pool && node->role == GOSSIP_ROLE_WORKER) {
+        worker_pool_remove_worker(coord->worker_pool, node->node_id);
         
-        /* Invoke user callback */
         if (coord->on_worker_failed) {
-            cluster_node_t worker_node;
-            memset(&worker_node, 0, sizeof(worker_node));
-            strncpy(worker_node.node_id, node->node_id, sizeof(worker_node.node_id) - 1);
-            strncpy(worker_node.address, node->address, sizeof(worker_node.address) - 1);
-            worker_node.gossip_port = node->port;
-            worker_node.node_type = CLUSTER_NODE_WORKER;
-            worker_node.gossip_status = GOSSIP_NODE_FAILED;
+            cluster_node_t cluster_node;
+            strncpy(cluster_node.node_id, node->node_id, sizeof(cluster_node.node_id) - 1);
+            strncpy(cluster_node.address, node->address, sizeof(cluster_node.address) - 1);
+            cluster_node.gossip_port = node->port;
+            cluster_node.node_type = CLUSTER_NODE_WORKER;
+            cluster_node.gossip_status = node->status;
+            cluster_node.last_seen_ms = node->last_seen_ms;
+            cluster_node.load = node->load;
             
-            coord->on_worker_failed(coord, &worker_node, coord->worker_callback_data);
+            coord->on_worker_failed(coord, &cluster_node, coord->worker_callback_data);
         }
     }
 }
@@ -480,193 +499,20 @@ static void on_gossip_node_recovered(const gossip_node_info_t* node, void* userd
     cluster_coordinator_t* coord = (cluster_coordinator_t*)userdata;
     
     if (coord->logger) {
-        LOG_INFO(coord->logger, "cluster", "Node recovered via gossip",
+        LOG_INFO(coord->logger, "cluster", "Node recovered",
                 "node_id", node->node_id,
+                "role", gossip_role_to_string(node->role),
                 NULL);
     }
     
-    /* Update worker pool */
-    if (node->role == GOSSIP_ROLE_WORKER && coord->worker_pool) {
-        worker_pool_update_from_gossip(coord->worker_pool, node);
+    /* Mark worker as healthy in pool */
+    if (coord->worker_pool && node->role == GOSSIP_ROLE_WORKER) {
+        worker_pool_mark_worker_healthy(coord->worker_pool, node->node_id);
     }
 }
 
 /* ============================================================================
- * STATE QUERIES
- * ========================================================================= */
-
-distric_err_t cluster_coordinator_get_state(
-    const cluster_coordinator_t* coord,
-    cluster_state_t* state_out
-) {
-    if (!coord || !state_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    *state_out = coord->state;
-    return DISTRIC_OK;
-}
-
-distric_err_t cluster_coordinator_is_leader(
-    const cluster_coordinator_t* coord,
-    bool* is_leader_out
-) {
-    if (!coord || !is_leader_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    if (!coord->raft) {
-        return DISTRIC_ERR_INVALID_STATE;  /* Not a coordinator */
-    }
-    
-    pthread_mutex_lock((pthread_mutex_t*)&coord->leadership_lock);
-    *is_leader_out = coord->is_leader;
-    pthread_mutex_unlock((pthread_mutex_t*)&coord->leadership_lock);
-    
-    return DISTRIC_OK;
-}
-
-distric_err_t cluster_coordinator_get_leader_id(
-    const cluster_coordinator_t* coord,
-    char* leader_id_out,
-    size_t buffer_size
-) {
-    if (!coord || !leader_id_out || buffer_size == 0) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    if (!coord->raft) {
-        return DISTRIC_ERR_INVALID_STATE;
-    }
-    
-    /* TODO: Implement raft_get_leader_id() */
-    snprintf(leader_id_out, buffer_size, "unknown");
-    
-    return DISTRIC_OK;
-}
-
-distric_err_t cluster_coordinator_get_node_count(
-    const cluster_coordinator_t* coord,
-    cluster_node_type_t node_type,
-    size_t* count_out
-) {
-    if (!coord || !count_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    /* Query from gossip */
-    size_t total_count = 0;
-    gossip_get_node_count(coord->gossip, (gossip_node_status_t)-1, &total_count);
-    
-    /* TODO: Filter by node type using gossip role */
-    *count_out = total_count;
-    
-    return DISTRIC_OK;
-}
-
-distric_err_t cluster_coordinator_get_alive_workers(
-    const cluster_coordinator_t* coord,
-    cluster_node_t** workers_out,
-    size_t* count_out
-) {
-    if (!coord || !workers_out || !count_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    if (!coord->worker_pool) {
-        *workers_out = NULL;
-        *count_out = 0;
-        return DISTRIC_OK;
-    }
-    
-    worker_info_t* workers = NULL;
-    size_t count = 0;
-    
-    distric_err_t err = worker_pool_get_all_workers(coord->worker_pool, &workers, &count);
-    if (err != DISTRIC_OK) {
-        return err;
-    }
-    
-    /* Convert to cluster_node_t */
-    cluster_node_t* cluster_nodes = calloc(count, sizeof(cluster_node_t));
-    if (!cluster_nodes && count > 0) {
-        free(workers);
-        return DISTRIC_ERR_NO_MEMORY;
-    }
-    
-    for (size_t i = 0; i < count; i++) {
-        strncpy(cluster_nodes[i].node_id, workers[i].worker_id,
-                sizeof(cluster_nodes[i].node_id) - 1);
-        strncpy(cluster_nodes[i].address, workers[i].address,
-                sizeof(cluster_nodes[i].address) - 1);
-        cluster_nodes[i].gossip_port = workers[i].port;
-        cluster_nodes[i].node_type = CLUSTER_NODE_WORKER;
-        cluster_nodes[i].gossip_status = workers[i].status;
-        cluster_nodes[i].last_seen_ms = workers[i].last_seen_ms;
-        cluster_nodes[i].load = workers[i].current_task_count;
-        cluster_nodes[i].max_concurrent_tasks = workers[i].max_concurrent_tasks;
-    }
-    
-    free(workers);
-    *workers_out = cluster_nodes;
-    *count_out = count;
-    
-    return DISTRIC_OK;
-}
-
-/* ============================================================================
- * WORKER MANAGEMENT
- * ========================================================================= */
-
-distric_err_t cluster_coordinator_select_worker(
-    cluster_coordinator_t* coord,
-    char* worker_id_out,
-    size_t buffer_size
-) {
-    if (!coord || !worker_id_out || buffer_size == 0) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    if (!coord->is_leader) {
-        return DISTRIC_ERR_INVALID_STATE;
-    }
-    
-    if (!coord->worker_pool) {
-        return DISTRIC_ERR_INVALID_STATE;
-    }
-    
-    const worker_info_t* worker = NULL;
-    distric_err_t err = worker_pool_get_available(coord->worker_pool,
-                                                  WORKER_SELECT_LEAST_LOADED,
-                                                  &worker);
-    if (err != DISTRIC_OK) {
-        return err;
-    }
-    
-    strncpy(worker_id_out, worker->worker_id, buffer_size - 1);
-    worker_id_out[buffer_size - 1] = '\0';
-    
-    return DISTRIC_OK;
-}
-
-distric_err_t cluster_coordinator_update_worker_load(
-    cluster_coordinator_t* coord,
-    const char* worker_id,
-    int32_t load_delta
-) {
-    if (!coord || !worker_id) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    if (!coord->worker_pool) {
-        return DISTRIC_ERR_INVALID_STATE;
-    }
-    
-    return worker_pool_update_task_count(coord->worker_pool, worker_id, load_delta);
-}
-
-/* ============================================================================
- * CALLBACKS
+ * CALLBACK REGISTRATION
  * ========================================================================= */
 
 distric_err_t cluster_coordinator_set_leadership_callbacks(
@@ -704,17 +550,67 @@ distric_err_t cluster_coordinator_set_worker_callbacks(
 }
 
 /* ============================================================================
+ * CLUSTER STATE QUERIES
+ * ========================================================================= */
+
+cluster_state_t cluster_coordinator_get_state(const cluster_coordinator_t* coord) {
+    if (!coord) {
+        return CLUSTER_STATE_ERROR;
+    }
+    
+    return coord->state;
+}
+
+bool cluster_coordinator_is_leader(const cluster_coordinator_t* coord) {
+    if (!coord || !coord->raft) {
+        return false;
+    }
+    
+    return raft_is_leader(coord->raft);
+}
+
+distric_err_t cluster_coordinator_get_leader_id(
+    const cluster_coordinator_t* coord,
+    char* leader_id_out,
+    size_t buffer_size
+) {
+    if (!coord || !leader_id_out || buffer_size == 0) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    if (!coord->raft) {
+        snprintf(leader_id_out, buffer_size, "unknown");
+        return DISTRIC_ERR_INVALID_STATE;
+    }
+    
+    return raft_get_leader(coord->raft, leader_id_out);
+}
+
+distric_err_t cluster_coordinator_get_node_count(
+    const cluster_coordinator_t* coord,
+    cluster_node_type_t node_type __attribute__((unused)),
+    size_t* count_out
+) {
+    if (!coord || !count_out) {
+        return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    /* For now, return total node count from gossip */
+    return gossip_get_node_count(coord->gossip, GOSSIP_NODE_ALIVE, count_out);
+}
+
+/* ============================================================================
  * UTILITY FUNCTIONS
  * ========================================================================= */
 
 const char* cluster_state_to_string(cluster_state_t state) {
     switch (state) {
-        case CLUSTER_STATE_STOPPED:  return "STOPPED";
-        case CLUSTER_STATE_STARTING: return "STARTING";
-        case CLUSTER_STATE_RUNNING:  return "RUNNING";
-        case CLUSTER_STATE_STOPPING: return "STOPPING";
-        case CLUSTER_STATE_ERROR:    return "ERROR";
-        default:                     return "UNKNOWN";
+        case CLUSTER_STATE_STOPPED:   return "STOPPED";
+        case CLUSTER_STATE_STARTING:  return "STARTING";
+        case CLUSTER_STATE_RUNNING:   return "RUNNING";
+        case CLUSTER_STATE_STOPPING:  return "STOPPING";
+        case CLUSTER_STATE_ERROR:     return "ERROR";
+        default:                      return "UNKNOWN";
     }
 }
 
