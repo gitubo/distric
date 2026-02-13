@@ -26,3 +26,6 @@ add_subdirectory(libs/distric_raft)
 
 # Add gossip library
 add_subdirectory(libs/distric_gossip)
+
+# Add cluster library
+add_subdirectory(libs/distric_cluster)

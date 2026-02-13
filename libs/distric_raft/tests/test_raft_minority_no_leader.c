@@ -297,7 +297,6 @@ static void test_vote_counting_in_minority(void) {
         // Note: raft_get_vote_count() not implemented
         // In 2-node minority, candidate can get at most 2 votes
         // Need 3 votes for majority in 5-node cluster
-        int votes = 1; // Stub: assume self-vote only
         int needed = (NUM_NODES / 2) + 1;
         
         printf("  Candidate %d has insufficient votes (need %d for majority)\n",

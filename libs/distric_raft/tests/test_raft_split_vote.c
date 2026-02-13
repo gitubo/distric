@@ -218,7 +218,7 @@ static void test_split_vote_with_delays(void) {
     printf("  ✓ Converged to single leader despite message delays\n");
     
     // Disable delays
-    for (int i = 0; i < ctx->cluster->num_nodes; i++) {
+    for (size_t i = 0; i < ctx->cluster->num_nodes; i++) {
         test_cluster_set_message_delay(ctx->cluster, i, 0, 0);
     }
     

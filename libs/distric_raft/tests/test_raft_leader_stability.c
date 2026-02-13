@@ -242,8 +242,10 @@ static void test_stability_with_occasional_lost_heartbeats(void) {
     
     printf("Test: Stability with occasional lost heartbeats\n");
     
-    // Enable 5% message loss
-    test_cluster_set_message_loss(ctx->cluster, 0.05);
+    // Enable 5% message loss on all nodes
+    for (int i = 0; i < NUM_NODES; i++) {
+        test_cluster_set_message_loss_rate(ctx->cluster, i, 0.05);
+    }
     
     uint64_t test_duration = 3000;
     uint64_t start = test_get_time_ms();
@@ -262,8 +264,10 @@ static void test_stability_with_occasional_lost_heartbeats(void) {
         }
     }
     
-    // Disable message loss
-    test_cluster_set_message_loss(ctx->cluster, 0.0);
+    // Disable message loss on all nodes
+    for (int i = 0; i < NUM_NODES; i++) {
+        test_cluster_set_message_loss_rate(ctx->cluster, i, 0.0);
+    }
     
     printf("  ✓ Cluster remained stable despite 5%% message loss\n");
     printf("  ✓ Heartbeats sufficient to prevent elections\n");
