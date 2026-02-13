@@ -1,116 +1,70 @@
 cmake_minimum_required(VERSION 3.15)
-project(distric_cluster C)
 
+# Library: distric_cluster
+project(distric_cluster VERSION 1.0.0 LANGUAGES C)
+
+# Set C11 standard with GNU extensions
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS ON)
+
+# Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic -Werror")
 
+# Find dependencies
+find_package(Threads REQUIRED)
+
+# Source files
+set(CLUSTER_SOURCES
+    src/cluster_coordinator.c
+    src/worker_pool.c
+)
+
+# Create library
+add_library(distric_cluster STATIC ${CLUSTER_SOURCES})
+
+# Set C11 properties explicitly with GNU extensions
+set_target_properties(distric_cluster PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    C_EXTENSIONS ON
+)
+
 # Include directories
-include_directories(
-    ${PROJECT_SOURCE_DIR}
-    ${PROJECT_SOURCE_DIR}/libs/distric_cluster/include
-    ${PROJECT_SOURCE_DIR}/libs/distric_obs/include
-    ${PROJECT_SOURCE_DIR}/libs/distric_raft/include
-    ${PROJECT_SOURCE_DIR}/libs/distric_gossip/include
-    ${PROJECT_SOURCE_DIR}/libs/distric_common/include
+target_include_directories(distric_cluster
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/distric_cluster
 )
 
-# ============================================================================
-# CLUSTER LIBRARY
-# ============================================================================
-
-add_library(distric_cluster STATIC
-    cluster_coordinator.c
-    worker_pool.c
-)
-
+# Link dependencies
+# Cluster depends on raft, gossip, and observability layers
 target_link_libraries(distric_cluster
-    distric_raft
-    distric_gossip
-    distric_obs
-    pthread
+    PUBLIC
+        distric_raft
+        distric_gossip
+        distric_obs
+        Threads::Threads
 )
 
-# ============================================================================
-# TESTS
-# ============================================================================
-
-# Integration tests
-add_executable(test_cluster_integration
-    test_cluster_integration.c
-)
-
-target_link_libraries(test_cluster_integration
-    distric_cluster
-    distric_raft
-    distric_gossip
-    distric_obs
-    pthread
-)
-
-# Enable testing
-enable_testing()
-add_test(NAME cluster_integration_tests COMMAND test_cluster_integration)
-
-# ============================================================================
-# INSTALLATION
-# ============================================================================
-
-# Install headers
-install(FILES distric_cluster.h
-        DESTINATION include/)
-
-install(FILES worker_pool.h
-        DESTINATION include/distric_cluster/)
-
-# Install library
-install(TARGETS distric_cluster
-        ARCHIVE DESTINATION lib)
-
-# ============================================================================
-# DOCUMENTATION
-# ============================================================================
-
-find_package(Doxygen)
-if(DOXYGEN_FOUND)
-    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in 
-                   ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile @ONLY)
-    add_custom_target(doc_cluster
-        ${DOXYGEN_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile
-        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-        COMMENT "Generating API documentation for distric_cluster"
-    )
+# Add tests
+if(BUILD_TESTING)
+    add_subdirectory(tests)
 endif()
 
-# ============================================================================
-# EXAMPLES
-# ============================================================================
-
-# Example: Simple coordinator node
-add_executable(example_coordinator
-    examples/coordinator_node.c
+# Installation
+install(TARGETS distric_cluster
+    EXPORT distric_cluster-targets
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+    INCLUDES DESTINATION include
 )
 
-target_link_libraries(example_coordinator
-    distric_cluster
-    distric_raft
-    distric_gossip
-    distric_obs
-    pthread
+install(DIRECTORY include/
+    DESTINATION include
+    FILES_MATCHING PATTERN "*.h"
 )
-
-# Example: Simple worker node
-add_executable(example_worker
-    examples/worker_node.c
-)
-
-target_link_libraries(example_worker
-    distric_cluster
-    distric_gossip
-    distric_obs
-    pthread
-)
-
-# Install examples
-install(TARGETS example_coordinator example_worker
-        RUNTIME DESTINATION bin/examples)

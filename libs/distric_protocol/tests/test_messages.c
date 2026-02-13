@@ -376,7 +376,7 @@ void test_gossip_membership_update() {
     TEST_START();
     
     /* Create node updates */
-    gossip_node_info_t updates[3];
+    gossip_node_info_wire_t updates[3];
     
     strncpy(updates[0].node_id, "node-1", sizeof(updates[0].node_id) - 1);
     strncpy(updates[0].address, "10.0.1.1", sizeof(updates[0].address) - 1);

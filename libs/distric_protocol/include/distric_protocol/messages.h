@@ -287,7 +287,7 @@ typedef struct {
     uint64_t incarnation;
     uint8_t cpu_usage;
     uint8_t memory_usage;
-} gossip_node_info_t;
+} gossip_node_info_wire_t;
 
 /**
  * @brief Gossip Ping - WIRE FORMAT
@@ -321,7 +321,7 @@ typedef struct {
  */
 typedef struct {
     char sender_id[64];
-    gossip_node_info_t* updates;
+    gossip_node_info_wire_t* updates;
     size_t update_count;
 } gossip_membership_update_t;
 

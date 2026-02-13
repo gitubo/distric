@@ -931,7 +931,7 @@ distric_err_t serialize_gossip_membership_update(
     /* Encode each node update */
     if (msg->updates && msg->update_count > 0) {
         for (size_t i = 0; i < msg->update_count; i++) {
-            const gossip_node_info_t* node = &msg->updates[i];
+            const gossip_node_info_wire_t* node = &msg->updates[i];
             
             /* Create sub-encoder for node info */
             tlv_encoder_t* node_enc = tlv_encoder_create(256);
@@ -976,7 +976,7 @@ distric_err_t deserialize_gossip_membership_update(
     
     memset(msg_out, 0, sizeof(gossip_membership_update_t));
     
-    gossip_node_info_t* updates = NULL;
+    gossip_node_info_wire_t* updates = NULL;
     size_t update_count = 0;
     size_t update_capacity = 0;
     
@@ -1004,8 +1004,8 @@ distric_err_t deserialize_gossip_membership_update(
                     /* Grow array if needed */
                     if (update_count >= update_capacity) {
                         update_capacity = update_capacity == 0 ? 4 : update_capacity * 2;
-                        gossip_node_info_t* new_updates = (gossip_node_info_t*)realloc(
-                            updates, update_capacity * sizeof(gossip_node_info_t));
+                        gossip_node_info_wire_t* new_updates = (gossip_node_info_wire_t*)realloc(
+                            updates, update_capacity * sizeof(gossip_node_info_wire_t));
                         if (!new_updates) {
                             free(updates);
                             tlv_decoder_free(dec);
@@ -1014,8 +1014,8 @@ distric_err_t deserialize_gossip_membership_update(
                         updates = new_updates;
                     }
                     
-                    gossip_node_info_t* node = &updates[update_count];
-                    memset(node, 0, sizeof(gossip_node_info_t));
+                    gossip_node_info_wire_t* node = &updates[update_count];
+                    memset(node, 0, sizeof(gossip_node_info_wire_t));
                     
                     /* Decode node fields */
                     tlv_decoder_t* node_dec = tlv_decoder_create(node_data, node_data_len);
