@@ -273,6 +273,40 @@ const char* worker_selection_strategy_to_string(
     worker_selection_strategy_t strategy
 );
 
+/**
+ * Add a new worker to the pool
+ */
+distric_err_t worker_pool_add_worker(
+    worker_pool_t* pool,
+    const char* worker_id,
+    const char* address,
+    uint16_t port
+);
+
+/**
+ * Mark a worker as unhealthy (suspected failure)
+ */
+distric_err_t worker_pool_mark_worker_unhealthy(
+    worker_pool_t* pool,
+    const char* worker_id
+);
+
+/**
+ * Remove a worker from the pool (permanent failure)
+ */
+distric_err_t worker_pool_remove_worker(
+    worker_pool_t* pool,
+    const char* worker_id
+);
+
+/**
+ * Mark a worker as healthy (recovered from failure)
+ */
+distric_err_t worker_pool_mark_worker_healthy(
+    worker_pool_t* pool,
+    const char* worker_id
+);
+
 #ifdef __cplusplus
 }
 #endif

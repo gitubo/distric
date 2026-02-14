@@ -9,7 +9,7 @@
  */
 
 #include "distric_cluster.h"
-#include "worker_pool.h"
+#include "distric_cluster/worker_pool.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -420,7 +420,8 @@ static void on_gossip_node_joined(const gossip_node_info_t* node, void* userdata
     /* Add worker to pool if we're a coordinator and node is a worker */
     if (coord->worker_pool && node->role == GOSSIP_ROLE_WORKER) {
         worker_pool_add_worker(coord->worker_pool, node->node_id,
-                              node->address, node->port, 100);  /* max_tasks from gossip metadata */
+                                node->address, node->port);
+
         
         if (coord->on_worker_joined) {
             cluster_node_t cluster_node;
@@ -552,21 +553,30 @@ distric_err_t cluster_coordinator_set_worker_callbacks(
 /* ============================================================================
  * CLUSTER STATE QUERIES
  * ========================================================================= */
-
-cluster_state_t cluster_coordinator_get_state(const cluster_coordinator_t* coord) {
-    if (!coord) {
-        return CLUSTER_STATE_ERROR;
+distric_err_t cluster_coordinator_get_state(
+    const cluster_coordinator_t* coord,
+    cluster_state_t* out_state
+) {
+    if (!coord || !out_state) {
+        return DISTRIC_ERR_INVALID_ARG;
     }
     
-    return coord->state;
+    *out_state = coord->state;
+    
+    return 0;
 }
 
-bool cluster_coordinator_is_leader(const cluster_coordinator_t* coord) {
-    if (!coord || !coord->raft) {
-        return false;
+distric_err_t cluster_coordinator_is_leader(
+    const cluster_coordinator_t* coord,
+    bool* out_is_leader
+) {
+    if (!coord || !out_is_leader) {
+        return DISTRIC_ERR_INVALID_ARG;
     }
     
-    return raft_is_leader(coord->raft);
+    *out_is_leader = raft_is_leader(coord->raft);
+    
+    return 0;
 }
 
 distric_err_t cluster_coordinator_get_leader_id(
