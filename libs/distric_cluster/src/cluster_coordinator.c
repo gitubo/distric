@@ -10,6 +10,7 @@
 
 #include "distric_cluster.h"
 #include "distric_cluster/worker_pool.h"
+#include "distric_cluster/cluster_coordinator.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
