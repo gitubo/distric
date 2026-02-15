@@ -394,3 +394,10 @@ int cluster_coordinator_set_worker_strategy(
     
     return worker_pool_set_strategy(coordinator->worker_pool, strategy);
 }
+/* ============================================================================
+ * UTILITY FUNCTIONS
+ * ========================================================================= */
+
+const char* distric_cluster_version(void) {
+    return "1.0.0";
+}

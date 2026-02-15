@@ -540,3 +540,23 @@ int worker_pool_get_strategy(
     
     return 0;
 }
+/* ============================================================================
+ * UTILITY FUNCTIONS
+ * ========================================================================= */
+
+const char* worker_selection_strategy_to_string(
+    worker_selection_strategy_t strategy
+) {
+    switch (strategy) {
+        case WORKER_SELECT_ROUND_ROBIN:
+            return "ROUND_ROBIN";
+        case WORKER_SELECT_LEAST_LOADED:
+            return "LEAST_LOADED";
+        case WORKER_SELECT_LEAST_UTILIZED:
+            return "LEAST_UTILIZED";
+        case WORKER_SELECT_RANDOM:
+            return "RANDOM";
+        default:
+            return "UNKNOWN";
+    }
+}

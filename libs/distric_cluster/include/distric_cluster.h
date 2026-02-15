@@ -297,6 +297,13 @@ const char* cluster_state_to_string(cluster_state_t state);
  */
 const char* cluster_node_type_to_string(cluster_node_type_t type);
 
+/**
+ * Get the library version string
+ * 
+ * @return Version string in format "MAJOR.MINOR.PATCH" (e.g., "1.0.0")
+ */
+const char* distric_cluster_version(void);
+
 #ifdef __cplusplus
 }
 #endif

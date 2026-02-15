@@ -158,7 +158,7 @@ int worker_pool_update_task_count(
  * 
  * @param pool Worker pool
  * @param status Status filter
- * @param workers_out Output array of worker pointers (read-only)
+ * @param workers_out Output array of worker pointers (caller must free)
  * @param count_out Number of workers returned
  * @return 0 on success, -1 on error
  */
@@ -217,6 +217,20 @@ int worker_pool_set_strategy(
 int worker_pool_get_strategy(
     worker_pool_t* pool,
     worker_selection_strategy_t* strategy
+);
+
+/* ====================================================================
+ * Utility Functions
+ * ==================================================================== */
+
+/**
+ * Convert worker selection strategy enum to string
+ * 
+ * @param strategy Worker selection strategy
+ * @return String representation of the strategy
+ */
+const char* worker_selection_strategy_to_string(
+    worker_selection_strategy_t strategy
 );
 
 #ifdef __cplusplus
