@@ -1,92 +1,226 @@
-#ifndef WORKER_POOL_H
-#define WORKER_POOL_H
+#ifndef DISTRIC_CLUSTER_WORKER_POOL_H
+#define DISTRIC_CLUSTER_WORKER_POOL_H
 
-#include "distric_obs.h"
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include "distric_obs.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Forward declaration */
-typedef struct worker_pool_t worker_pool_t;
+/* Forward declarations */
+typedef struct worker_pool_s worker_pool_t;
+typedef struct gossip_node_info_s gossip_node_info_t;
+
+/* Gossip node status enumeration */
+typedef enum {
+    GOSSIP_NODE_ALIVE = 0,
+    GOSSIP_NODE_SUSPECT = 1,
+    GOSSIP_NODE_FAILED = 2,
+    GOSSIP_NODE_LEFT = 3
+} gossip_node_status_t;
+
+/* Gossip node role enumeration */
+typedef enum {
+    GOSSIP_ROLE_COORDINATOR = 0,
+    GOSSIP_ROLE_WORKER = 1,
+    GOSSIP_ROLE_MONITOR = 2
+} gossip_node_role_t;
+
+/* Worker selection strategy */
+typedef enum {
+    WORKER_SELECT_ROUND_ROBIN = 0,
+    WORKER_SELECT_LEAST_LOADED = 1,
+    WORKER_SELECT_LEAST_UTILIZED = 2,
+    WORKER_SELECT_RANDOM = 3
+} worker_selection_strategy_t;
+
+/* Worker information structure */
+typedef struct {
+    char worker_id[64];
+    char address[256];
+    uint16_t port;
+    
+    gossip_node_status_t status;
+    uint32_t incarnation;
+    
+    uint64_t joined_at_ms;
+    uint64_t last_seen_ms;
+    uint64_t last_task_assigned_ms;
+    
+    uint32_t max_concurrent_tasks;
+    uint32_t current_task_count;
+    uint32_t total_tasks_completed;
+    
+    double load_metric;
+    double utilization;
+} worker_info_t;
+
+/* Gossip node information structure */
+typedef struct gossip_node_info_s {
+    char node_id[64];
+    char address[256];
+    uint16_t port;
+    
+    gossip_node_role_t role;
+    gossip_node_status_t status;
+    uint32_t incarnation;
+    
+    double load;
+    uint64_t last_updated_ms;
+} gossip_node_info_t;
+
+/* Worker pool capacity statistics */
+typedef struct {
+    size_t total_workers;
+    size_t alive_workers;
+    uint32_t total_capacity;
+    uint32_t total_utilized;
+    double utilization_rate;
+    double average_load;
+} worker_pool_capacity_stats_t;
 
 /**
- * Create a worker pool
+ * Create a new worker pool
  * 
- * @param metrics Metrics registry for tracking pool metrics
- * @param logger Logger for pool operations
- * @param pool_out Output parameter for created pool
- * @return DISTRIC_OK on success, error code otherwise
+ * @param metrics Optional metrics registry
+ * @param logger Optional logger
+ * @return New worker pool instance or NULL on error
  */
-distric_err_t worker_pool_create(
+worker_pool_t* worker_pool_create(
     metrics_registry_t* metrics,
-    logger_t* logger,
-    worker_pool_t** pool_out
+    logger_t* logger
 );
 
 /**
  * Destroy a worker pool
  * 
- * @param pool The worker pool to destroy
+ * @param pool Worker pool to destroy
  */
 void worker_pool_destroy(worker_pool_t* pool);
 
 /**
- * Add a worker to the pool
+ * Update worker pool from gossip protocol information
  * 
- * @param pool The worker pool
- * @param node_id ID of the worker node
- * @param address Worker's network address
- * @param port Worker's network port
- * @return DISTRIC_OK on success, error code otherwise
+ * @param pool Worker pool
+ * @param node Gossip node information
+ * @return 0 on success, -1 on error
  */
-distric_err_t worker_pool_add_worker(
+int worker_pool_update_from_gossip(
     worker_pool_t* pool,
-    const char* node_id,
-    const char* address,
-    uint16_t port
+    const gossip_node_info_t* node
 );
 
 /**
- * Remove a worker from the pool
+ * Mark a worker as failed
  * 
- * @param pool The worker pool
- * @param node_id ID of the worker node to remove
- * @return DISTRIC_OK on success, error code otherwise
+ * @param pool Worker pool
+ * @param worker_id Worker identifier
+ * @return 0 on success, -1 on error
  */
-distric_err_t worker_pool_remove_worker(
+int worker_pool_mark_failed(
     worker_pool_t* pool,
-    const char* node_id
+    const char* worker_id
 );
 
 /**
- * Mark a worker as unhealthy
+ * Select a worker based on the configured strategy
  * 
- * @param pool The worker pool
- * @param node_id ID of the worker node
- * @return DISTRIC_OK on success, error code otherwise
+ * @param pool Worker pool
+ * @param strategy Selection strategy to use
+ * @param worker_out Output pointer for selected worker (read-only)
+ * @return 0 on success, -1 if no worker available
  */
-distric_err_t worker_pool_mark_worker_unhealthy(
+int worker_pool_select_worker(
     worker_pool_t* pool,
-    const char* node_id
+    worker_selection_strategy_t strategy,
+    const worker_info_t** worker_out
 );
 
 /**
- * Mark a worker as healthy
+ * Update task count for a specific worker
  * 
- * @param pool The worker pool
- * @param node_id ID of the worker node
- * @return DISTRIC_OK on success, error code otherwise
+ * @param pool Worker pool
+ * @param worker_id Worker identifier
+ * @param task_delta Change in task count (positive or negative)
+ * @return 0 on success, -1 on error
  */
-distric_err_t worker_pool_mark_worker_healthy(
+int worker_pool_update_task_count(
     worker_pool_t* pool,
-    const char* node_id
+    const char* worker_id,
+    int32_t task_delta
+);
+
+/**
+ * Get all workers matching a specific status
+ * 
+ * @param pool Worker pool
+ * @param status Status filter
+ * @param workers_out Output array of worker pointers (read-only)
+ * @param count_out Number of workers returned
+ * @return 0 on success, -1 on error
+ */
+int worker_pool_get_workers_by_status(
+    worker_pool_t* pool,
+    gossip_node_status_t status,
+    worker_info_t** workers_out,
+    size_t* count_out
+);
+
+/**
+ * Get information about a specific worker
+ * 
+ * @param pool Worker pool
+ * @param worker_id Worker identifier
+ * @param worker_out Output structure to fill
+ * @return 0 on success, -1 if worker not found
+ */
+int worker_pool_get_worker_info(
+    worker_pool_t* pool,
+    const char* worker_id,
+    worker_info_t* worker_out
+);
+
+/**
+ * Get capacity statistics for the worker pool
+ * 
+ * @param pool Worker pool
+ * @param stats_out Output structure for statistics
+ * @return 0 on success, -1 on error
+ */
+int worker_pool_get_capacity_stats(
+    worker_pool_t* pool,
+    worker_pool_capacity_stats_t* stats_out
+);
+
+/**
+ * Set the worker selection strategy
+ * 
+ * @param pool Worker pool
+ * @param strategy Strategy to use
+ * @return 0 on success, -1 on error
+ */
+int worker_pool_set_strategy(
+    worker_pool_t* pool,
+    worker_selection_strategy_t strategy
+);
+
+/**
+ * Get the current worker selection strategy
+ * 
+ * @param pool Worker pool
+ * @param strategy Output pointer for current strategy
+ * @return 0 on success, -1 on error
+ */
+int worker_pool_get_strategy(
+    worker_pool_t* pool,
+    worker_selection_strategy_t* strategy
 );
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* WORKER_POOL_H */
+#endif /* DISTRIC_CLUSTER_WORKER_POOL_H */

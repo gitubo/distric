@@ -1,25 +1,11 @@
-/**
- * @file worker_pool.c
- * @brief Worker Pool Management Implementation
- * 
- * Thread-safe worker pool with Gossip integration.
- * 
- * @version 1.0
- * @date 2026-02-12
- */
-
-#include "worker_pool.h"
+#include "distric_cluster/worker_pool.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <time.h>
-#include <sys/time.h>
-#include <stdio.h>
 
-/* ============================================================================
- * INTERNAL STRUCTURES
- * ========================================================================= */
-
+/* Internal worker pool structure */
 struct worker_pool_s {
     worker_info_t* workers;
     size_t worker_count;
@@ -30,27 +16,24 @@ struct worker_pool_s {
     worker_selection_strategy_t strategy;
     size_t round_robin_index;
     
-    /* Metrics */
     metrics_registry_t* metrics;
+    logger_t* logger;
+    
+    /* Metrics */
     metric_t* worker_count_metric;
     metric_t* worker_alive_metric;
     metric_t* total_capacity_metric;
     metric_t* total_load_metric;
-    
-    /* Logging */
-    logger_t* logger;
 };
 
-/* ============================================================================
- * UTILITY FUNCTIONS
- * ========================================================================= */
-
+/* Helper function to get current time in milliseconds */
 static uint64_t get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* Find a worker by ID */
 static worker_info_t* find_worker(worker_pool_t* pool, const char* worker_id) {
     for (size_t i = 0; i < pool->worker_count; i++) {
         if (strcmp(pool->workers[i].worker_id, worker_id) == 0) {
@@ -60,14 +43,15 @@ static worker_info_t* find_worker(worker_pool_t* pool, const char* worker_id) {
     return NULL;
 }
 
+/* Update pool metrics */
 static void update_pool_metrics(worker_pool_t* pool) {
     if (!pool->metrics) {
         return;
     }
     
     size_t alive_count = 0;
-    uint64_t total_capacity = 0;
-    uint64_t total_load = 0;
+    uint32_t total_capacity = 0;
+    uint32_t total_load = 0;
     
     for (size_t i = 0; i < pool->worker_count; i++) {
         if (pool->workers[i].status == GOSSIP_NODE_ALIVE) {
@@ -91,29 +75,22 @@ static void update_pool_metrics(worker_pool_t* pool) {
     }
 }
 
-/* ============================================================================
- * LIFECYCLE
- * ========================================================================= */
+/* Public API implementation */
 
-distric_err_t worker_pool_create(
+worker_pool_t* worker_pool_create(
     metrics_registry_t* metrics,
-    logger_t* logger,
-    worker_pool_t** pool_out
+    logger_t* logger
 ) {
-    if (!pool_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
     worker_pool_t* pool = calloc(1, sizeof(worker_pool_t));
     if (!pool) {
-        return DISTRIC_ERR_NO_MEMORY;
+        return NULL;
     }
     
     pool->worker_capacity = 16;  /* Initial capacity */
     pool->workers = calloc(pool->worker_capacity, sizeof(worker_info_t));
     if (!pool->workers) {
         free(pool);
-        return DISTRIC_ERR_NO_MEMORY;
+        return NULL;
     }
     
     pthread_rwlock_init(&pool->lock, NULL);
@@ -123,31 +100,30 @@ distric_err_t worker_pool_create(
     
     /* Register metrics */
     if (metrics) {
-        metric_t* metric;
-        
-        metrics_register_gauge(metrics, "cluster_workers_total",
-                              "Total workers in pool", NULL, 0, &metric);
-        pool->worker_count_metric = metric;
-        
-        metrics_register_gauge(metrics, "cluster_workers_alive",
-                              "Alive workers", NULL, 0, &metric);
-        pool->worker_alive_metric = metric;
-        
-        metrics_register_gauge(metrics, "cluster_workers_capacity_total",
-                              "Total worker capacity", NULL, 0, &metric);
-        pool->total_capacity_metric = metric;
-        
-        metrics_register_gauge(metrics, "cluster_workers_load_total",
-                              "Total worker load", NULL, 0, &metric);
-        pool->total_load_metric = metric;
+        metric_t* metric = NULL;
+        if (metrics_register_gauge(metrics, "worker_pool_total_workers", 
+                                   "Total number of workers", NULL, 0, &metric) == DISTRIC_OK) {
+            pool->worker_count_metric = metric;
+        }
+        if (metrics_register_gauge(metrics, "worker_pool_alive_workers", 
+                                   "Number of alive workers", NULL, 0, &metric) == DISTRIC_OK) {
+            pool->worker_alive_metric = metric;
+        }
+        if (metrics_register_gauge(metrics, "worker_pool_total_capacity", 
+                                   "Total task capacity", NULL, 0, &metric) == DISTRIC_OK) {
+            pool->total_capacity_metric = metric;
+        }
+        if (metrics_register_gauge(metrics, "worker_pool_total_load", 
+                                   "Total current load", NULL, 0, &metric) == DISTRIC_OK) {
+            pool->total_load_metric = metric;
+        }
     }
     
     if (logger) {
         LOG_INFO(logger, "worker_pool", "Worker pool created", NULL);
     }
     
-    *pool_out = pool;
-    return DISTRIC_OK;
+    return pool;
 }
 
 void worker_pool_destroy(worker_pool_t* pool) {
@@ -164,51 +140,48 @@ void worker_pool_destroy(worker_pool_t* pool) {
     free(pool);
 }
 
-/* ============================================================================
- * GOSSIP INTEGRATION
- * ========================================================================= */
-
-distric_err_t worker_pool_update_from_gossip(
+int worker_pool_update_from_gossip(
     worker_pool_t* pool,
     const gossip_node_info_t* node
 ) {
     if (!pool || !node) {
-        return DISTRIC_ERR_INVALID_ARG;
+        return -1;
     }
     
-    /* Only track worker nodes */
+    /* Only process worker nodes */
     if (node->role != GOSSIP_ROLE_WORKER) {
-        return DISTRIC_OK;
+        return 0;
     }
     
     pthread_rwlock_wrlock(&pool->lock);
     
     worker_info_t* worker = find_worker(pool, node->node_id);
     
+    /* Add new worker if not found */
     if (!worker) {
-        /* New worker - add it */
+        /* Expand array if needed */
         if (pool->worker_count >= pool->worker_capacity) {
-            /* Expand capacity */
+            /* Double capacity */
             size_t new_capacity = pool->worker_capacity * 2;
             worker_info_t* new_workers = realloc(pool->workers,
                                                  new_capacity * sizeof(worker_info_t));
             if (!new_workers) {
                 pthread_rwlock_unlock(&pool->lock);
-                return DISTRIC_ERR_NO_MEMORY;
+                return -1;
             }
             pool->workers = new_workers;
             pool->worker_capacity = new_capacity;
         }
         
         worker = &pool->workers[pool->worker_count++];
-        memset(worker, 0, sizeof(worker_info_t));
         
+        /* Initialize new worker */
         strncpy(worker->worker_id, node->node_id, sizeof(worker->worker_id) - 1);
         strncpy(worker->address, node->address, sizeof(worker->address) - 1);
         worker->port = node->port;
         worker->joined_at_ms = get_time_ms();
         
-        /* Default capacity (will be updated via Raft state machine) */
+        /* Default values */
         worker->max_concurrent_tasks = 10;
         
         if (pool->logger) {
@@ -217,7 +190,7 @@ distric_err_t worker_pool_update_from_gossip(
         }
     }
     
-    /* Update health status */
+    /* Update worker state */
     worker->status = node->status;
     worker->last_seen_ms = get_time_ms();
     worker->incarnation = node->incarnation;
@@ -225,23 +198,22 @@ distric_err_t worker_pool_update_from_gossip(
     
     /* Update utilization */
     if (worker->max_concurrent_tasks > 0) {
-        worker->utilization = (double)worker->current_task_count / 
+        worker->utilization = (double)worker->current_task_count /
                              (double)worker->max_concurrent_tasks;
     }
     
     update_pool_metrics(pool);
     
     pthread_rwlock_unlock(&pool->lock);
-    
-    return DISTRIC_OK;
+    return 0;
 }
 
-distric_err_t worker_pool_mark_failed(
+int worker_pool_mark_failed(
     worker_pool_t* pool,
     const char* worker_id
 ) {
     if (!pool || !worker_id) {
-        return DISTRIC_ERR_INVALID_ARG;
+        return -1;
     }
     
     pthread_rwlock_wrlock(&pool->lock);
@@ -249,7 +221,7 @@ distric_err_t worker_pool_mark_failed(
     worker_info_t* worker = find_worker(pool, worker_id);
     if (!worker) {
         pthread_rwlock_unlock(&pool->lock);
-        return DISTRIC_ERR_NOT_FOUND;
+        return -1;
     }
     
     worker->status = GOSSIP_NODE_FAILED;
@@ -259,23 +231,21 @@ distric_err_t worker_pool_mark_failed(
         snprintf(task_count, sizeof(task_count), "%u", worker->current_task_count);
         LOG_WARN(pool->logger, "worker_pool", "Worker failed",
                 "worker_id", worker_id,
-                "pending_tasks", task_count,
+                "active_tasks", task_count,
                 NULL);
     }
     
     update_pool_metrics(pool);
     
     pthread_rwlock_unlock(&pool->lock);
-    
-    return DISTRIC_OK;
+    return 0;
 }
 
-/* ============================================================================
- * WORKER SELECTION
- * ========================================================================= */
+/* Worker selection strategies */
 
 static const worker_info_t* select_round_robin(worker_pool_t* pool) {
     size_t attempts = 0;
+    
     while (attempts < pool->worker_count) {
         size_t idx = pool->round_robin_index % pool->worker_count;
         pool->round_robin_index++;
@@ -311,7 +281,7 @@ static const worker_info_t* select_least_loaded(worker_pool_t* pool) {
 
 static const worker_info_t* select_least_utilized(worker_pool_t* pool) {
     const worker_info_t* best = NULL;
-    double min_utilization = 2.0;  /* > 1.0 */
+    double min_utilization = 1.0;
     
     for (size_t i = 0; i < pool->worker_count; i++) {
         worker_info_t* worker = &pool->workers[i];
@@ -341,29 +311,29 @@ static const worker_info_t* select_random(worker_pool_t* pool) {
     }
     
     /* Select random available worker */
-    size_t random_idx = rand() % available_count;
-    size_t current_idx = 0;
+    size_t target = rand() % available_count;
+    size_t current = 0;
     
     for (size_t i = 0; i < pool->worker_count; i++) {
         if (pool->workers[i].status == GOSSIP_NODE_ALIVE &&
             pool->workers[i].current_task_count < pool->workers[i].max_concurrent_tasks) {
-            if (current_idx == random_idx) {
+            if (current == target) {
                 return &pool->workers[i];
             }
-            current_idx++;
+            current++;
         }
     }
     
     return NULL;
 }
 
-distric_err_t worker_pool_get_available(
+int worker_pool_select_worker(
     worker_pool_t* pool,
     worker_selection_strategy_t strategy,
     const worker_info_t** worker_out
 ) {
     if (!pool || !worker_out) {
-        return DISTRIC_ERR_INVALID_ARG;
+        return -1;
     }
     
     pthread_rwlock_rdlock(&pool->lock);
@@ -384,30 +354,27 @@ distric_err_t worker_pool_get_available(
             selected = select_random(pool);
             break;
         default:
-            selected = select_least_loaded(pool);
+            pthread_rwlock_unlock(&pool->lock);
+            return -1;
     }
     
-    pthread_rwlock_unlock(&pool->lock);
-    
     if (!selected) {
-        return DISTRIC_ERR_NOT_FOUND;
+        pthread_rwlock_unlock(&pool->lock);
+        return -1;
     }
     
     *worker_out = selected;
-    return DISTRIC_OK;
+    pthread_rwlock_unlock(&pool->lock);
+    return 0;
 }
 
-/* ============================================================================
- * LOAD MANAGEMENT
- * ========================================================================= */
-
-distric_err_t worker_pool_update_task_count(
+int worker_pool_update_task_count(
     worker_pool_t* pool,
     const char* worker_id,
     int32_t task_delta
 ) {
     if (!pool || !worker_id) {
-        return DISTRIC_ERR_INVALID_ARG;
+        return -1;
     }
     
     pthread_rwlock_wrlock(&pool->lock);
@@ -415,14 +382,14 @@ distric_err_t worker_pool_update_task_count(
     worker_info_t* worker = find_worker(pool, worker_id);
     if (!worker) {
         pthread_rwlock_unlock(&pool->lock);
-        return DISTRIC_ERR_NOT_FOUND;
+        return -1;
     }
     
     /* Update task count */
     if (task_delta > 0) {
         worker->current_task_count += task_delta;
         worker->last_task_assigned_ms = get_time_ms();
-    } else if (task_delta < 0) {
+    } else {
         if (worker->current_task_count >= (uint32_t)(-task_delta)) {
             worker->current_task_count += task_delta;
             worker->total_tasks_completed++;
@@ -431,156 +398,145 @@ distric_err_t worker_pool_update_task_count(
     
     /* Update utilization */
     if (worker->max_concurrent_tasks > 0) {
-        worker->utilization = (double)worker->current_task_count / 
+        worker->utilization = (double)worker->current_task_count /
                              (double)worker->max_concurrent_tasks;
     }
     
     update_pool_metrics(pool);
     
     pthread_rwlock_unlock(&pool->lock);
-    
-    return DISTRIC_OK;
+    return 0;
 }
 
-/* ============================================================================
- * QUERIES
- * ========================================================================= */
-
-distric_err_t worker_pool_get_count(
-    const worker_pool_t* pool,
+int worker_pool_get_workers_by_status(
+    worker_pool_t* pool,
     gossip_node_status_t status,
-    size_t* count_out
-) {
-    if (!pool || !count_out) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    pthread_rwlock_rdlock((pthread_rwlock_t*)&pool->lock);
-    
-    size_t count = 0;
-    for (size_t i = 0; i < pool->worker_count; i++) {
-        if ((int)status == -1 || pool->workers[i].status == status) {
-            count++;
-        }
-    }
-    
-    *count_out = count;
-    
-    pthread_rwlock_unlock((pthread_rwlock_t*)&pool->lock);
-    
-    return DISTRIC_OK;
-}
-
-distric_err_t worker_pool_get_all_workers(
-    const worker_pool_t* pool,
     worker_info_t** workers_out,
     size_t* count_out
 ) {
     if (!pool || !workers_out || !count_out) {
-        return DISTRIC_ERR_INVALID_ARG;
+        return -1;
     }
     
-    pthread_rwlock_rdlock((pthread_rwlock_t*)&pool->lock);
+    pthread_rwlock_rdlock(&pool->lock);
     
-    worker_info_t* workers = malloc(pool->worker_count * sizeof(worker_info_t));
-    if (!workers && pool->worker_count > 0) {
-        pthread_rwlock_unlock((pthread_rwlock_t*)&pool->lock);
-        return DISTRIC_ERR_NO_MEMORY;
+    /* Count matching workers */
+    size_t count = 0;
+    for (size_t i = 0; i < pool->worker_count; i++) {
+        if (pool->workers[i].status == status) {
+            count++;
+        }
     }
     
-    memcpy(workers, pool->workers, pool->worker_count * sizeof(worker_info_t));
-    *workers_out = workers;
-    *count_out = pool->worker_count;
+    /* Allocate output array */
+    worker_info_t* result = NULL;
+    if (count > 0) {
+        result = malloc(count * sizeof(worker_info_t));
+        if (!result) {
+            pthread_rwlock_unlock(&pool->lock);
+            return -1;
+        }
+        
+        /* Copy matching workers */
+        size_t idx = 0;
+        for (size_t i = 0; i < pool->worker_count; i++) {
+            if (pool->workers[i].status == status) {
+                memcpy(&result[idx++], &pool->workers[i], sizeof(worker_info_t));
+            }
+        }
+    }
     
-    pthread_rwlock_unlock((pthread_rwlock_t*)&pool->lock);
+    *workers_out = result;
+    *count_out = count;
     
-    return DISTRIC_OK;
+    pthread_rwlock_unlock(&pool->lock);
+    return 0;
 }
 
-distric_err_t worker_pool_get_worker(
-    const worker_pool_t* pool,
+int worker_pool_get_worker_info(
+    worker_pool_t* pool,
     const char* worker_id,
     worker_info_t* worker_out
 ) {
     if (!pool || !worker_id || !worker_out) {
-        return DISTRIC_ERR_INVALID_ARG;
+        return -1;
     }
     
-    pthread_rwlock_rdlock((pthread_rwlock_t*)&pool->lock);
+    pthread_rwlock_rdlock(&pool->lock);
     
-    worker_info_t* worker = find_worker((worker_pool_t*)pool, worker_id);
+    worker_info_t* worker = find_worker(pool, worker_id);
     if (!worker) {
-        pthread_rwlock_unlock((pthread_rwlock_t*)&pool->lock);
-        return DISTRIC_ERR_NOT_FOUND;
+        pthread_rwlock_unlock(&pool->lock);
+        return -1;
     }
     
     memcpy(worker_out, worker, sizeof(worker_info_t));
     
-    pthread_rwlock_unlock((pthread_rwlock_t*)&pool->lock);
-    
-    return DISTRIC_OK;
+    pthread_rwlock_unlock(&pool->lock);
+    return 0;
 }
 
-distric_err_t worker_pool_get_capacity_stats(
-    const worker_pool_t* pool,
-    uint64_t* total_capacity_out,
-    uint64_t* total_utilized_out
+int worker_pool_get_capacity_stats(
+    worker_pool_t* pool,
+    worker_pool_capacity_stats_t* stats_out
 ) {
-    if (!pool) {
-        return DISTRIC_ERR_INVALID_ARG;
+    if (!pool || !stats_out) {
+        return -1;
     }
     
-    pthread_rwlock_rdlock((pthread_rwlock_t*)&pool->lock);
+    pthread_rwlock_rdlock(&pool->lock);
     
-    uint64_t total_capacity = 0;
-    uint64_t total_utilized = 0;
+    size_t alive_count = 0;
+    uint32_t total_capacity = 0;
+    uint32_t total_utilized = 0;
     
     for (size_t i = 0; i < pool->worker_count; i++) {
         if (pool->workers[i].status == GOSSIP_NODE_ALIVE) {
+            alive_count++;
             total_capacity += pool->workers[i].max_concurrent_tasks;
             total_utilized += pool->workers[i].current_task_count;
         }
     }
     
-    if (total_capacity_out) {
-        *total_capacity_out = total_capacity;
-    }
-    if (total_utilized_out) {
-        *total_utilized_out = total_utilized;
-    }
+    stats_out->total_workers = pool->worker_count;
+    stats_out->alive_workers = alive_count;
+    stats_out->total_capacity = total_capacity;
+    stats_out->total_utilized = total_utilized;
+    stats_out->utilization_rate = total_capacity > 0 ? 
+        (double)total_utilized / (double)total_capacity : 0.0;
+    stats_out->average_load = alive_count > 0 ? 
+        (double)total_utilized / (double)alive_count : 0.0;
     
-    pthread_rwlock_unlock((pthread_rwlock_t*)&pool->lock);
-    
-    return DISTRIC_OK;
+    pthread_rwlock_unlock(&pool->lock);
+    return 0;
 }
 
-distric_err_t worker_pool_set_strategy(
+int worker_pool_set_strategy(
     worker_pool_t* pool,
     worker_selection_strategy_t strategy
 ) {
     if (!pool) {
-        return DISTRIC_ERR_INVALID_ARG;
+        return -1;
     }
     
     pthread_rwlock_wrlock(&pool->lock);
     pool->strategy = strategy;
     pthread_rwlock_unlock(&pool->lock);
     
-    return DISTRIC_OK;
+    return 0;
 }
 
-/* ============================================================================
- * UTILITY FUNCTIONS
- * ========================================================================= */
-
-const char* worker_selection_strategy_to_string(
-    worker_selection_strategy_t strategy
+int worker_pool_get_strategy(
+    worker_pool_t* pool,
+    worker_selection_strategy_t* strategy
 ) {
-    switch (strategy) {
-        case WORKER_SELECT_ROUND_ROBIN:    return "ROUND_ROBIN";
-        case WORKER_SELECT_LEAST_LOADED:   return "LEAST_LOADED";
-        case WORKER_SELECT_LEAST_UTILIZED: return "LEAST_UTILIZED";
-        case WORKER_SELECT_RANDOM:         return "RANDOM";
-        default:                           return "UNKNOWN";
+    if (!pool || !strategy) {
+        return -1;
     }
+    
+    pthread_rwlock_rdlock(&pool->lock);
+    *strategy = pool->strategy;
+    pthread_rwlock_unlock(&pool->lock);
+    
+    return 0;
 }
