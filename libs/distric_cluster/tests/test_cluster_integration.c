@@ -501,22 +501,6 @@ static int test_worker_capacity_stats(void) {
  * TEST 9: Utility Functions
  * ========================================================================= */
 
-/* Utility function to convert worker selection strategy to string */
-static const char* worker_selection_strategy_to_string(worker_selection_strategy_t strategy) {
-    switch (strategy) {
-        case WORKER_SELECT_ROUND_ROBIN: return "ROUND_ROBIN";
-        case WORKER_SELECT_LEAST_LOADED: return "LEAST_LOADED";
-        case WORKER_SELECT_LEAST_UTILIZED: return "LEAST_UTILIZED";
-        case WORKER_SELECT_RANDOM: return "RANDOM";
-        default: return "UNKNOWN";
-    }
-}
-
-/* Utility function to get cluster version */
-static const char* distric_cluster_version(void) {
-    return "5.2.0";
-}
-
 static int test_utility_functions(void) {
     printf("  Test: Utility functions\n");
     

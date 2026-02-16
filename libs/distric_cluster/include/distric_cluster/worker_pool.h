@@ -1,10 +1,20 @@
+/**
+ * @file worker_pool.h
+ * @brief Worker Pool Management for DistriC Cluster
+ * 
+ * Manages a pool of worker nodes, tracking their health status and
+ * capacity for task distribution.
+ */
+
 #ifndef DISTRIC_CLUSTER_WORKER_POOL_H
 #define DISTRIC_CLUSTER_WORKER_POOL_H
 
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+
 #include "distric_obs.h"
+#include "distric_gossip.h"  /* Import gossip types instead of redefining them */
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,22 +22,6 @@ extern "C" {
 
 /* Forward declarations */
 typedef struct worker_pool_s worker_pool_t;
-typedef struct gossip_node_info_s gossip_node_info_t;
-
-/* Gossip node status enumeration */
-typedef enum {
-    GOSSIP_NODE_ALIVE = 0,
-    GOSSIP_NODE_SUSPECT = 1,
-    GOSSIP_NODE_FAILED = 2,
-    GOSSIP_NODE_LEFT = 3
-} gossip_node_status_t;
-
-/* Gossip node role enumeration */
-typedef enum {
-    GOSSIP_ROLE_COORDINATOR = 0,
-    GOSSIP_ROLE_WORKER = 1,
-    GOSSIP_ROLE_MONITOR = 2
-} gossip_node_role_t;
 
 /* Worker selection strategy */
 typedef enum {
@@ -43,7 +37,7 @@ typedef struct {
     char address[256];
     uint16_t port;
     
-    gossip_node_status_t status;
+    gossip_node_status_t status;  /* Use type from distric_gossip.h */
     uint32_t incarnation;
     
     uint64_t joined_at_ms;
@@ -57,20 +51,6 @@ typedef struct {
     double load_metric;
     double utilization;
 } worker_info_t;
-
-/* Gossip node information structure */
-typedef struct gossip_node_info_s {
-    char node_id[64];
-    char address[256];
-    uint16_t port;
-    
-    gossip_node_role_t role;
-    gossip_node_status_t status;
-    uint32_t incarnation;
-    
-    double load;
-    uint64_t last_updated_ms;
-} gossip_node_info_t;
 
 /* Worker pool capacity statistics */
 typedef struct {
