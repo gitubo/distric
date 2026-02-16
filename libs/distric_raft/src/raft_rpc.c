@@ -2,7 +2,7 @@
  * @file raft_rpc.c
  * @brief Raft RPC Integration Implementation
  * 
- * Implements network communication for Raft consensus.
+ * Implements network communication for Raft consensus with partition support.
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -47,6 +47,10 @@ struct raft_rpc_context {
     metric_t* append_entries_sent_metric;
     metric_t* append_entries_received_metric;
     metric_t* rpc_errors_metric;
+    
+    /* Send filter (for testing partitions) */
+    raft_rpc_send_filter_t send_filter;
+    void* send_filter_userdata;
     
     /* Control */
     volatile bool running;
@@ -275,6 +279,9 @@ static int handle_install_snapshot_rpc(
     }
     
     /* Handle InstallSnapshot */
+    bool success = false;
+    uint32_t term = 0;
+    
     err = raft_install_snapshot(
         context->raft_node,
         install_snapshot.last_included_index,
@@ -283,8 +290,13 @@ static int handle_install_snapshot_rpc(
         install_snapshot.data_len
     );
     
-    bool success = (err == DISTRIC_OK);
-    uint32_t term = raft_get_term(context->raft_node);
+    if (err == DISTRIC_OK) {
+        success = true;
+    }
+    
+    term = raft_get_term(context->raft_node);
+    
+    free_raft_install_snapshot(&install_snapshot);
     
     /* Create response */
     raft_install_snapshot_response_t response_msg = {
@@ -294,13 +306,14 @@ static int handle_install_snapshot_rpc(
     
     err = serialize_raft_install_snapshot_response(&response_msg, response, resp_len);
     
-    free_raft_install_snapshot(&install_snapshot);
-    
     if (err != DISTRIC_OK) {
         LOG_ERROR(context->config.logger, "raft_rpc", "Failed to serialize InstallSnapshot response");
         metrics_counter_inc(context->rpc_errors_metric);
         return -1;
     }
+    
+    LOG_DEBUG(context->config.logger, "raft_rpc", "InstallSnapshot handled",
+             "success", success ? "true" : "false");
     
     return 0;
 }
@@ -326,6 +339,10 @@ distric_err_t raft_rpc_create(
     /* Copy configuration */
     memcpy(&context->config, config, sizeof(raft_rpc_config_t));
     context->raft_node = raft_node;
+    
+    /* Initialize send filter to NULL (disabled by default) */
+    context->send_filter = NULL;
+    context->send_filter_userdata = NULL;
     
     /* Create TCP server */
     distric_err_t err = tcp_server_create(
@@ -485,6 +502,23 @@ void raft_rpc_destroy(raft_rpc_context_t* context) {
 }
 
 /* ============================================================================
+ * SEND FILTER (FOR TESTING)
+ * ========================================================================= */
+
+void raft_rpc_set_send_filter(
+    raft_rpc_context_t* context,
+    raft_rpc_send_filter_t filter,
+    void* userdata
+) {
+    if (!context) {
+        return;
+    }
+    
+    context->send_filter = filter;
+    context->send_filter_userdata = userdata;
+}
+
+/* ============================================================================
  * RPC CLIENT OPERATIONS
  * ========================================================================= */
 
@@ -501,6 +535,15 @@ distric_err_t raft_rpc_send_request_vote(
 ) {
     if (!context || !peer_address || !candidate_id || !vote_granted_out || !term_out) {
         return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    /* Check send filter */
+    if (context->send_filter) {
+        if (!context->send_filter(context->send_filter_userdata, peer_address, peer_port)) {
+            LOG_DEBUG(context->config.logger, "raft_rpc", "RequestVote blocked by send filter",
+                     "peer", peer_address);
+            return DISTRIC_ERR_UNAVAILABLE;
+        }
     }
     
     /* Create request */
@@ -525,7 +568,6 @@ distric_err_t raft_rpc_send_request_vote(
     uint32_t retries = 0;
     
     while (retries <= context->config.max_retries) {
-
         char term_str[16];
         snprintf(term_str, sizeof(term_str), "%u", term);
         LOG_DEBUG(context->config.logger, "raft_rpc", "Sending RequestVote",
@@ -611,6 +653,14 @@ distric_err_t raft_rpc_send_append_entries(
 ) {
     if (!context || !peer_address || !leader_id || !success_out || !term_out || !match_index_out) {
         return DISTRIC_ERR_INVALID_ARG;
+    }
+    
+    /* Check send filter */
+    if (context->send_filter) {
+        if (!context->send_filter(context->send_filter_userdata, peer_address, peer_port)) {
+            /* Silently block heartbeats/replication to avoid log spam */
+            return DISTRIC_ERR_UNAVAILABLE;
+        }
     }
     
     /* Convert internal format to wire format */
@@ -725,6 +775,15 @@ distric_err_t raft_rpc_send_install_snapshot(
         return DISTRIC_ERR_INVALID_ARG;
     }
     
+    /* Check send filter */
+    if (context->send_filter) {
+        if (!context->send_filter(context->send_filter_userdata, peer_address, peer_port)) {
+            LOG_DEBUG(context->config.logger, "raft_rpc", "InstallSnapshot blocked by send filter",
+                     "peer", peer_address);
+            return DISTRIC_ERR_UNAVAILABLE;
+        }
+    }
+    
     /* Create request */
     raft_install_snapshot_t request = {
         .term = term,
@@ -833,20 +892,18 @@ distric_err_t raft_rpc_broadcast_request_vote(
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* Get node configuration */
     const raft_config_t* config = raft_get_config(raft_node);
-    if (!config) {
-        return DISTRIC_ERR_INVALID_ARG;
+    if (!config || config->peer_count == 0) {
+        *votes_received_out = 1;  /* Self vote */
+        return DISTRIC_OK;
     }
     
     uint32_t term = raft_get_term(raft_node);
     uint32_t last_log_index = raft_get_last_log_index(raft_node);
     uint32_t last_log_term = raft_get_last_log_term(raft_node);
+    const char* node_id = raft_get_node_id(raft_node);
     
-    /* Start with 1 vote (self) */
-    uint32_t votes = 1;
-    
-    /* Create thread for each peer */
+    /* Create threads for parallel broadcast */
     pthread_t* threads = (pthread_t*)calloc(config->peer_count, sizeof(pthread_t));
     request_vote_thread_arg_t* args = (request_vote_thread_arg_t*)calloc(
         config->peer_count, sizeof(request_vote_thread_arg_t));
@@ -857,29 +914,35 @@ distric_err_t raft_rpc_broadcast_request_vote(
         return DISTRIC_ERR_NO_MEMORY;
     }
     
-    /* Launch threads */
+    /* Start threads */
     for (size_t i = 0; i < config->peer_count; i++) {
         args[i].context = context;
         args[i].peer = &config->peers[i];
         args[i].term = term;
         args[i].last_log_index = last_log_index;
         args[i].last_log_term = last_log_term;
-        strncpy(args[i].candidate_id, config->node_id, sizeof(args[i].candidate_id) - 1);
+        strncpy(args[i].candidate_id, node_id, sizeof(args[i].candidate_id) - 1);
         args[i].vote_granted = false;
         args[i].completed = false;
         
-        pthread_create(&threads[i], NULL, request_vote_thread, &args[i]);
+        if (pthread_create(&threads[i], NULL, request_vote_thread, &args[i]) != 0) {
+            args[i].completed = false;
+        }
     }
     
     /* Wait for all threads */
     for (size_t i = 0; i < config->peer_count; i++) {
         pthread_join(threads[i], NULL);
-        
+    }
+    
+    /* Count votes */
+    uint32_t votes = 1;  /* Self vote */
+    for (size_t i = 0; i < config->peer_count; i++) {
         if (args[i].completed && args[i].vote_granted) {
             votes++;
         }
         
-        /* Check if we discovered a higher term */
+        /* Check for higher term */
         if (args[i].completed && args[i].peer_term > term) {
             LOG_INFO(context->config.logger, "raft_rpc", "Discovered higher term during election",
                     "our_term", &term,
@@ -934,52 +997,53 @@ static void* append_entries_thread(void* arg) {
     
     /* Get prev_log info */
     uint32_t prev_log_index = (next_index > 1) ? next_index - 1 : 0;
-    uint32_t prev_log_term = 0;
-    if (prev_log_index > 0) {
-        prev_log_term = raft_get_log_term(targ->raft_node, prev_log_index);
-    }
+    uint32_t prev_log_term = (prev_log_index > 0) ? 
+        raft_get_log_term(targ->raft_node, prev_log_index) : 0;
     
-    /* Send AppendEntries */
-    bool success = false;
-    uint32_t term = 0;
-    uint32_t match_index = 0;
+    const char* leader_id = raft_get_node_id(targ->raft_node);
+    uint32_t term = raft_get_term(targ->raft_node);
+    uint32_t leader_commit = raft_get_commit_index(targ->raft_node);
+    
+    bool success;
+    uint32_t peer_term;
+    uint32_t match_index;
     
     distric_err_t err = raft_rpc_send_append_entries(
         targ->context,
         targ->peer->address,
         targ->peer->port,
-        raft_get_node_id(targ->raft_node),
-        raft_get_term(targ->raft_node),
+        leader_id,
+        term,
         prev_log_index,
         prev_log_term,
         entries,
         entry_count,
-        raft_get_commit_index(targ->raft_node),
+        leader_commit,
         &success,
-        &term,
+        &peer_term,
         &match_index
     );
-    
-    if (err == DISTRIC_OK) {
-        if (success) {
-            /* Update next_index and match_index */
-            raft_update_peer_indices(targ->raft_node, targ->peer_index, match_index + 1, match_index);
-        } else {
-            /* Decrement next_index and retry later */
-            raft_decrement_peer_next_index(targ->raft_node, targ->peer_index);
-        }
-        
-        /* Check for higher term */
-        if (term > raft_get_term(targ->raft_node)) {
-            raft_step_down(targ->raft_node, term);
-        }
-    }
     
     if (entries) {
         free(entries);
     }
     
-    targ->completed = (err == DISTRIC_OK);
+    if (err == DISTRIC_OK) {
+        if (success) {
+            /* Update peer's next_index and match_index */
+            uint32_t new_next_index = match_index + 1;
+            raft_update_peer_indices(targ->raft_node, targ->peer_index, new_next_index, match_index);
+        } else if (peer_term > term) {
+            /* Higher term discovered - step down */
+            raft_step_down(targ->raft_node, peer_term);
+        } else {
+            /* Decrement next_index and retry later */
+            raft_decrement_peer_next_index(targ->raft_node, targ->peer_index);
+        }
+        targ->completed = true;
+    } else {
+        targ->completed = false;
+    }
     
     return NULL;
 }
@@ -992,18 +1056,12 @@ distric_err_t raft_rpc_broadcast_append_entries(
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* Only leader can send AppendEntries */
-    if (!raft_is_leader(raft_node)) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    /* Get node configuration */
     const raft_config_t* config = raft_get_config(raft_node);
-    if (!config) {
-        return DISTRIC_ERR_INVALID_ARG;
+    if (!config || config->peer_count == 0) {
+        return DISTRIC_OK;
     }
     
-    /* Create thread for each peer */
+    /* Create threads for parallel broadcast */
     pthread_t* threads = (pthread_t*)calloc(config->peer_count, sizeof(pthread_t));
     append_entries_thread_arg_t* args = (append_entries_thread_arg_t*)calloc(
         config->peer_count, sizeof(append_entries_thread_arg_t));
@@ -1014,7 +1072,7 @@ distric_err_t raft_rpc_broadcast_append_entries(
         return DISTRIC_ERR_NO_MEMORY;
     }
     
-    /* Launch threads */
+    /* Start threads */
     for (size_t i = 0; i < config->peer_count; i++) {
         args[i].context = context;
         args[i].raft_node = raft_node;
@@ -1022,7 +1080,9 @@ distric_err_t raft_rpc_broadcast_append_entries(
         args[i].peer_index = i;
         args[i].completed = false;
         
-        pthread_create(&threads[i], NULL, append_entries_thread, &args[i]);
+        if (pthread_create(&threads[i], NULL, append_entries_thread, &args[i]) != 0) {
+            args[i].completed = false;
+        }
     }
     
     /* Wait for all threads */

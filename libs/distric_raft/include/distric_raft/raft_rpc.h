@@ -8,6 +8,7 @@
  * - InstallSnapshot RPC (send/receive)
  * - Automatic retry and timeout handling
  * - Integration with distric_protocol RPC framework
+ * - Send filter support for testing (network partitions)
  * 
  * @version 1.0.0
  */
@@ -35,6 +36,23 @@ extern "C" {
  * Manages RPC client and server for Raft communication.
  */
 typedef struct raft_rpc_context raft_rpc_context_t;
+
+/**
+ * @brief Send filter callback
+ * 
+ * Allows filtering outgoing RPC messages. Used for testing network
+ * partitions and message loss simulation.
+ * 
+ * @param userdata User-provided context
+ * @param peer_address Target peer address
+ * @param peer_port Target peer port
+ * @return true to allow send, false to block
+ */
+typedef bool (*raft_rpc_send_filter_t)(
+    void* userdata,
+    const char* peer_address,
+    uint16_t peer_port
+);
 
 /**
  * @brief RPC configuration
@@ -101,6 +119,28 @@ distric_err_t raft_rpc_stop(raft_rpc_context_t* context);
 void raft_rpc_destroy(raft_rpc_context_t* context);
 
 /* ============================================================================
+ * SEND FILTER (FOR TESTING)
+ * ========================================================================= */
+
+/**
+ * @brief Set send filter callback
+ * 
+ * Registers a callback that will be invoked before sending each RPC.
+ * If the callback returns false, the message is blocked.
+ * 
+ * This is primarily used for testing network partitions and message loss.
+ * 
+ * @param context RPC context
+ * @param filter Filter callback (NULL to disable)
+ * @param userdata User data passed to filter callback
+ */
+void raft_rpc_set_send_filter(
+    raft_rpc_context_t* context,
+    raft_rpc_send_filter_t filter,
+    void* userdata
+);
+
+/* ============================================================================
  * RPC CLIENT OPERATIONS
  * ========================================================================= */
 
@@ -109,6 +149,9 @@ void raft_rpc_destroy(raft_rpc_context_t* context);
  * 
  * Sends RequestVote RPC and waits for response.
  * Automatically retries on failure according to config.
+ * 
+ * Note: If a send filter is registered and blocks the message,
+ * this function returns DISTRIC_ERR_UNAVAILABLE.
  * 
  * @param context RPC context
  * @param peer_address Peer address (e.g., "10.0.1.5")
@@ -119,7 +162,7 @@ void raft_rpc_destroy(raft_rpc_context_t* context);
  * @param last_log_term Candidate's last log term
  * @param vote_granted_out Output: vote granted
  * @param term_out Output: peer's current term
- * @return DISTRIC_OK on success
+ * @return DISTRIC_OK on success, DISTRIC_ERR_UNAVAILABLE if blocked by filter
  */
 distric_err_t raft_rpc_send_request_vote(
     raft_rpc_context_t* context,
@@ -138,6 +181,9 @@ distric_err_t raft_rpc_send_request_vote(
  * 
  * Sends AppendEntries RPC (heartbeat or log replication) and waits for response.
  * 
+ * Note: If a send filter is registered and blocks the message,
+ * this function returns DISTRIC_ERR_UNAVAILABLE.
+ * 
  * @param context RPC context
  * @param peer_address Peer address
  * @param peer_port Peer port
@@ -151,7 +197,7 @@ distric_err_t raft_rpc_send_request_vote(
  * @param success_out Output: true if follower matched prev_log
  * @param term_out Output: peer's current term
  * @param match_index_out Output: peer's last log index (for updating match_index)
- * @return DISTRIC_OK on success
+ * @return DISTRIC_OK on success, DISTRIC_ERR_UNAVAILABLE if blocked by filter
  */
 distric_err_t raft_rpc_send_append_entries(
     raft_rpc_context_t* context,
@@ -174,18 +220,21 @@ distric_err_t raft_rpc_send_append_entries(
  * 
  * Sends snapshot to follower that is too far behind.
  * 
+ * Note: If a send filter is registered and blocks the message,
+ * this function returns DISTRIC_ERR_UNAVAILABLE.
+ * 
  * @param context RPC context
  * @param peer_address Peer address
  * @param peer_port Peer port
  * @param leader_id Leader node ID
  * @param term Leader's term
- * @param last_included_index Last index in snapshot
- * @param last_included_term Last term in snapshot
+ * @param last_included_index Snapshot's last included log index
+ * @param last_included_term Snapshot's last included term
  * @param snapshot_data Snapshot data
  * @param snapshot_len Snapshot length
- * @param success_out Output: true if snapshot installed
+ * @param success_out Output: true if accepted
  * @param term_out Output: peer's current term
- * @return DISTRIC_OK on success
+ * @return DISTRIC_OK on success, DISTRIC_ERR_UNAVAILABLE if blocked by filter
  */
 distric_err_t raft_rpc_send_install_snapshot(
     raft_rpc_context_t* context,
@@ -201,35 +250,35 @@ distric_err_t raft_rpc_send_install_snapshot(
     uint32_t* term_out
 );
 
-/* ============================================================================
- * BROADCAST HELPERS
- * ========================================================================= */
-
 /**
  * @brief Broadcast RequestVote to all peers
  * 
- * Sends RequestVote RPC to all peers in parallel and collects votes.
- * Used during leader election.
+ * Sends RequestVote RPC to all peers in parallel.
  * 
  * @param context RPC context
- * @param raft_node Raft node
- * @param votes_received_out Output: number of votes received (including self)
+ * @param raft_node Raft node (for getting peer list)
+ * @param term Current term
+ * @param last_log_index Last log index
+ * @param last_log_term Last log term
+ * @param votes_received_out Output: number of votes received
  * @return DISTRIC_OK on success
  */
 distric_err_t raft_rpc_broadcast_request_vote(
     raft_rpc_context_t* context,
     raft_node_t* raft_node,
+    uint32_t term,
+    uint32_t last_log_index,
+    uint32_t last_log_term,
     uint32_t* votes_received_out
 );
 
 /**
  * @brief Broadcast AppendEntries to all peers
  * 
- * Sends AppendEntries RPC to all peers in parallel.
- * Used for heartbeats and log replication.
+ * Sends AppendEntries RPC (heartbeat or replication) to all peers in parallel.
  * 
  * @param context RPC context
- * @param raft_node Raft node
+ * @param raft_node Raft node (for getting peer list and per-peer state)
  * @return DISTRIC_OK on success
  */
 distric_err_t raft_rpc_broadcast_append_entries(

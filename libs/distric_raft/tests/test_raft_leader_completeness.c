@@ -27,20 +27,7 @@ typedef struct {
  * Helper to get current term from a node
  */
 static uint32_t get_node_term(raft_node_t* node) {
-    bool vote_granted = false;
-    uint32_t term_out = 0;
-    
-    raft_handle_request_vote(
-        node,
-        "dummy_candidate",
-        0,
-        0,
-        0,
-        &vote_granted,
-        &term_out
-    );
-    
-    return term_out;
+    return raft_get_term(node);
 }
 
 /**
@@ -61,6 +48,9 @@ static test_context_t* setup_test(uint32_t num_nodes) {
         ctx->nodes[i] = test_cluster_get_node(ctx->cluster, i);
         assert(ctx->nodes[i] != NULL);
     }
+    
+    // Start the cluster and wait for leader election
+    test_cluster_start(ctx->cluster);
     
     return ctx;
 }
@@ -88,8 +78,8 @@ static void test_new_leader_has_committed_entries(void) {
     
     test_context_t* ctx = setup_test(5);
     
-    // Elect initial leader
-    int leader_idx = test_cluster_find_leader(ctx->cluster);
+    // Wait for initial leader election
+    int leader_idx = test_cluster_wait_for_leader(ctx->cluster, 5000);
     assert(leader_idx >= 0);
     
     raft_node_t* leader1 = ctx->nodes[leader_idx];
@@ -142,8 +132,8 @@ static void test_new_leader_has_committed_entries(void) {
     // Heal partition to check new leader
     test_cluster_heal_partition(ctx->cluster);
     
-    // Find new leader (should be from the majority partition)
-    int new_leader_idx = test_cluster_find_leader(ctx->cluster);
+    // Wait for new leader (should be from the majority partition)
+    int new_leader_idx = test_cluster_wait_for_leader(ctx->cluster, 5000);
     assert(new_leader_idx >= 0);
     
     raft_node_t* leader2 = ctx->nodes[new_leader_idx];
@@ -174,8 +164,8 @@ static void test_incomplete_log_loses_election(void) {
     
     test_context_t* ctx = setup_test(5);
     
-    // Elect initial leader
-    int leader_idx = test_cluster_find_leader(ctx->cluster);
+    // Wait for initial leader election
+    int leader_idx = test_cluster_wait_for_leader(ctx->cluster, 5000);
     assert(leader_idx >= 0);
     
     raft_node_t* leader = ctx->nodes[leader_idx];
@@ -242,7 +232,7 @@ static void test_incomplete_log_loses_election(void) {
     // Heal and check leader
     test_cluster_heal_partition(ctx->cluster);
     
-    int new_leader_idx = test_cluster_find_leader(ctx->cluster);
+    int new_leader_idx = test_cluster_wait_for_leader(ctx->cluster, 5000);
     
     if (new_leader_idx >= 0) {
         // The node with complete log in partition 2 should win
@@ -269,8 +259,8 @@ static void test_most_uptodate_log_wins(void) {
     
     test_context_t* ctx = setup_test(3);
     
-    // Elect initial leader
-    int leader_idx = test_cluster_find_leader(ctx->cluster);
+    // Wait for initial leader election
+    int leader_idx = test_cluster_wait_for_leader(ctx->cluster, 5000);
     assert(leader_idx >= 0);
     
     raft_node_t* leader = ctx->nodes[leader_idx];
@@ -321,8 +311,8 @@ static void test_most_uptodate_log_wins(void) {
     // Heal partition
     test_cluster_heal_partition(ctx->cluster);
     
-    // Check for new leader
-    int new_leader_idx = test_cluster_find_leader(ctx->cluster);
+    // Wait for new leader
+    int new_leader_idx = test_cluster_wait_for_leader(ctx->cluster, 5000);
     
     if (new_leader_idx >= 0) {
         // New leader should have complete log
@@ -343,8 +333,8 @@ static void test_committed_entries_survive_leader_change(void) {
     
     test_context_t* ctx = setup_test(5);
     
-    // Elect initial leader
-    int leader_idx = test_cluster_find_leader(ctx->cluster);
+    // Wait for initial leader election
+    int leader_idx = test_cluster_wait_for_leader(ctx->cluster, 5000);
     assert(leader_idx >= 0);
     
     raft_node_t* leader = ctx->nodes[leader_idx];
@@ -393,8 +383,8 @@ static void test_committed_entries_survive_leader_change(void) {
         // Heal partition
         test_cluster_heal_partition(ctx->cluster);
         
-        // Find new leader
-        int new_leader_idx = test_cluster_find_leader(ctx->cluster);
+        // Wait for new leader
+        int new_leader_idx = test_cluster_wait_for_leader(ctx->cluster, 5000);
         
         if (new_leader_idx >= 0) {
             leader_idx = new_leader_idx;
@@ -422,8 +412,8 @@ static void test_higher_term_preferred(void) {
     
     test_context_t* ctx = setup_test(3);
     
-    // Elect initial leader
-    int leader_idx = test_cluster_find_leader(ctx->cluster);
+    // Wait for initial leader election
+    int leader_idx = test_cluster_wait_for_leader(ctx->cluster, 5000);
     assert(leader_idx >= 0);
     
     raft_node_t* leader = ctx->nodes[leader_idx];
@@ -467,7 +457,7 @@ static void test_higher_term_preferred(void) {
     // Heal partition
     test_cluster_heal_partition(ctx->cluster);
     
-    int new_leader_idx = test_cluster_find_leader(ctx->cluster);
+    int new_leader_idx = test_cluster_wait_for_leader(ctx->cluster, 5000);
     
     if (new_leader_idx >= 0) {
         raft_node_t* new_leader = ctx->nodes[new_leader_idx];

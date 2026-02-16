@@ -3,7 +3,7 @@
  * @brief Implementation of RAFT Test Framework
  * 
  * Based on the working test_raft_cluster.c implementation,
- * this provides reusable test infrastructure.
+ * this provides reusable test infrastructure with partition support.
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -32,6 +32,58 @@
 
 static bool framework_initialized = false;
 static uint32_t cluster_counter = 0;  /* For unique data directories */
+
+/* ============================================================================
+ * PARTITION FILTER CALLBACK
+ * ========================================================================= */
+
+/**
+ * @brief Send filter callback for network partition simulation
+ * 
+ * Checks if a message should be allowed based on current partition state.
+ * 
+ * @param userdata Pointer to test_node_t (sender node)
+ * @param peer_address Target peer address (unused)
+ * @param peer_port Target peer port
+ * @return true to allow send, false to block
+ */
+static bool can_communicate(void* userdata, const char* peer_address, uint16_t peer_port) {
+    (void)peer_address;  /* Unused */
+    test_node_t* sender_node = (test_node_t*)userdata;
+    
+    /* If no partition active, allow all communication */
+    if (!sender_node->cluster->partition_active) {
+        return true;
+    }
+    
+    /* If sender is not in a partition, allow */
+    if (!sender_node->partitioned) {
+        return true;
+    }
+    
+    /* Find receiver node by port */
+    int receiver_idx = (int)(peer_port - TEST_BASE_PORT);
+    if (receiver_idx < 0 || receiver_idx >= (int)sender_node->cluster->num_nodes) {
+        /* Invalid port, allow to avoid breaking non-partition tests */
+        return true;
+    }
+    
+    test_node_t* receiver_node = &sender_node->cluster->nodes[receiver_idx];
+    
+    /* If receiver is not partitioned, allow */
+    if (!receiver_node->partitioned) {
+        return true;
+    }
+    
+    /* Block if sender and receiver are in different partition groups */
+    if (sender_node->partition_group != receiver_node->partition_group) {
+        /* Message blocked by partition */
+        return false;
+    }
+    
+    /* Same partition group - allow communication */
+    return true;
+}
 
 /* ============================================================================
  * INTERNAL HELPERS
@@ -210,47 +262,47 @@ test_cluster_t* test_cluster_create(int num_nodes) {
         node->partitioned = false;
         node->partition_group = 0;
         
-        /* Create peer list (all other nodes) */
-        raft_peer_t* peers = NULL;
-        size_t peer_count = num_nodes - 1;
+        /* Set cluster back-reference for partition checks */
+        node->cluster = cluster;
         
-        if (peer_count > 0) {
-            peers = calloc(peer_count, sizeof(raft_peer_t));
-            if (!peers) {
-                test_cluster_destroy(cluster);
-                return NULL;
-            }
-            
-            size_t p = 0;
-            for (int j = 0; j < num_nodes; j++) {
-                if (j == i) continue;
-                
-                snprintf(peers[p].node_id, sizeof(peers[p].node_id), "node-%d", j);
-                strncpy(peers[p].address, "127.0.0.1", sizeof(peers[p].address) - 1);
-                peers[p].port = TEST_BASE_PORT + j;
-                p++;
-            }
+        /* Create peer list (all other nodes) */
+        raft_peer_t* peers = calloc(num_nodes - 1, sizeof(raft_peer_t));
+        if (!peers) {
+            fprintf(stderr, "Failed to allocate peers for node %d\n", i);
+            test_cluster_destroy(cluster);
+            return NULL;
         }
         
-        /* Create RAFT config */
-        raft_config_t config = {
+        int peer_idx = 0;
+        for (int j = 0; j < num_nodes; j++) {
+            if (i == j) continue;
+            
+            snprintf(peers[peer_idx].node_id, sizeof(peers[peer_idx].node_id), "node-%d", j);
+            snprintf(peers[peer_idx].address, sizeof(peers[peer_idx].address), "127.0.0.1");
+            peers[peer_idx].port = TEST_BASE_PORT + j;
+            peer_idx++;
+        }
+        
+        /* Create RAFT configuration */
+        raft_config_t raft_cfg = {
             .peers = peers,
-            .peer_count = peer_count,
+            .peer_count = num_nodes - 1,
             .election_timeout_min_ms = TEST_DEFAULT_ELECTION_TIMEOUT_MIN_MS,
             .election_timeout_max_ms = TEST_DEFAULT_ELECTION_TIMEOUT_MAX_MS,
             .heartbeat_interval_ms = TEST_DEFAULT_HEARTBEAT_INTERVAL_MS,
-            .snapshot_threshold = 100,
-            .persistence_data_dir = NULL,  /* No persistence for tests */
+            .snapshot_threshold = 10000,
+            .persistence_data_dir = NULL,  /* Disable persistence for tests */
             .apply_fn = NULL,
             .state_change_fn = NULL,
-            .user_data = node,
+            .user_data = NULL,
             .metrics = cluster->metrics,
             .logger = cluster->logger
         };
-        strncpy(config.node_id, node->node_id, sizeof(config.node_id) - 1);
+        strncpy(raft_cfg.node_id, node->node_id, sizeof(raft_cfg.node_id) - 1);
         
         /* Create RAFT node */
-        distric_err_t err = raft_create(&config, &node->raft_node);
+        distric_err_t err = raft_create(&raft_cfg, &node->raft_node);
+        
         free(peers);
         
         if (err != DISTRIC_OK) {
@@ -264,7 +316,7 @@ test_cluster_t* test_cluster_create(int num_nodes) {
         raft_rpc_config_t rpc_cfg = {
             .bind_address = "127.0.0.1",
             .bind_port = node->port,
-            .rpc_timeout_ms = 3000,
+            .rpc_timeout_ms = 1000,
             .max_retries = 3,
             .metrics = cluster->metrics,
             .logger = cluster->logger
@@ -277,6 +329,9 @@ test_cluster_t* test_cluster_create(int num_nodes) {
             test_cluster_destroy(cluster);
             return NULL;
         }
+        
+        /* Register partition filter callback */
+        raft_rpc_set_send_filter(node->rpc, can_communicate, node);
     }
     
     return cluster;
@@ -416,83 +471,14 @@ void test_cluster_tick(test_cluster_t* cluster, int ms) {
     }
     
     /* The tick threads are already running and calling raft_tick()
-     * automatically. We just need to sleep for the requested time. */
-    usleep(ms * 1000);
+     * automatically. We just need to sleep for the requested time.
+     * Nodes will tick in the background. */
+    usleep((useconds_t)ms * 1000);
 }
 
 /* ============================================================================
  * LEADER ELECTION HELPERS
  * ========================================================================= */
-
-int test_cluster_wait_for_leader(test_cluster_t* cluster, uint32_t timeout_ms) {
-    if (!cluster) {
-        return -1;
-    }
-    
-    uint64_t start = test_get_time_ms();
-    
-    while (test_get_time_ms() - start < timeout_ms) {
-        int leader_id = test_cluster_find_leader(cluster);
-        if (leader_id >= 0) {
-            return leader_id;
-        }
-        
-        usleep(50000);  /* 50ms */
-    }
-    
-    return -1;  /* Timeout */
-}
-
-bool test_cluster_start_election(test_cluster_t* cluster, int node_id) {
-    if (!cluster || node_id < 0 || node_id >= (int)cluster->num_nodes) {
-        return false;
-    }
-    
-    test_node_t* node = &cluster->nodes[node_id];
-    
-    /* This is a test helper - in a real scenario, elections are triggered
-     * by timeouts. For testing, we can't directly trigger an election
-     * through the public API, so we'd need to manipulate timeouts or
-     * wait for natural timeout. For now, just return true. */
-    
-    (void)node;  /* Unused */
-    return true;
-}
-
-void test_cluster_count_states(test_cluster_t* cluster,
-                               int* leaders_out,
-                               int* candidates_out,
-                               int* followers_out) {
-    if (!cluster) {
-        return;
-    }
-    
-    int leaders = 0, candidates = 0, followers = 0;
-    
-    for (size_t i = 0; i < cluster->num_nodes; i++) {
-        if (atomic_load(&cluster->nodes[i].crashed)) {
-            continue;
-        }
-        
-        raft_state_t state = raft_get_state(cluster->nodes[i].raft_node);
-        
-        switch (state) {
-            case RAFT_STATE_LEADER:
-                leaders++;
-                break;
-            case RAFT_STATE_CANDIDATE:
-                candidates++;
-                break;
-            case RAFT_STATE_FOLLOWER:
-                followers++;
-                break;
-        }
-    }
-    
-    if (leaders_out) *leaders_out = leaders;
-    if (candidates_out) *candidates_out = candidates;
-    if (followers_out) *followers_out = followers;
-}
 
 int test_cluster_find_leader(test_cluster_t* cluster) {
     if (!cluster) {
@@ -512,31 +498,50 @@ int test_cluster_find_leader(test_cluster_t* cluster) {
     return -1;
 }
 
-bool test_cluster_elect_leader(test_cluster_t* cluster, int preferred_node) {
-    (void)preferred_node; // Ignored for now - any node can become leader
-    
+int test_cluster_wait_for_leader(test_cluster_t* cluster, int timeout_ms) {
     if (!cluster) {
-        return false;
+        return -1;
     }
     
-    // Check if cluster is already running
-    bool already_started = false;
-    for (size_t i = 0; i < cluster->num_nodes; i++) {
-        if (atomic_load(&cluster->nodes[i].running)) {
-            already_started = true;
-            break;
+    uint64_t start = test_get_time_ms();
+    
+    while (test_get_time_ms() - start < (uint64_t)timeout_ms) {
+        int leader = test_cluster_find_leader(cluster);
+        if (leader >= 0) {
+            return leader;
         }
+        
+        usleep(50000);  /* 50ms */
     }
     
-    // Start cluster if not running
-    if (!already_started) {
-        if (!test_cluster_start(cluster)) {
-            return false;
+    return -1;
+}
+
+int test_cluster_wait_for_stable_leader(test_cluster_t* cluster, int stable_ms) {
+    if (!cluster) {
+        return -1;
+    }
+    
+    int current_leader = -1;
+    uint64_t stable_start = 0;
+    
+    while (true) {
+        int leader = test_cluster_find_leader(cluster);
+        
+        if (leader != current_leader) {
+            current_leader = leader;
+            stable_start = test_get_time_ms();
+        } else if (leader >= 0) {
+            uint64_t stable_duration = test_get_time_ms() - stable_start;
+            if (stable_duration >= (uint64_t)stable_ms) {
+                return leader;
+            }
         }
+        
+        usleep(50000);  /* 50ms */
     }
     
-    // Wait for leader election (5 second timeout)
-    return test_cluster_wait_for_leader(cluster, 5000) >= 0;
+    return -1;
 }
 
 /* ============================================================================
@@ -661,9 +666,8 @@ bool test_cluster_partition(test_cluster_t* cluster,
         }
     }
     
-    /* NOTE: Actual network isolation would require RPC layer support.
-     * For now, this just marks the partition state. The RPC layer would
-     * need to check can_communicate() before sending messages. */
+    /* Network isolation is enforced via send filter callback registered
+     * with each node's RPC context. See can_communicate() above. */
     
     return true;
 }
@@ -759,38 +763,39 @@ void test_cluster_print_state(test_cluster_t* cluster) {
     
     printf("\n=== Cluster State ===\n");
     printf("Nodes: %zu\n", cluster->num_nodes);
-    printf("Partition: %s\n", cluster->partition_active ? "ACTIVE" : "none");
+    printf("Partition: %s\n", cluster->partition_active ? "ACTIVE" : "NONE");
     
-    for (size_t i = 0; i < cluster->num_nodes; i++) {
-        test_node_t* node = &cluster->nodes[i];
-        raft_node_t* raft = node->raft_node;
-        
-        const char* state_str = "UNKNOWN";
-        raft_state_t state = raft_get_state(raft);
-        switch (state) {
-            case RAFT_STATE_FOLLOWER: state_str = "FOLLOWER"; break;
-            case RAFT_STATE_CANDIDATE: state_str = "CANDIDATE"; break;
-            case RAFT_STATE_LEADER: state_str = "LEADER"; break;
+    if (cluster->partition_active) {
+        printf("  Group 1:");
+        for (size_t i = 0; i < cluster->group1_count; i++) {
+            printf(" %d", cluster->group1_nodes[i]);
         }
-        
-        printf("  Node %zu [%s]: ", i, node->node_id);
-        printf("state=%s term=%u commit=%u last_log=%u",
-               state_str,
-               raft_get_term(raft),
-               raft_get_commit_index(raft),
-               raft_get_last_log_index(raft));
-        
-        if (atomic_load(&node->crashed)) {
-            printf(" [CRASHED]");
+        printf("\n  Group 2:");
+        for (size_t i = 0; i < cluster->group2_count; i++) {
+            printf(" %d", cluster->group2_nodes[i]);
         }
-        
-        if (node->partitioned) {
-            printf(" [PARTITION_GROUP_%d]", node->partition_group);
-        }
-        
         printf("\n");
     }
     
+    for (size_t i = 0; i < cluster->num_nodes; i++) {
+        test_node_t* node = &cluster->nodes[i];
+        
+        const char* state_str = "UNKNOWN";
+        uint32_t term = 0;
+        uint32_t commit_idx = 0;
+        
+        if (!atomic_load(&node->crashed)) {
+            raft_state_t state = raft_get_state(node->raft_node);
+            state_str = raft_state_to_string(state);
+            term = raft_get_term(node->raft_node);
+            commit_idx = raft_get_commit_index(node->raft_node);
+        } else {
+            state_str = "CRASHED";
+        }
+        
+        printf("  Node %zu: %s (term=%u, commit=%u)\n",
+               i, state_str, term, commit_idx);
+    }
     printf("=====================\n\n");
 }
 

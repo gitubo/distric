@@ -73,6 +73,9 @@ typedef struct test_node {
     bool partitioned;           /**< Is this node partitioned? */
     int partition_group;        /**< Which partition group (0 or 1) */
     
+    /* Back-reference to cluster for partition checking */
+    struct test_cluster* cluster;  /**< Parent cluster (for partition checks) */
+    
 } test_node_t;
 
 /* ============================================================================
@@ -148,32 +151,34 @@ void test_cluster_destroy(test_cluster_t* cluster);
  * Starts RAFT nodes and RPC servers, begins tick threads.
  * 
  * @param cluster Cluster to start
- * @return true on success, false on failure
+ * @return true on success
  */
 bool test_cluster_start(test_cluster_t* cluster);
 
 /**
  * @brief Stop all nodes in the cluster
  * 
+ * Stops tick threads and RPC servers.
+ * 
  * @param cluster Cluster to stop
  */
 void test_cluster_stop(test_cluster_t* cluster);
 
 /**
- * @brief Get a node by index
+ * @brief Get RAFT node by ID
  * 
  * @param cluster Cluster
- * @param node_id Node index (0-based)
- * @return RAFT node handle, or NULL if invalid
+ * @param node_id Node ID (0-based)
+ * @return RAFT node, or NULL if not found
  */
 raft_node_t* test_cluster_get_node(test_cluster_t* cluster, int node_id);
 
 /**
- * @brief Get test node context by index
+ * @brief Get test node by ID
  * 
  * @param cluster Cluster
- * @param node_id Node index (0-based)
- * @return Test node context, or NULL if invalid
+ * @param node_id Node ID (0-based)
+ * @return Test node, or NULL if not found
  */
 test_node_t* test_cluster_get_test_node(test_cluster_t* cluster, int node_id);
 
@@ -182,87 +187,73 @@ test_node_t* test_cluster_get_test_node(test_cluster_t* cluster, int node_id);
  * ========================================================================= */
 
 /**
- * @brief Advance time by ticking all nodes
+ * @brief Get current time in milliseconds
  * 
- * Simulates the passage of time by calling raft_tick() on all
- * non-crashed nodes.
- * 
- * @param cluster Cluster to tick
- * @param ms Milliseconds to advance (will sleep this amount)
- */
-void test_cluster_tick(test_cluster_t* cluster, int ms);
-
-/**
- * @brief Get current monotonic time in milliseconds
- * 
- * @return Current time in ms
+ * @return Current time in milliseconds
  */
 uint64_t test_get_time_ms(void);
+
+/**
+ * @brief Advance cluster time
+ * 
+ * Sleeps for the specified amount of time, allowing nodes to tick.
+ * 
+ * @param cluster Cluster
+ * @param ms Milliseconds to advance
+ */
+void test_cluster_tick(test_cluster_t* cluster, int ms);
 
 /* ============================================================================
  * LEADER ELECTION HELPERS
  * ========================================================================= */
 
 /**
- * @brief Wait for a leader to be elected
- * 
- * Polls the cluster until exactly one leader is detected or timeout.
+ * @brief Find current leader in cluster
  * 
  * @param cluster Cluster to check
- * @param timeout_ms Maximum time to wait
- * @return Node ID of leader, or -1 on timeout
- */
-int test_cluster_wait_for_leader(test_cluster_t* cluster, uint32_t timeout_ms);
-
-/**
- * @brief Force a specific node to start an election
- * 
- * This is a helper for testing - directly triggers election logic.
- * 
- * @param cluster Cluster
- * @param node_id Node to start election
- * @return true on success
- */
-bool test_cluster_start_election(test_cluster_t* cluster, int node_id);
-
-/**
- * @brief Count number of nodes in each state
- * 
- * @param cluster Cluster to check
- * @param leaders_out Number of leaders (can be NULL)
- * @param candidates_out Number of candidates (can be NULL)
- * @param followers_out Number of followers (can be NULL)
- */
-void test_cluster_count_states(test_cluster_t* cluster,
-                               int* leaders_out,
-                               int* candidates_out,
-                               int* followers_out);
-
-/**
- * @brief Find the current leader
- * 
- * @param cluster Cluster to check
- * @return Node ID of leader, or -1 if none
+ * @return Leader node ID, or -1 if no leader
  */
 int test_cluster_find_leader(test_cluster_t* cluster);
+
+/**
+ * @brief Wait for leader to be elected
+ * 
+ * @param cluster Cluster to wait on
+ * @param timeout_ms Maximum time to wait in milliseconds
+ * @return Leader node ID, or -1 if timeout
+ */
+int test_cluster_wait_for_leader(test_cluster_t* cluster, int timeout_ms);
+
+/**
+ * @brief Wait for stable leader
+ * 
+ * Waits for a leader to be elected and remain stable for a period.
+ * 
+ * @param cluster Cluster to wait on
+ * @param stable_ms How long leader must be stable (milliseconds)
+ * @return Leader node ID, or -1 if timeout
+ */
+int test_cluster_wait_for_stable_leader(test_cluster_t* cluster, int stable_ms);
 
 /* ============================================================================
  * LOG REPLICATION HELPERS
  * ========================================================================= */
 
 /**
- * @brief Append entries to the leader and wait for replication
+ * @brief Replicate logs to followers
  * 
- * Finds the leader, appends test entries, and waits for them to commit.
+ * Waits for log replication to complete across the cluster.
  * 
  * @param cluster Cluster
- * @param num_entries Number of entries to append
- * @return true if replicated successfully
+ * @param num_entries Number of entries to replicate
+ * @return true if replication succeeded
  */
 bool test_cluster_replicate_logs(test_cluster_t* cluster, int num_entries);
 
 /**
- * @brief Append entries and wait for commit on majority
+ * @brief Replicate and commit a single entry
+ * 
+ * Helper that replicates one entry and waits for commit.
  * 
  * @param cluster Cluster
  * @return true on success
@@ -270,10 +261,9 @@ bool test_cluster_replicate_logs(test_cluster_t* cluster, int num_entries);
 bool test_cluster_replicate_and_commit(test_cluster_t* cluster);
 
 /**
- * @brief Check if all nodes agree on committed entries
+ * @brief Verify log consistency across cluster
  * 
- * Verifies that all non-crashed, non-partitioned nodes have the
- * same committed log prefix.
+ * Checks that all nodes have consistent logs.
  * 
  * @param cluster Cluster to check
  * @return true if logs are consistent
