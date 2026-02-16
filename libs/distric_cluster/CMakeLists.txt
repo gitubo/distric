@@ -18,6 +18,7 @@ find_package(Threads REQUIRED)
 set(CLUSTER_SOURCES
     src/cluster_coordinator.c
     src/worker_pool.c
+    src/config_manager.c
 )
 
 # Create library
