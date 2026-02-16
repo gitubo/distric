@@ -461,6 +461,45 @@ test_node_t* test_cluster_get_test_node(test_cluster_t* cluster, int node_id) {
     return &cluster->nodes[node_id];
 }
 
+void test_cluster_count_states(
+    test_cluster_t *cluster,
+    int *leaders,
+    int *candidates,
+    int *followers
+) {
+    if (!cluster || !leaders || !candidates || !followers) {
+        return;
+    }
+
+    *leaders = 0;
+    *candidates = 0;
+    *followers = 0;
+
+    for (size_t i = 0; i < cluster->num_nodes; i++) {
+        test_node_t *node = &cluster->nodes[i];
+        if (!node || !node->raft_node) {
+            continue;
+        }
+
+        raft_state_t state = raft_get_state(node->raft_node);
+        
+        switch (state) {
+            case RAFT_STATE_LEADER:
+                (*leaders)++;
+                break;
+            case RAFT_STATE_CANDIDATE:
+                (*candidates)++;
+                break;
+            case RAFT_STATE_FOLLOWER:
+                (*followers)++;
+                break;
+            default:
+                // Unknown state, don't count
+                break;
+        }
+    }
+}
+
 /* ============================================================================
  * TIME CONTROL
  * ========================================================================= */

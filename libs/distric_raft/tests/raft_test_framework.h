@@ -323,6 +323,21 @@ void test_cluster_set_message_loss_rate(test_cluster_t* cluster,
                                        int node_id,
                                        double rate);
 
+                                       /**
+ * Count the number of nodes in each Raft state
+ * 
+ * @param cluster The test cluster
+ * @param leaders Output: number of nodes in LEADER state
+ * @param candidates Output: number of nodes in CANDIDATE state  
+ * @param followers Output: number of nodes in FOLLOWER state
+ */
+void test_cluster_count_states(
+    test_cluster_t *cluster,
+    int *leaders,
+    int *candidates,
+    int *followers
+);
+
 /* ============================================================================
  * NODE CRASH/RESTART SIMULATION
  * ========================================================================= */

@@ -50,7 +50,8 @@ typedef enum {
     DISTRIC_ERR_MEMORY = -12,
     DISTRIC_ERR_IO = -13,
     DISTRIC_ERR_INVALID_STATE = -14,
-    DISTRIC_ERR_THREAD = -15
+    DISTRIC_ERR_THREAD = -15,
+    DISTRIC_ERR_UNAVAILABLE = -16
 } distric_err_t;
 
 

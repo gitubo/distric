@@ -266,9 +266,6 @@ distric_err_t raft_rpc_send_install_snapshot(
 distric_err_t raft_rpc_broadcast_request_vote(
     raft_rpc_context_t* context,
     raft_node_t* raft_node,
-    uint32_t term,
-    uint32_t last_log_index,
-    uint32_t last_log_term,
     uint32_t* votes_received_out
 );
 
