@@ -23,6 +23,7 @@ typedef struct {
     raft_node_t** nodes;
     uint32_t num_nodes;
     uint32_t initial_term;
+    int leader_id;
 } test_context_t;
 
 /**
@@ -46,8 +47,10 @@ static test_context_t* setup_test(void) {
         assert(ctx->nodes[i] != NULL);
     }
     
-    // Elect a leader
-    assert(test_cluster_find_leader(ctx->cluster) >= 0);
+    // Start the cluster and wait for leader election
+    test_cluster_start(ctx->cluster);
+    ctx->leader_id = test_cluster_wait_for_leader(ctx->cluster, 5000);
+    assert(ctx->leader_id >= 0);
     
     // Store initial term
     ctx->initial_term = raft_get_term(ctx->nodes[0]);
@@ -77,7 +80,7 @@ static void test_higher_term_request_vote(void) {
     printf("Running test: higher_term_request_vote\n");
     
     test_context_t* ctx = setup_test();
-    raft_node_t* leader = ctx->nodes[0];
+    raft_node_t* leader = ctx->nodes[ctx->leader_id];
     
     // Create a RequestVote with higher term
     uint32_t higher_term = ctx->initial_term + 10;
@@ -124,7 +127,7 @@ static void test_higher_term_append_entries(void) {
     printf("Running test: higher_term_append_entries\n");
     
     test_context_t* ctx = setup_test();
-    raft_node_t* leader = ctx->nodes[0];
+    raft_node_t* leader = ctx->nodes[ctx->leader_id];
     
     // Create AppendEntries with higher term
     uint32_t higher_term = ctx->initial_term + 5;
@@ -177,7 +180,7 @@ static void test_higher_term_outdated_log(void) {
     printf("Running test: higher_term_outdated_log\n");
     
     test_context_t* ctx = setup_test();
-    raft_node_t* leader = ctx->nodes[0];
+    raft_node_t* leader = ctx->nodes[ctx->leader_id];
     
     // Append some entries to the leader
     for (int i = 0; i < 5; i++) {
@@ -243,7 +246,7 @@ static void test_higher_term_persistence(void) {
     printf("Running test: higher_term_persistence\n");
     
     test_context_t* ctx = setup_test();
-    raft_node_t* leader = ctx->nodes[0];
+    raft_node_t* leader = ctx->nodes[ctx->leader_id];
     
     // Update term via RequestVote
     uint32_t higher_term = ctx->initial_term + 15;

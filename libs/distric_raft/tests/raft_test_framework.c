@@ -51,11 +51,32 @@ uint64_t test_get_time_ms(void) {
  */
 static void* tick_thread_func(void* arg) {
     test_node_t* node = (test_node_t*)arg;
+    uint32_t last_broadcast_term = 0;
     
     while (atomic_load(&node->running)) {
         if (!atomic_load(&node->crashed)) {
             /* Call raft_tick to advance time */
             raft_tick(node->raft_node);
+            
+            /* Get current state */
+            raft_state_t state = raft_get_state(node->raft_node);
+            uint32_t current_term = raft_get_term(node->raft_node);
+            
+            /* Broadcast vote requests when new election starts */
+            if (state == RAFT_STATE_CANDIDATE && current_term > last_broadcast_term) {
+                uint32_t votes = 0;
+                raft_rpc_broadcast_request_vote(node->rpc, node->raft_node, &votes);
+                last_broadcast_term = current_term;
+                
+                /* Process election result */
+                raft_process_election_result(node->raft_node, votes);
+            }
+            
+            /* Send heartbeats as leader */
+            if (state == RAFT_STATE_LEADER && raft_should_send_heartbeat(node->raft_node)) {
+                raft_rpc_broadcast_append_entries(node->rpc, node->raft_node);
+                raft_mark_heartbeat_sent(node->raft_node);
+            }
         }
         
         /* Sleep for tick interval */
