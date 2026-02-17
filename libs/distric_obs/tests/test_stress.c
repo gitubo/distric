@@ -300,7 +300,7 @@ static _Atomic uint64_t g_exported_spans = 0;
 
 static void overload_export_callback(trace_span_t* spans, size_t count,
                                      void* user_data) {
-    (void)user_data;
+    (void)spans; (void)user_data;
     atomic_fetch_add(&g_export_calls, 1);
     atomic_fetch_add(&g_exported_spans, count);
     /* Simulate a slow backend — deliberately delay export to build backpressure. */

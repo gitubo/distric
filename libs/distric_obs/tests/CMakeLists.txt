@@ -39,3 +39,7 @@ target_link_libraries(bench_logging PRIVATE distric_obs_static pthread m)
 add_executable(test_stress test_stress.c)
 target_link_libraries(test_stress PRIVATE distric_obs_static pthread m)
 add_test(NAME test_stress COMMAND test_stress)
+
+add_executable(test_stress_production test_stress_production.c)
+target_link_libraries(test_stress_production PRIVATE distric_obs_static pthread m)
+add_test(NAME test_stress_production COMMAND test_stress_production)
