@@ -113,14 +113,34 @@ static bool should_sample(tracer_t* tracer) {
     return rand_val < sample_rate;
 }
 
+/*
+ * Update the backpressure flag with hysteresis to prevent thrashing:
+ *   Enter backpressure at 75% fill.
+ *   Exit  backpressure at 50% fill.
+ * Both thresholds use relaxed loads — approximate fill level is acceptable
+ * for a sampling heuristic; exactness is not required.
+ */
 static void update_backpressure(tracer_t* tracer) {
-    uint64_t head = atomic_load_explicit(&tracer->head, memory_order_relaxed);
-    uint64_t tail = atomic_load_explicit(&tracer->tail, memory_order_relaxed);
+    uint64_t head       = atomic_load_explicit(&tracer->head, memory_order_relaxed);
+    uint64_t tail       = atomic_load_explicit(&tracer->tail, memory_order_relaxed);
     uint32_t buffer_size = tracer->buffer_mask + 1;
-    uint64_t used = (head >= tail) ? (head - tail) : 0;
-    
-    bool should_backpressure = (used * 100 / buffer_size) > 75;
-    atomic_store_explicit(&tracer->in_backpressure, should_backpressure, memory_order_relaxed);
+    uint64_t used       = (head >= tail) ? (head - tail) : 0;
+    uint32_t fill_pct   = (uint32_t)(used * 100u / buffer_size);
+
+    bool currently_in_bp = atomic_load_explicit(&tracer->in_backpressure,
+                                                 memory_order_relaxed);
+    bool should_be_in_bp;
+    if (currently_in_bp) {
+        should_be_in_bp = (fill_pct > 50); /* exit at 50% */
+    } else {
+        should_be_in_bp = (fill_pct > 75); /* enter at 75% */
+    }
+
+    if (should_be_in_bp != currently_in_bp) {
+        /* Relaxed store — this is advisory sampling state. */
+        atomic_store_explicit(&tracer->in_backpressure, should_be_in_bp,
+                              memory_order_relaxed);
+    }
 }
 
 static void* exporter_thread_fn(void* arg) {
@@ -172,11 +192,14 @@ distric_err_t trace_init(
     void (*export_callback)(trace_span_t*, size_t, void*),
     void* user_data) {
     
+    /* Default: 100% normal sampling, 10% under backpressure.
+     * This means tracing volume automatically drops by 90% when the export
+     * buffer exceeds 75% fill — graceful degradation under load. */
     trace_sampling_config_t default_sampling = {
-        .always_sample = 1,
-        .always_drop = 0,
-        .backpressure_sample = 1,
-        .backpressure_drop = 0
+        .always_sample        = 1,
+        .always_drop          = 0,
+        .backpressure_sample  = 1,
+        .backpressure_drop    = 9,
     };
     
     return trace_init_with_sampling(tracer, &default_sampling, export_callback, user_data);

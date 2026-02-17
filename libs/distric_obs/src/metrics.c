@@ -83,6 +83,25 @@ struct metrics_registry_s {
     pthread_mutex_t register_mutex;
 };
 
+/*
+ * Compute the maximum number of distinct label value combinations for a
+ * metric definition.
+ * Returns 0 when cardinality is unbounded (any dimension has
+ * num_allowed_values == 0) or when it overflows MAX_METRIC_CARDINALITY.
+ * Registration is rejected when this exceeds MAX_METRIC_CARDINALITY.
+ */
+static uint64_t compute_cardinality(const metric_label_definition_t* defs,
+                                    size_t count) {
+    if (!defs || count == 0) return 1; /* no labels → 1 combination */
+    uint64_t c = 1;
+    for (size_t i = 0; i < count; i++) {
+        if (defs[i].num_allowed_values == 0) return 0; /* unbounded */
+        c *= defs[i].num_allowed_values;
+        if (c > (uint64_t)MAX_METRIC_CARDINALITY) return 0;
+    }
+    return c;
+}
+
 static bool validate_label(const metric_label_t *label,
                            const metric_label_definition_t *def) {
     if (strcmp(label->key, def->key) != 0) {
@@ -235,7 +254,13 @@ distric_err_t metrics_register_counter(
     metric->num_label_defs = label_def_count > MAX_METRIC_LABELS ? MAX_METRIC_LABELS : label_def_count;
     
     if (label_defs && label_def_count > 0) {
-        memcpy(metric->label_defs, label_defs, 
+        /* Enforce cardinality cap before accepting the registration. */
+        uint64_t card = compute_cardinality(label_defs, metric->num_label_defs);
+        if (card == 0 || card > (uint64_t)MAX_METRIC_CARDINALITY) {
+            pthread_mutex_unlock(&registry->register_mutex);
+            return DISTRIC_ERR_HIGH_CARDINALITY;
+        }
+        memcpy(metric->label_defs, label_defs,
                metric->num_label_defs * sizeof(metric_label_definition_t));
     }
     
@@ -293,6 +318,11 @@ distric_err_t metrics_register_gauge(
     metric->num_label_defs = label_def_count > MAX_METRIC_LABELS ? MAX_METRIC_LABELS : label_def_count;
     
     if (label_defs && label_def_count > 0) {
+        uint64_t card = compute_cardinality(label_defs, metric->num_label_defs);
+        if (card == 0 || card > (uint64_t)MAX_METRIC_CARDINALITY) {
+            pthread_mutex_unlock(&registry->register_mutex);
+            return DISTRIC_ERR_HIGH_CARDINALITY;
+        }
         memcpy(metric->label_defs, label_defs,
                metric->num_label_defs * sizeof(metric_label_definition_t));
     }
@@ -351,6 +381,11 @@ distric_err_t metrics_register_histogram(
     metric->num_label_defs = label_def_count > MAX_METRIC_LABELS ? MAX_METRIC_LABELS : label_def_count;
     
     if (label_defs && label_def_count > 0) {
+        uint64_t card = compute_cardinality(label_defs, metric->num_label_defs);
+        if (card == 0 || card > (uint64_t)MAX_METRIC_CARDINALITY) {
+            pthread_mutex_unlock(&registry->register_mutex);
+            return DISTRIC_ERR_HIGH_CARDINALITY;
+        }
         memcpy(metric->label_defs, label_defs,
                metric->num_label_defs * sizeof(metric_label_definition_t));
     }

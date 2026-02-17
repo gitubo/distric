@@ -34,3 +34,8 @@ target_link_libraries(bench_metrics PRIVATE distric_obs_static pthread m)
 
 add_executable(bench_logging bench_logging.c)
 target_link_libraries(bench_logging PRIVATE distric_obs_static pthread m)
+
+# Stress tests (Gap #5 — overload and non-blocking verification)
+add_executable(test_stress test_stress.c)
+target_link_libraries(test_stress PRIVATE distric_obs_static pthread m)
+add_test(NAME test_stress COMMAND test_stress)
