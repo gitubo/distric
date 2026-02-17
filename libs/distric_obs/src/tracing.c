@@ -2,109 +2,193 @@
 #define _POSIX_C_SOURCE 199309L
 #endif
 
-#include "distric_obs/tracing.h"
+#include "distric_obs.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdatomic.h>
+#include <pthread.h>
 
-/* Thread-local active span */
+#define MAX_SPANS_BUFFER 1000
+
+#define SPAN_SLOT_EMPTY      0
+#define SPAN_SLOT_FILLED     1
+#define SPAN_SLOT_PROCESSING 2
+
+typedef struct {
+    _Atomic uint32_t state;
+    trace_span_t span;
+} span_slot_t;
+
+struct tracer_s {
+    span_slot_t* slots;
+    uint32_t buffer_mask;
+    
+    _Atomic uint64_t head;
+    _Atomic uint64_t tail;
+    
+    trace_sampling_config_t sampling;
+    _Atomic bool in_backpressure;
+    _Atomic uint64_t sample_counter;
+    
+    void (*export_callback)(trace_span_t*, size_t, void*);
+    void* user_data;
+    
+    _Atomic uint64_t spans_created;
+    _Atomic uint64_t spans_sampled_in;
+    _Atomic uint64_t spans_sampled_out;
+    _Atomic uint64_t spans_dropped_backpressure;
+    _Atomic uint64_t exports_attempted;
+    _Atomic uint64_t exports_succeeded;
+    
+    _Atomic uint32_t refcount;
+    _Atomic bool shutdown;
+    pthread_t exporter_thread;
+    bool exporter_started;
+};
+
 static __thread trace_span_t* tls_active_span = NULL;
 
-/* Get high-resolution timestamp in nanoseconds */
+static trace_span_t sampled_out_span = {
+    .sampled = false
+};
+
+static uint32_t next_power_of_2(uint32_t n) {
+    if (n == 0) return 1;
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    return n + 1;
+}
+
 static uint64_t get_time_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-/* Generate random trace ID */
 static trace_id_t generate_trace_id(void) {
     trace_id_t id;
-    /* Simple random generation - in production use better entropy source */
     id.high = ((uint64_t)rand() << 32) | rand();
     id.low = ((uint64_t)rand() << 32) | rand();
     return id;
 }
 
-/* Generate random span ID */
 static span_id_t generate_span_id(void) {
     return ((uint64_t)rand() << 32) | rand();
 }
 
-/* Background export thread */
-static void* export_thread_fn(void* arg) {
+static uint32_t fast_rand(void) {
+    static _Atomic uint32_t seed = 12345;
+    uint32_t s = atomic_load_explicit(&seed, memory_order_relaxed);
+    s = s * 1103515245 + 12345;
+    atomic_store_explicit(&seed, s, memory_order_relaxed);
+    return s;
+}
+
+static bool should_sample(tracer_t* tracer) {
+    bool backpressure = atomic_load_explicit(&tracer->in_backpressure, memory_order_relaxed);
+    
+    uint32_t sample_rate, total_rate;
+    if (backpressure) {
+        sample_rate = tracer->sampling.backpressure_sample;
+        total_rate = tracer->sampling.backpressure_sample +
+                     tracer->sampling.backpressure_drop;
+    } else {
+        sample_rate = tracer->sampling.always_sample;
+        total_rate = tracer->sampling.always_sample +
+                     tracer->sampling.always_drop;
+    }
+    
+    if (total_rate == 0) {
+        return false;
+    }
+    
+    uint32_t rand_val = fast_rand() % total_rate;
+    return rand_val < sample_rate;
+}
+
+static void update_backpressure(tracer_t* tracer) {
+    uint64_t head = atomic_load_explicit(&tracer->head, memory_order_relaxed);
+    uint64_t tail = atomic_load_explicit(&tracer->tail, memory_order_relaxed);
+    uint32_t buffer_size = tracer->buffer_mask + 1;
+    uint64_t used = (head >= tail) ? (head - tail) : 0;
+    
+    bool should_backpressure = (used * 100 / buffer_size) > 75;
+    atomic_store_explicit(&tracer->in_backpressure, should_backpressure, memory_order_relaxed);
+}
+
+static void* exporter_thread_fn(void* arg) {
     tracer_t* tracer = (tracer_t*)arg;
-    span_buffer_t* buffer = tracer->buffer;
     
-    struct timespec sleep_time = {
-        .tv_sec = SPAN_EXPORT_INTERVAL_MS / 1000,
-        .tv_nsec = (SPAN_EXPORT_INTERVAL_MS % 1000) * 1000000
-    };
-    
-    while (atomic_load(&buffer->running)) {
-        nanosleep(&sleep_time, NULL);
+    while (!atomic_load_explicit(&tracer->shutdown, memory_order_acquire)) {
+        uint64_t tail = atomic_load_explicit(&tracer->tail, memory_order_acquire);
+        uint64_t head = atomic_load_explicit(&tracer->head, memory_order_acquire);
         
-        pthread_mutex_lock(&buffer->lock);
-        
-        size_t read_pos = atomic_load(&buffer->read_pos);
-        size_t write_pos = atomic_load(&buffer->write_pos);
-        size_t available = write_pos - read_pos;
-        
-        if (available > 0 && tracer->export_callback) {
-            /* Export up to available spans */
-            size_t to_export = available > MAX_SPANS_BUFFER ? MAX_SPANS_BUFFER : available;
-            
-            /* Create temporary array for export */
-            trace_span_t* export_spans = malloc(to_export * sizeof(trace_span_t));
-            if (export_spans) {
-                for (size_t i = 0; i < to_export; i++) {
-                    size_t idx = (read_pos + i) % MAX_SPANS_BUFFER;
-                    memcpy(&export_spans[i], &buffer->spans[idx], sizeof(trace_span_t));
-                }
-                
-                /* Call user callback */
-                tracer->export_callback(export_spans, to_export, tracer->user_data);
-                
-                free(export_spans);
-                
-                /* Update read position */
-                atomic_store(&buffer->read_pos, read_pos + to_export);
-            }
+        if (tail == head) {
+            struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000};
+            nanosleep(&ts, NULL);
+            update_backpressure(tracer);
+            continue;
         }
         
-        pthread_mutex_unlock(&buffer->lock);
-    }
-    
-    /* Final flush on shutdown */
-    pthread_mutex_lock(&buffer->lock);
-    size_t read_pos = atomic_load(&buffer->read_pos);
-    size_t write_pos = atomic_load(&buffer->write_pos);
-    size_t remaining = write_pos - read_pos;
-    
-    if (remaining > 0 && tracer->export_callback) {
-        trace_span_t* export_spans = malloc(remaining * sizeof(trace_span_t));
-        if (export_spans) {
-            for (size_t i = 0; i < remaining; i++) {
-                size_t idx = (read_pos + i) % MAX_SPANS_BUFFER;
-                memcpy(&export_spans[i], &buffer->spans[idx], sizeof(trace_span_t));
-            }
-            
-            tracer->export_callback(export_spans, remaining, tracer->user_data);
-            free(export_spans);
+        uint32_t slot_idx = tail & tracer->buffer_mask;
+        span_slot_t* slot = &tracer->slots[slot_idx];
+        
+        uint32_t expected = SPAN_SLOT_FILLED;
+        if (!atomic_compare_exchange_strong_explicit(
+                &slot->state, &expected, SPAN_SLOT_PROCESSING,
+                memory_order_acquire, memory_order_relaxed)) {
+            struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000};
+            nanosleep(&ts, NULL);
+            continue;
         }
+        
+        atomic_fetch_add_explicit(&tracer->exports_attempted, 1, memory_order_relaxed);
+        
+        if (tracer->export_callback) {
+            trace_span_t spans[1];
+            memcpy(&spans[0], &slot->span, sizeof(trace_span_t));
+            tracer->export_callback(spans, 1, tracer->user_data);
+            atomic_fetch_add_explicit(&tracer->exports_succeeded, 1, memory_order_relaxed);
+        }
+        
+        atomic_store_explicit(&slot->state, SPAN_SLOT_EMPTY, memory_order_release);
+        atomic_store_explicit(&tracer->tail, tail + 1, memory_order_release);
+        
+        update_backpressure(tracer);
     }
-    pthread_mutex_unlock(&buffer->lock);
     
     return NULL;
 }
 
-/* Initialize tracer */
-distric_err_t trace_init(tracer_t** tracer,
-                         void (*export_callback)(trace_span_t*, size_t, void*),
-                         void* user_data) {
-    if (!tracer) {
+distric_err_t trace_init(
+    tracer_t** tracer,
+    void (*export_callback)(trace_span_t*, size_t, void*),
+    void* user_data) {
+    
+    trace_sampling_config_t default_sampling = {
+        .always_sample = 1,
+        .always_drop = 0,
+        .backpressure_sample = 1,
+        .backpressure_drop = 0
+    };
+    
+    return trace_init_with_sampling(tracer, &default_sampling, export_callback, user_data);
+}
+
+distric_err_t trace_init_with_sampling(
+    tracer_t** tracer,
+    const trace_sampling_config_t* sampling,
+    void (*export_callback)(trace_span_t*, size_t, void*),
+    void* user_data) {
+    
+    if (!tracer || !sampling) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
@@ -113,182 +197,227 @@ distric_err_t trace_init(tracer_t** tracer,
         return DISTRIC_ERR_ALLOC_FAILURE;
     }
     
-    t->buffer = calloc(1, sizeof(span_buffer_t));
-    if (!t->buffer) {
+    t->sampling = *sampling;
+    t->export_callback = export_callback;
+    t->user_data = user_data;
+    
+    uint32_t buffer_size = next_power_of_2(MAX_SPANS_BUFFER);
+    t->buffer_mask = buffer_size - 1;
+    
+    t->slots = calloc(buffer_size, sizeof(span_slot_t));
+    if (!t->slots) {
         free(t);
         return DISTRIC_ERR_ALLOC_FAILURE;
     }
     
-    atomic_init(&t->buffer->write_pos, 0);
-    atomic_init(&t->buffer->read_pos, 0);
-    atomic_init(&t->buffer->running, true);
-    
-    if (pthread_mutex_init(&t->buffer->lock, NULL) != 0) {
-        free(t->buffer);
-        free(t);
-        return DISTRIC_ERR_INIT_FAILED;
+    for (uint32_t i = 0; i < buffer_size; i++) {
+        atomic_init(&t->slots[i].state, SPAN_SLOT_EMPTY);
     }
     
+    atomic_init(&t->head, 0);
+    atomic_init(&t->tail, 0);
+    atomic_init(&t->spans_created, 0);
+    atomic_init(&t->spans_sampled_in, 0);
+    atomic_init(&t->spans_sampled_out, 0);
+    atomic_init(&t->spans_dropped_backpressure, 0);
+    atomic_init(&t->exports_attempted, 0);
+    atomic_init(&t->exports_succeeded, 0);
+    atomic_init(&t->sample_counter, 0);
+    atomic_init(&t->in_backpressure, false);
+    atomic_init(&t->refcount, 1);
     atomic_init(&t->shutdown, false);
-    t->export_callback = export_callback;
-    t->user_data = user_data;
     
-    /* Start export thread */
-    if (pthread_create(&t->export_thread, NULL, export_thread_fn, t) != 0) {
-        pthread_mutex_destroy(&t->buffer->lock);
-        free(t->buffer);
+    if (pthread_create(&t->exporter_thread, NULL, exporter_thread_fn, t) != 0) {
+        free(t->slots);
         free(t);
         return DISTRIC_ERR_INIT_FAILED;
     }
+    t->exporter_started = true;
     
     *tracer = t;
     return DISTRIC_OK;
 }
 
-/* Destroy tracer */
-void trace_destroy(tracer_t* tracer) {
-    if (!tracer) {
-        return;
+void trace_retain(tracer_t* tracer) {
+    if (!tracer) return;
+    atomic_fetch_add_explicit(&tracer->refcount, 1, memory_order_relaxed);
+}
+
+void trace_release(tracer_t* tracer) {
+    if (!tracer) return;
+    
+    uint32_t old_ref = atomic_fetch_sub_explicit(&tracer->refcount, 1, memory_order_acq_rel);
+    if (old_ref != 1) return;
+    
+    atomic_store_explicit(&tracer->shutdown, true, memory_order_release);
+    
+    if (tracer->exporter_started) {
+        pthread_join(tracer->exporter_thread, NULL);
     }
     
-    if (tracer->buffer) {
-        atomic_store(&tracer->buffer->running, false);
-        pthread_join(tracer->export_thread, NULL);
-        pthread_mutex_destroy(&tracer->buffer->lock);
-        free(tracer->buffer);
-    }
-    
+    free(tracer->slots);
     free(tracer);
 }
 
-/* Start root span */
-distric_err_t trace_start_span(tracer_t* tracer, const char* operation,
-                               trace_span_t** out_span) {
+void trace_destroy(tracer_t* tracer) {
+    trace_release(tracer);
+}
+
+distric_err_t trace_start_span(
+    tracer_t* tracer,
+    const char* operation,
+    trace_span_t** out_span) {
+    
     if (!tracer || !operation || !out_span) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    trace_span_t* span = calloc(1, sizeof(trace_span_t));
-    if (!span) {
-        return DISTRIC_ERR_ALLOC_FAILURE;
+    atomic_fetch_add_explicit(&tracer->spans_created, 1, memory_order_relaxed);
+    
+    if (!should_sample(tracer)) {
+        atomic_fetch_add_explicit(&tracer->spans_sampled_out, 1, memory_order_relaxed);
+        *out_span = &sampled_out_span;
+        return DISTRIC_OK;
     }
+    
+    atomic_fetch_add_explicit(&tracer->spans_sampled_in, 1, memory_order_relaxed);
+    
+    trace_span_t* span = malloc(sizeof(trace_span_t));
+    if (!span) {
+        *out_span = &sampled_out_span;
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    memset(span, 0, sizeof(*span));
     
     span->trace_id = generate_trace_id();
     span->span_id = generate_span_id();
     span->parent_span_id = 0;
     
-    strncpy(span->operation, operation, MAX_OPERATION_NAME_LEN - 1);
-    span->operation[MAX_OPERATION_NAME_LEN - 1] = '\0';
+    strncpy(span->operation, operation, TRACE_MAX_OPERATION_LEN - 1);
+    span->operation[TRACE_MAX_OPERATION_LEN - 1] = '\0';
     
     span->start_time_ns = get_time_ns();
-    span->end_time_ns = 0;
     span->tag_count = 0;
     span->status = SPAN_STATUS_UNSET;
-    atomic_init(&span->finished, false);
+    span->sampled = true;
+    span->_tracer = tracer;
     
     *out_span = span;
     return DISTRIC_OK;
 }
 
-/* Start child span */
-distric_err_t trace_start_child_span(tracer_t* tracer, trace_span_t* parent,
-                                     const char* operation, trace_span_t** out_span) {
+distric_err_t trace_start_child_span(
+    tracer_t* tracer,
+    trace_span_t* parent,
+    const char* operation,
+    trace_span_t** out_span) {
+    
     if (!tracer || !parent || !operation || !out_span) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    trace_span_t* span = calloc(1, sizeof(trace_span_t));
-    if (!span) {
-        return DISTRIC_ERR_ALLOC_FAILURE;
+    atomic_fetch_add_explicit(&tracer->spans_created, 1, memory_order_relaxed);
+    
+    if (!should_sample(tracer)) {
+        atomic_fetch_add_explicit(&tracer->spans_sampled_out, 1, memory_order_relaxed);
+        *out_span = &sampled_out_span;
+        return DISTRIC_OK;
     }
+    
+    atomic_fetch_add_explicit(&tracer->spans_sampled_in, 1, memory_order_relaxed);
+    
+    trace_span_t* span = malloc(sizeof(trace_span_t));
+    if (!span) {
+        *out_span = &sampled_out_span;
+        return DISTRIC_ERR_NO_MEMORY;
+    }
+    
+    memset(span, 0, sizeof(*span));
     
     span->trace_id = parent->trace_id;
     span->span_id = generate_span_id();
     span->parent_span_id = parent->span_id;
     
-    strncpy(span->operation, operation, MAX_OPERATION_NAME_LEN - 1);
-    span->operation[MAX_OPERATION_NAME_LEN - 1] = '\0';
+    strncpy(span->operation, operation, TRACE_MAX_OPERATION_LEN - 1);
+    span->operation[TRACE_MAX_OPERATION_LEN - 1] = '\0';
     
     span->start_time_ns = get_time_ns();
-    span->end_time_ns = 0;
     span->tag_count = 0;
     span->status = SPAN_STATUS_UNSET;
-    atomic_init(&span->finished, false);
+    span->sampled = true;
+    span->_tracer = tracer;
     
     *out_span = span;
     return DISTRIC_OK;
 }
 
-/* Add tag to span */
 distric_err_t trace_add_tag(trace_span_t* span, const char* key, const char* value) {
-    if (!span || !key || !value) {
-        return DISTRIC_ERR_INVALID_ARG;
+    if (!span || !key || !value || !span->sampled) {
+        return DISTRIC_OK;
     }
     
-    if (span->tag_count >= MAX_SPAN_TAGS) {
+    if (span->tag_count >= TRACE_MAX_SPAN_TAGS) {
         return DISTRIC_ERR_BUFFER_OVERFLOW;
     }
     
     span_tag_t* tag = &span->tags[span->tag_count];
-    strncpy(tag->key, key, MAX_TAG_KEY_LEN - 1);
-    tag->key[MAX_TAG_KEY_LEN - 1] = '\0';
+    strncpy(tag->key, key, TRACE_MAX_TAG_KEY_LEN - 1);
+    tag->key[TRACE_MAX_TAG_KEY_LEN - 1] = '\0';
     
-    strncpy(tag->value, value, MAX_TAG_VALUE_LEN - 1);
-    tag->value[MAX_TAG_VALUE_LEN - 1] = '\0';
+    strncpy(tag->value, value, TRACE_MAX_TAG_VALUE_LEN - 1);
+    tag->value[TRACE_MAX_TAG_VALUE_LEN - 1] = '\0';
     
     span->tag_count++;
     return DISTRIC_OK;
 }
 
-/* Set span status */
 void trace_set_status(trace_span_t* span, span_status_t status) {
-    if (span) {
+    if (span && span->sampled) {
         span->status = status;
     }
 }
 
-/* Finish span */
 void trace_finish_span(tracer_t* tracer, trace_span_t* span) {
-    if (!tracer || !span) {
+    if (!span || !span->sampled || span == &sampled_out_span) {
         return;
     }
     
-    /* Mark span as finished */
     span->end_time_ns = get_time_ns();
-    atomic_store(&span->finished, true);
     
-    /* Add to buffer */
-    pthread_mutex_lock(&tracer->buffer->lock);
+    if (!tracer) {
+        tracer = (struct tracer_s*)span->_tracer;
+    }
     
-    size_t write_pos = atomic_load(&tracer->buffer->write_pos);
-    size_t read_pos = atomic_load(&tracer->buffer->read_pos);
-    
-    /* Check if buffer is full */
-    if (write_pos - read_pos >= MAX_SPANS_BUFFER) {
-        pthread_mutex_unlock(&tracer->buffer->lock);
+    if (!tracer) {
         free(span);
         return;
     }
     
-    /* Copy span to buffer */
-    size_t idx = write_pos % MAX_SPANS_BUFFER;
-    memcpy(&tracer->buffer->spans[idx], span, sizeof(trace_span_t));
+    uint64_t head = atomic_load_explicit(&tracer->head, memory_order_acquire);
+    uint64_t tail = atomic_load_explicit(&tracer->tail, memory_order_acquire);
+    uint32_t buffer_size = tracer->buffer_mask + 1;
     
-    atomic_store(&tracer->buffer->write_pos, write_pos + 1);
+    if (head - tail >= buffer_size) {
+        atomic_fetch_add_explicit(&tracer->spans_dropped_backpressure, 1, memory_order_relaxed);
+        free(span);
+        return;
+    }
     
-    pthread_mutex_unlock(&tracer->buffer->lock);
+    uint64_t slot_idx = atomic_fetch_add_explicit(&tracer->head, 1, memory_order_acq_rel);
+    span_slot_t* slot = &tracer->slots[slot_idx & tracer->buffer_mask];
     
-    /* Free the span memory */
+    memcpy(&slot->span, span, sizeof(trace_span_t));
+    atomic_store_explicit(&slot->state, SPAN_SLOT_FILLED, memory_order_release);
+    
     free(span);
 }
 
-/* Inject trace context into header */
 distric_err_t trace_inject_context(trace_span_t* span, char* header, size_t header_size) {
     if (!span || !header || header_size < 128) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* Format: traceparent: 00-<trace_id>-<span_id>-01 */
     int written = snprintf(header, header_size,
                           "00-%016lx%016lx-%016lx-01",
                           span->trace_id.high, span->trace_id.low,
@@ -301,13 +430,11 @@ distric_err_t trace_inject_context(trace_span_t* span, char* header, size_t head
     return DISTRIC_OK;
 }
 
-/* Extract trace context from header */
 distric_err_t trace_extract_context(const char* header, trace_context_t* context) {
     if (!header || !context) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    /* Parse format: 00-<trace_id>-<span_id>-01 */
     unsigned long long trace_high, trace_low, span_id;
     int parsed = sscanf(header, "00-%016llx%016llx-%016llx-",
                        &trace_high, &trace_low, &span_id);
@@ -323,43 +450,43 @@ distric_err_t trace_extract_context(const char* header, trace_context_t* context
     return DISTRIC_OK;
 }
 
-/* Start span from extracted context */
-distric_err_t trace_start_span_from_context(tracer_t* tracer,
-                                            const trace_context_t* context,
-                                            const char* operation,
-                                            trace_span_t** out_span) {
+distric_err_t trace_start_span_from_context(
+    tracer_t* tracer,
+    const trace_context_t* context,
+    const char* operation,
+    trace_span_t** out_span) {
+    
     if (!tracer || !context || !operation || !out_span) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    trace_span_t* span = calloc(1, sizeof(trace_span_t));
+    trace_span_t* span = malloc(sizeof(trace_span_t));
     if (!span) {
-        return DISTRIC_ERR_ALLOC_FAILURE;
+        *out_span = &sampled_out_span;
+        return DISTRIC_ERR_NO_MEMORY;
     }
+    
+    memset(span, 0, sizeof(*span));
     
     span->trace_id = context->trace_id;
     span->span_id = generate_span_id();
     span->parent_span_id = context->span_id;
     
-    strncpy(span->operation, operation, MAX_OPERATION_NAME_LEN - 1);
-    span->operation[MAX_OPERATION_NAME_LEN - 1] = '\0';
+    strncpy(span->operation, operation, TRACE_MAX_OPERATION_LEN - 1);
     
     span->start_time_ns = get_time_ns();
-    span->end_time_ns = 0;
-    span->tag_count = 0;
     span->status = SPAN_STATUS_UNSET;
-    atomic_init(&span->finished, false);
+    span->sampled = true;
+    span->_tracer = tracer;
     
     *out_span = span;
     return DISTRIC_OK;
 }
 
-/* Set thread-local active span */
 void trace_set_active_span(trace_span_t* span) {
     tls_active_span = span;
 }
 
-/* Get thread-local active span */
 trace_span_t* trace_get_active_span(void) {
     return tls_active_span;
 }

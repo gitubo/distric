@@ -1,22 +1,3 @@
-/**
- * @file logging_fixed.c
- * @brief FIXED: Thread-safe logger shutdown
- * 
- * ROOT CAUSE: Use-after-free during concurrent shutdown
- * 
- * PROBLEM:
- * 1. Integration test destroys logger
- * 2. Background threads (UDP, TCP, HTTP, tracing) still running
- * 3. Those threads call LOG_*() macros
- * 4. Logger already freed → SEGFAULT
- * 
- * FIX:
- * 1. Add shutdown flag to logger (check before writing)
- * 2. Ensure flush thread exits cleanly
- * 3. Make log_write() return early if logger is shutting down
- */
-
-/* Feature test macros must come before any includes */
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif
@@ -25,7 +6,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
-#include "distric_obs/logging.h"
+#include "distric_obs.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -34,11 +15,46 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
-/* Thread-local buffer for log formatting */
+#define LOG_BUFFER_SIZE 4096
+#define RING_BUFFER_SIZE 16384
+#define RING_BUFFER_MASK (RING_BUFFER_SIZE - 1)
+
+#define LOG_SLOT_EMPTY 0
+#define LOG_SLOT_FILLED 1
+#define LOG_SLOT_PROCESSING 2
+
+typedef struct {
+    _Atomic uint32_t state;
+    log_level_t level;
+    uint64_t timestamp_ms;
+    char message[512];
+} log_entry_t;
+
+typedef struct {
+    log_entry_t entries[RING_BUFFER_SIZE];
+    _Atomic uint64_t head;
+    _Atomic uint64_t tail;
+    _Atomic bool running;
+} ring_buffer_t;
+
+struct logger_s {
+    int fd;
+    log_mode_t mode;
+    ring_buffer_t* ring_buffer;
+    pthread_t flush_thread;
+    _Atomic uint32_t refcount;
+    _Atomic bool shutdown;
+    
+    _Atomic uint64_t messages_logged;
+    _Atomic uint64_t messages_dropped;
+    _Atomic uint64_t drops_by_level[5];
+};
+
 static __thread char tls_buffer[LOG_BUFFER_SIZE];
 
-/* Architecture-specific pause instruction */
 #if defined(__x86_64__) || defined(__i386__)
     #define CPU_PAUSE() __asm__ __volatile__("pause" ::: "memory")
 #elif defined(__aarch64__) || defined(__arm__)
@@ -47,7 +63,6 @@ static __thread char tls_buffer[LOG_BUFFER_SIZE];
     #define CPU_PAUSE() do { } while(0)
 #endif
 
-/* Convert log level to string */
 static const char* log_level_str(log_level_t level) {
     switch (level) {
         case LOG_LEVEL_DEBUG: return "DEBUG";
@@ -59,14 +74,12 @@ static const char* log_level_str(log_level_t level) {
     }
 }
 
-/* Get current timestamp in milliseconds */
 static uint64_t get_timestamp_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
 }
 
-/* Escape JSON string - optimized version */
 static void json_escape(const char* src, char* dst, size_t dst_size) {
     if (!src || !dst || dst_size == 0) return;
     
@@ -100,56 +113,40 @@ static void json_escape(const char* src, char* dst, size_t dst_size) {
     dst[j] = '\0';
 }
 
-/* Background thread for async logging */
 static void* flush_thread_fn(void* arg) {
     logger_t* logger = (logger_t*)arg;
     ring_buffer_t* rb = logger->ring_buffer;
     
     while (atomic_load_explicit(&rb->running, memory_order_acquire) || 
-           atomic_load_explicit(&rb->read_pos, memory_order_acquire) != 
-           atomic_load_explicit(&rb->write_pos, memory_order_acquire)) {
+           atomic_load_explicit(&rb->tail, memory_order_acquire) != 
+           atomic_load_explicit(&rb->head, memory_order_acquire)) {
         
-        size_t read_pos = atomic_load_explicit(&rb->read_pos, memory_order_acquire);
-        size_t write_pos = atomic_load_explicit(&rb->write_pos, memory_order_acquire);
+        uint64_t tail = atomic_load_explicit(&rb->tail, memory_order_acquire);
+        uint64_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
         
-        if (read_pos == write_pos) {
+        if (tail == head) {
             usleep(1000);
             continue;
         }
 
-        log_entry_t* entry = &rb->entries[read_pos & RING_BUFFER_MASK];
+        log_entry_t* entry = &rb->entries[tail & RING_BUFFER_MASK];
         
         int spin_count = 0;
         const int MAX_SPIN = 100;
         
-        while (!atomic_load_explicit(&entry->ready, memory_order_acquire)) {
-            if (spin_count < 10) {
-                CPU_PAUSE();
-                spin_count++;
-            } else if (spin_count < MAX_SPIN) {
-                sched_yield();
-                spin_count++;
-            } else {
-                /* Timeout - skip this entry if shutting down */
-                if (!atomic_load_explicit(&rb->running, memory_order_acquire)) {
-                    atomic_store_explicit(&rb->read_pos, read_pos + 1, memory_order_release);
-                    break;
-                }
-                
-                /* Still running but entry stuck - skip it */
-                atomic_store_explicit(&rb->read_pos, read_pos + 1, memory_order_release);
-                break;
-            }
+        while (!atomic_load_explicit(&entry->state, memory_order_acquire) && spin_count < MAX_SPIN) {
+            CPU_PAUSE();
+            spin_count++;
         }
         
-        if (atomic_load_explicit(&entry->ready, memory_order_acquire)) {
-            if (entry->length > 0) {
+        if (atomic_load_explicit(&entry->state, memory_order_acquire) == LOG_SLOT_FILLED) {
+            if (strlen(entry->message) > 0) {
                 ssize_t written = 0;
                 ssize_t total = 0;
+                size_t len = strlen(entry->message);
                 
-                while (total < (ssize_t)entry->length) {
-                    written = write(logger->fd, entry->data + total, 
-                                   entry->length - total);
+                while (total < (ssize_t)len) {
+                    written = write(logger->fd, entry->message + total, len - total);
                     if (written < 0) {
                         if (errno == EINTR) continue;
                         break;
@@ -158,22 +155,17 @@ static void* flush_thread_fn(void* arg) {
                 }
             }
             
-            atomic_store_explicit(&entry->ready, false, memory_order_release);
+            atomic_store_explicit(&entry->state, LOG_SLOT_EMPTY, memory_order_release);
         }
         
-        atomic_store_explicit(&rb->read_pos, read_pos + 1, memory_order_release);
+        atomic_store_explicit(&rb->tail, tail + 1, memory_order_release);
     }
     
     return NULL;
 }
 
-/* Initialize logger with output file descriptor and mode */
 distric_err_t log_init(logger_t** logger, int fd, log_mode_t mode) {
-    if (!logger) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    if (fd < 0) {
+    if (!logger || fd < 0) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
@@ -184,7 +176,13 @@ distric_err_t log_init(logger_t** logger, int fd, log_mode_t mode) {
     
     log->fd = fd;
     log->mode = mode;
-    atomic_init(&log->shutdown, false);  /* CRITICAL: Initialize shutdown flag */
+    atomic_init(&log->refcount, 1);
+    atomic_init(&log->shutdown, false);
+    atomic_init(&log->messages_logged, 0);
+    atomic_init(&log->messages_dropped, 0);
+    for (int i = 0; i < 5; i++) {
+        atomic_init(&log->drops_by_level[i], 0);
+    }
     
     if (mode == LOG_MODE_ASYNC) {
         log->ring_buffer = calloc(1, sizeof(ring_buffer_t));
@@ -193,13 +191,12 @@ distric_err_t log_init(logger_t** logger, int fd, log_mode_t mode) {
             return DISTRIC_ERR_ALLOC_FAILURE;
         }
         
-        atomic_init(&log->ring_buffer->write_pos, 0);
-        atomic_init(&log->ring_buffer->read_pos, 0);
+        atomic_init(&log->ring_buffer->head, 0);
+        atomic_init(&log->ring_buffer->tail, 0);
         atomic_init(&log->ring_buffer->running, true);
         
         for (size_t i = 0; i < RING_BUFFER_SIZE; i++) {
-            atomic_init(&log->ring_buffer->entries[i].ready, false);
-            log->ring_buffer->entries[i].length = 0;
+            atomic_init(&log->ring_buffer->entries[i].state, LOG_SLOT_EMPTY);
         }
         
         if (pthread_create(&log->flush_thread, NULL, flush_thread_fn, log) != 0) {
@@ -213,51 +210,46 @@ distric_err_t log_init(logger_t** logger, int fd, log_mode_t mode) {
     return DISTRIC_OK;
 }
 
-/* Destroy logger and flush all pending logs - HARDENED */
-void log_destroy(logger_t* logger) {
-    if (!logger) {
-        return;
-    }
+void log_retain(logger_t* logger) {
+    if (!logger) return;
+    atomic_fetch_add_explicit(&logger->refcount, 1, memory_order_relaxed);
+}
+
+void log_release(logger_t* logger) {
+    if (!logger) return;
     
-    /* CRITICAL FIX: Set shutdown flag FIRST to prevent new writes */
-    atomic_store_explicit(&logger->shutdown, true, memory_order_seq_cst);
+    uint32_t old_ref = atomic_fetch_sub_explicit(&logger->refcount, 1, memory_order_acq_rel);
+    if (old_ref != 1) return;
     
-    /* Memory barrier to ensure all threads see shutdown flag */
-    atomic_thread_fence(memory_order_seq_cst);
+    atomic_store_explicit(&logger->shutdown, true, memory_order_release);
     
     if (logger->mode == LOG_MODE_ASYNC && logger->ring_buffer) {
-        /* Stop the ring buffer */
         atomic_store_explicit(&logger->ring_buffer->running, false, memory_order_release);
-        
-        /* Wait for flush thread to exit cleanly */
         pthread_join(logger->flush_thread, NULL);
-        
-        /* Now safe to free ring buffer */
         free(logger->ring_buffer);
     }
     
-    /* Finally free logger struct */
     free(logger);
 }
 
-/* Write a log entry - HARDENED with shutdown check */
-distric_err_t log_write(logger_t* logger, log_level_t level, 
+void log_destroy(logger_t* logger) {
+    log_release(logger);
+}
+
+distric_err_t log_write(logger_t* logger, log_level_t level,
                        const char* component, const char* message, ...) {
-    /* CRITICAL FIX: Check shutdown flag BEFORE accessing logger */
     if (!logger || atomic_load_explicit(&logger->shutdown, memory_order_acquire)) {
-        return DISTRIC_ERR_INVALID_ARG;  /* Silently fail if shutting down */
+        return DISTRIC_ERR_INVALID_ARG;
     }
     
     if (!component || !message) {
         return DISTRIC_ERR_INVALID_ARG;
     }
 
-    /* Use thread-local buffer */
     size_t remaining = LOG_BUFFER_SIZE;
     size_t offset = 0;
     int written;
 
-    /* Start JSON object */
     written = snprintf(tls_buffer + offset, remaining, "{");
     if (written < 0 || (size_t)written >= remaining) {
         return DISTRIC_ERR_BUFFER_OVERFLOW;
@@ -265,7 +257,6 @@ distric_err_t log_write(logger_t* logger, log_level_t level,
     offset += written;
     remaining -= written;
 
-    /* Timestamp */
     uint64_t ts = get_timestamp_ms();
     written = snprintf(tls_buffer + offset, remaining, "\"timestamp\":%lu,", ts);
     if (written < 0 || (size_t)written >= remaining) {
@@ -274,12 +265,11 @@ distric_err_t log_write(logger_t* logger, log_level_t level,
     offset += written;
     remaining -= written;
 
-    /* Level and Component */
     char escaped_component[256];
     json_escape(component, escaped_component, sizeof(escaped_component));
     
-    written = snprintf(tls_buffer + offset, remaining, 
-                      "\"level\":\"%s\",\"component\":\"%s\",", 
+    written = snprintf(tls_buffer + offset, remaining,
+                      "\"level\":\"%s\",\"component\":\"%s\",",
                       log_level_str(level), escaped_component);
     if (written < 0 || (size_t)written >= remaining) {
         return DISTRIC_ERR_BUFFER_OVERFLOW;
@@ -287,10 +277,9 @@ distric_err_t log_write(logger_t* logger, log_level_t level,
     offset += written;
     remaining -= written;
 
-    /* Message */
     char escaped_message[1024];
     json_escape(message, escaped_message, sizeof(escaped_message));
-    written = snprintf(tls_buffer + offset, remaining, 
+    written = snprintf(tls_buffer + offset, remaining,
                       "\"message\":\"%s\"", escaped_message);
     if (written < 0 || (size_t)written >= remaining) {
         return DISTRIC_ERR_BUFFER_OVERFLOW;
@@ -298,7 +287,6 @@ distric_err_t log_write(logger_t* logger, log_level_t level,
     offset += written;
     remaining -= written;
 
-    /* Varargs */
     va_list args;
     va_start(args, message);
     const char* key;
@@ -311,7 +299,7 @@ distric_err_t log_write(logger_t* logger, log_level_t level,
         json_escape(key, escaped_key, sizeof(escaped_key));
         json_escape(val, escaped_val, sizeof(escaped_val));
         
-        written = snprintf(tls_buffer + offset, remaining, 
+        written = snprintf(tls_buffer + offset, remaining,
                           ",\"%s\":\"%s\"", escaped_key, escaped_val);
         if (written < 0 || (size_t)written >= remaining) {
             break;
@@ -321,14 +309,12 @@ distric_err_t log_write(logger_t* logger, log_level_t level,
     }
     va_end(args);
 
-    /* End JSON object */
     written = snprintf(tls_buffer + offset, remaining, "}\n");
     if (written < 0 || (size_t)written >= remaining) {
         return DISTRIC_ERR_BUFFER_OVERFLOW;
     }
     offset += written;
 
-    /* CRITICAL: Check shutdown again before writing */
     if (atomic_load_explicit(&logger->shutdown, memory_order_acquire)) {
         return DISTRIC_ERR_INVALID_ARG;
     }
@@ -339,48 +325,41 @@ distric_err_t log_write(logger_t* logger, log_level_t level,
             ssize_t n = write(logger->fd, tls_buffer + total, offset - total);
             if (n < 0) {
                 if (errno == EINTR) continue;
-                return DISTRIC_ERR_INIT_FAILED;
+                return DISTRIC_ERR_IO;
             }
             total += n;
         }
+        atomic_fetch_add_explicit(&logger->messages_logged, 1, memory_order_relaxed);
         return DISTRIC_OK;
     } else {
-        /* Async mode */
         ring_buffer_t* rb = logger->ring_buffer;
         
-        /* Check if ring buffer is being shut down */
         if (!rb || !atomic_load_explicit(&rb->running, memory_order_acquire)) {
             return DISTRIC_ERR_INVALID_ARG;
         }
         
-        size_t current_write = atomic_load_explicit(&rb->write_pos, memory_order_acquire);
-        size_t current_read = atomic_load_explicit(&rb->read_pos, memory_order_acquire);
+        uint64_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+        uint64_t tail = atomic_load_explicit(&rb->tail, memory_order_acquire);
         
-        size_t used = current_write - current_read;
-        
-        if (used >= RING_BUFFER_SIZE - 1) {
+        if (head - tail >= RING_BUFFER_SIZE - 1) {
+            atomic_fetch_add_explicit(&logger->messages_dropped, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&logger->drops_by_level[level], 1, memory_order_relaxed);
             return DISTRIC_ERR_BUFFER_OVERFLOW;
         }
         
-        size_t write_pos = atomic_fetch_add_explicit(&rb->write_pos, 1, 
-                                                     memory_order_acq_rel);
-        log_entry_t* entry = &rb->entries[write_pos & RING_BUFFER_MASK];
+        uint64_t slot_idx = atomic_fetch_add_explicit(&rb->head, 1, memory_order_acq_rel);
+        log_entry_t* entry = &rb->entries[slot_idx & RING_BUFFER_MASK];
 
-        size_t recheck_read = atomic_load_explicit(&rb->read_pos, memory_order_acquire);
-        if (write_pos - recheck_read >= RING_BUFFER_SIZE) {
-            entry->length = 0;
-            atomic_store_explicit(&entry->ready, true, memory_order_release);
-            return DISTRIC_ERR_BUFFER_OVERFLOW;
-        }
-
-        atomic_store_explicit(&entry->ready, false, memory_order_release);
-        atomic_thread_fence(memory_order_acquire);
+        atomic_store_explicit(&entry->state, LOG_SLOT_EMPTY, memory_order_release);
         
-        memcpy(entry->data, tls_buffer, offset);
-        entry->length = offset;
+        entry->level = level;
+        entry->timestamp_ms = ts;
+        strncpy(entry->message, tls_buffer, sizeof(entry->message) - 1);
+        entry->message[sizeof(entry->message) - 1] = '\0';
         
-        atomic_thread_fence(memory_order_release);
-        atomic_store_explicit(&entry->ready, true, memory_order_release);
+        atomic_store_explicit(&entry->state, LOG_SLOT_FILLED, memory_order_release);
+        
+        atomic_fetch_add_explicit(&logger->messages_logged, 1, memory_order_relaxed);
         
         return DISTRIC_OK;
     }

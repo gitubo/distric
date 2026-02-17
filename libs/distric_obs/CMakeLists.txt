@@ -1,23 +1,14 @@
 cmake_minimum_required(VERSION 3.15)
 
-# Library: distric_obs
 project(distric_obs VERSION 0.2.0 LANGUAGES C)
 
-# Set C11 standard
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS OFF)
-
-# Compiler flags
-# Use gnu11 instead of c11 to allow GNU extensions like ##__VA_ARGS__ for variadic macros
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_EXTENSIONS ON)  # Enable GNU extensions
+set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic -Werror")
 
-# Find dependencies
 find_package(Threads REQUIRED)
 
-# Source files
 set(OBS_SOURCES
     src/error.c
     src/metrics.c
@@ -27,52 +18,38 @@ set(OBS_SOURCES
     src/http_server.c
 )
 
-# Create static library
 add_library(distric_obs_static STATIC ${OBS_SOURCES})
-set_target_properties(distric_obs_static PROPERTIES 
+set_target_properties(distric_obs_static PROPERTIES
     OUTPUT_NAME distric_obs
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
-    C_EXTENSIONS OFF
+    C_EXTENSIONS ON
 )
 
-# Create shared library
 add_library(distric_obs SHARED ${OBS_SOURCES})
 set_target_properties(distric_obs PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
-    C_EXTENSIONS ON  # Enable GNU extensions
+    C_EXTENSIONS ON
 )
 
-# Include directories for both library variants
 foreach(target distric_obs distric_obs_static)
     target_include_directories(${target}
         PUBLIC
-            # When building the library, use source include directory
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-            # When installing, use install include directory
             $<INSTALL_INTERFACE:include>
-        PRIVATE
-            # Internal headers (not exported to consumers)
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
-    
-    # Link dependencies
     target_link_libraries(${target}
-        PUBLIC
-            Threads::Threads
-        PRIVATE
-            m  # Math library for floating point operations
+        PUBLIC Threads::Threads
+        PRIVATE m
     )
 endforeach()
 
-# Add tests if enabled
 if(BUILD_TESTING)
     enable_testing()
     add_subdirectory(tests)
 endif()
 
-# Installation
 install(TARGETS distric_obs distric_obs_static
     EXPORT distric_obs-targets
     LIBRARY DESTINATION lib
@@ -81,18 +58,8 @@ install(TARGETS distric_obs distric_obs_static
     INCLUDES DESTINATION include
 )
 
-# Install only the public header
-install(FILES include/distric_obs.h
-    DESTINATION include
-)
+install(FILES include/distric_obs.h DESTINATION include)
 
-# Install internal headers (for library developers, optional)
-install(DIRECTORY include/distric_obs/
-    DESTINATION include/distric_obs
-    FILES_MATCHING PATTERN "*.h"
-)
-
-# Export targets for use by other projects
 install(EXPORT distric_obs-targets
     FILE distric_obs-targets.cmake
     NAMESPACE distric::

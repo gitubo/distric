@@ -2,12 +2,37 @@
 #define _POSIX_C_SOURCE 200112L
 #endif
 
-#include "distric_obs/http_server.h"
+#include "distric_obs.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <stdatomic.h>
+#include <pthread.h>
+
+typedef struct {
+    char method[16];
+    char path[256];
+    char version[16];
+} http_request_t;
+
+typedef struct {
+    int status_code;
+    const char* status_text;
+    const char* content_type;
+    const char* body;
+    size_t body_length;
+} http_response_t;
+
+struct obs_server_s {
+    int socket_fd;
+    uint16_t port;
+    pthread_t thread;
+    _Atomic bool running;
+    metrics_registry_t* metrics;
+    health_registry_t* health;
+};
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>

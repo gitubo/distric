@@ -2,11 +2,31 @@
 #define _POSIX_C_SOURCE 199309L
 #endif
 
-#include "distric_obs/health.h"
+#include "distric_obs.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <stdatomic.h>
+#include <pthread.h>
+
+#define MAX_HEALTH_COMPONENTS 64
+#define MAX_COMPONENT_NAME_LEN 64
+#define MAX_HEALTH_MESSAGE_LEN 256
+
+struct health_component_s {
+    char name[MAX_COMPONENT_NAME_LEN];
+    _Atomic int status;
+    char message[MAX_HEALTH_MESSAGE_LEN];
+    uint64_t last_check_time_ms;
+    _Atomic bool active;
+};
+
+struct health_registry_s {
+    health_component_t components[MAX_HEALTH_COMPONENTS];
+    _Atomic size_t component_count;
+    pthread_mutex_t lock;
+};
 
 /* Get current timestamp in milliseconds */
 static uint64_t get_timestamp_ms(void) {
