@@ -1,11 +1,13 @@
 /*
  * health.c — DistriC Observability Library — Health Monitoring
  */
+
 #ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 #endif
 
 #include "distric_obs.h"
+#include "distric_obs/health.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -13,242 +15,163 @@
 #include <stdatomic.h>
 #include <pthread.h>
 
-#define MAX_COMPONENT_NAME_LEN 64
-#define MAX_HEALTH_MESSAGE_LEN 256
-
-struct health_component_s {
-    char name[MAX_COMPONENT_NAME_LEN];
-    _Atomic int status;
-    char message[MAX_HEALTH_MESSAGE_LEN];
-    uint64_t last_check_time_ms;
-    _Atomic bool active;
-};
-
-struct health_registry_s {
-    health_component_t components[MAX_HEALTH_COMPONENTS];
-    _Atomic size_t component_count;
-    pthread_mutex_t lock;
-};
-
-/* Get current timestamp in milliseconds */
 static uint64_t get_timestamp_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+    return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
 }
 
-/* Convert health status to string */
 const char* health_status_str(health_status_t status) {
     switch (status) {
-        case HEALTH_UP:
-            return "UP";
-        case HEALTH_DEGRADED:
-            return "DEGRADED";
-        case HEALTH_DOWN:
-            return "DOWN";
-        default:
-            return "UNKNOWN";
+        case HEALTH_UP:       return "UP";
+        case HEALTH_DEGRADED: return "DEGRADED";
+        case HEALTH_DOWN:     return "DOWN";
+        default:              return "UNKNOWN";
     }
 }
 
-/* Initialize health registry */
 distric_err_t health_init(health_registry_t** registry) {
-    if (!registry) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    health_registry_t* reg = calloc(1, sizeof(health_registry_t));
-    if (!reg) {
-        return DISTRIC_ERR_ALLOC_FAILURE;
-    }
-    
+    if (!registry) return DISTRIC_ERR_INVALID_ARG;
+
+    health_registry_t* reg = calloc(1, sizeof(*reg));
+    if (!reg) return DISTRIC_ERR_ALLOC_FAILURE;
+
     atomic_init(&reg->component_count, 0);
-    
-    if (pthread_mutex_init(&reg->lock, NULL) != 0) {
+    atomic_init(&reg->refcount, 1);
+
+    if (pthread_mutex_init(&reg->register_lock, NULL) != 0) {
         free(reg);
         return DISTRIC_ERR_INIT_FAILED;
     }
-    
-    /* Initialize all components as inactive */
+
     for (size_t i = 0; i < MAX_HEALTH_COMPONENTS; i++) {
+        atomic_init(&reg->components[i].status, (int)HEALTH_DOWN);
         atomic_init(&reg->components[i].active, false);
-        atomic_init(&reg->components[i].status, HEALTH_UP);
+        pthread_mutex_init(&reg->components[i].message_lock, NULL);
     }
-    
+
     *registry = reg;
     return DISTRIC_OK;
 }
 
-/* Destroy health registry */
 void health_destroy(health_registry_t* registry) {
-    if (registry) {
-        pthread_mutex_destroy(&registry->lock);
-        free(registry);
-    }
+    if (!registry) return;
+    for (size_t i = 0; i < MAX_HEALTH_COMPONENTS; i++)
+        pthread_mutex_destroy(&registry->components[i].message_lock);
+    pthread_mutex_destroy(&registry->register_lock);
+    free(registry);
 }
 
-/* Register health check component */
-distric_err_t health_register_component(health_registry_t* registry,
-                                        const char* name,
-                                        health_component_t** out_component) {
-    if (!registry || !name || !out_component) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    pthread_mutex_lock(&registry->lock);
-    
-    /* Check if component already exists */
-    size_t count = atomic_load(&registry->component_count);
-    for (size_t i = 0; i < count; i++) {
-        health_component_t* comp = &registry->components[i];
-        if (atomic_load(&comp->active) && strcmp(comp->name, name) == 0) {
-            pthread_mutex_unlock(&registry->lock);
-            *out_component = comp;
-            return DISTRIC_OK;
-        }
-    }
-    
-    /* Allocate new component */
-    if (count >= MAX_HEALTH_COMPONENTS) {
-        pthread_mutex_unlock(&registry->lock);
+distric_err_t health_register_component(health_registry_t*   registry,
+                                          const char*          name,
+                                          health_component_t** out_component) {
+    if (!registry || !name || !out_component) return DISTRIC_ERR_INVALID_ARG;
+
+    pthread_mutex_lock(&registry->register_lock);
+
+    size_t idx = atomic_load_explicit(&registry->component_count, memory_order_relaxed);
+    if (idx >= MAX_HEALTH_COMPONENTS) {
+        pthread_mutex_unlock(&registry->register_lock);
         return DISTRIC_ERR_REGISTRY_FULL;
     }
-    
-    health_component_t* comp = &registry->components[count];
-    
+
+    health_component_t* comp = &registry->components[idx];
     strncpy(comp->name, name, MAX_COMPONENT_NAME_LEN - 1);
     comp->name[MAX_COMPONENT_NAME_LEN - 1] = '\0';
-    
-    atomic_store(&comp->status, HEALTH_UP);
-    strncpy(comp->message, "Component initialized", MAX_HEALTH_MESSAGE_LEN - 1);
-    comp->message[MAX_HEALTH_MESSAGE_LEN - 1] = '\0';
-    
+    atomic_store_explicit(&comp->status, (int)HEALTH_DOWN, memory_order_relaxed);
     comp->last_check_time_ms = get_timestamp_ms();
-    atomic_store(&comp->active, true);
-    
-    atomic_store(&registry->component_count, count + 1);
-    
-    pthread_mutex_unlock(&registry->lock);
-    
+    atomic_store_explicit(&comp->active, true, memory_order_release);
+
+    atomic_store_explicit(&registry->component_count, idx + 1, memory_order_release);
+    pthread_mutex_unlock(&registry->register_lock);
+
     *out_component = comp;
     return DISTRIC_OK;
 }
 
-/* Update component health status */
 distric_err_t health_update_status(health_component_t* component,
-                                   health_status_t status,
-                                   const char* message) {
-    if (!component) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    atomic_store(&component->status, status);
-    
+                                    health_status_t     status,
+                                    const char*         message) {
+    if (!component) return DISTRIC_ERR_INVALID_ARG;
+
+    HEALTH_ASSERT_LIFECYCLE(
+        atomic_load_explicit(&component->active, memory_order_relaxed));
+
+    atomic_store_explicit(&component->status, (int)status, memory_order_release);
+    component->last_check_time_ms = get_timestamp_ms();
+
     if (message) {
+        pthread_mutex_lock(&component->message_lock);
         strncpy(component->message, message, MAX_HEALTH_MESSAGE_LEN - 1);
         component->message[MAX_HEALTH_MESSAGE_LEN - 1] = '\0';
+        pthread_mutex_unlock(&component->message_lock);
     }
-    
-    component->last_check_time_ms = get_timestamp_ms();
-    
+
     return DISTRIC_OK;
 }
 
-/* Get overall system health */
 health_status_t health_get_overall_status(health_registry_t* registry) {
-    if (!registry) {
-        return HEALTH_DOWN;
-    }
-    
+    if (!registry) return HEALTH_DOWN;
+
     health_status_t worst = HEALTH_UP;
-    size_t count = atomic_load(&registry->component_count);
-    
-    for (size_t i = 0; i < count; i++) {
-        health_component_t* comp = &registry->components[i];
-        if (!atomic_load(&comp->active)) {
-            continue;
-        }
-        
-        health_status_t status = atomic_load(&comp->status);
-        if (status > worst) {
-            worst = status;
-        }
+    size_t n = atomic_load_explicit(&registry->component_count, memory_order_acquire);
+    for (size_t i = 0; i < n; i++) {
+        health_component_t* c = &registry->components[i];
+        if (!atomic_load_explicit(&c->active, memory_order_acquire)) continue;
+        int s = atomic_load_explicit(&c->status, memory_order_relaxed);
+        if (s > (int)worst) worst = (health_status_t)s;
     }
-    
     return worst;
 }
 
-/* Escape JSON string */
-static void json_escape(const char* src, char* dst, size_t dst_size) {
-    size_t j = 0;
-    for (size_t i = 0; src[i] && j < dst_size - 2; i++) {
-        char c = src[i];
-        if (c == '"' || c == '\\') {
-            if (j < dst_size - 3) dst[j++] = '\\';
-            dst[j++] = c;
-        } else if (c == '\n') {
-            if (j < dst_size - 3) {
-                dst[j++] = '\\';
-                dst[j++] = 'n';
-            }
-        } else if ((unsigned char)c >= 32) {
-            dst[j++] = c;
-        }
-    }
-    dst[j] = '\0';
-}
-
-/* Export health as JSON */
 distric_err_t health_export_json(health_registry_t* registry,
-                                  char** out_buffer,
-                                  size_t* out_size) {
-    if (!registry || !out_buffer || !out_size) {
-        return DISTRIC_ERR_INVALID_ARG;
-    }
-    
-    size_t buffer_size = 65536;
-    char* buffer = malloc(buffer_size);
-    if (!buffer) {
-        return DISTRIC_ERR_NO_MEMORY;
-    }
-    
+                                   char** out_json, size_t* out_size) {
+    if (!registry || !out_json || !out_size) return DISTRIC_ERR_INVALID_ARG;
+
+    size_t n = atomic_load_explicit(&registry->component_count, memory_order_acquire);
+
+    /* Estimate buffer size */
+    size_t buf_size = 256 + n * (MAX_COMPONENT_NAME_LEN + MAX_HEALTH_MESSAGE_LEN + 128);
+    char*  buf = malloc(buf_size);
+    if (!buf) return DISTRIC_ERR_NO_MEMORY;
+
     health_status_t overall = health_get_overall_status(registry);
     size_t offset = 0;
-    
-    int written = snprintf(buffer + offset, buffer_size - offset,
-                          "{\"status\":\"%s\",\"components\":[",
-                          health_status_str(overall));
-    if (written > 0) offset += (size_t)written;
-    
-    size_t count = atomic_load(&registry->component_count);
-    for (size_t i = 0; i < count; i++) {
-        health_component_t* comp = &registry->components[i];
-        if (!atomic_load(&comp->active)) {
-            continue;
-        }
-        
-        if (i > 0 && offset < buffer_size) {
-            buffer[offset++] = ',';
-        }
-        
-        char escaped_msg[MAX_HEALTH_MESSAGE_LEN * 2];
-        json_escape(comp->message, escaped_msg, sizeof(escaped_msg));
-        
-        written = snprintf(buffer + offset, buffer_size - offset,
-                          "{\"name\":\"%s\",\"status\":\"%s\",\"message\":\"%s\"}",
-                          comp->name,
-                          health_status_str(atomic_load(&comp->status)),
-                          escaped_msg);
-        if (written > 0) offset += (size_t)written;
+    int w;
+
+#define JAPPEND(fmt, ...) \
+    do { w = snprintf(buf + offset, buf_size - offset, fmt, ##__VA_ARGS__); \
+         if (w > 0) offset += (size_t)w; } while (0)
+
+    JAPPEND("{\"status\":\"%s\",\"components\":[",
+            health_status_str(overall));
+
+    for (size_t i = 0; i < n; i++) {
+        health_component_t* c = &registry->components[i];
+        if (!atomic_load_explicit(&c->active, memory_order_acquire)) continue;
+
+        int s = atomic_load_explicit(&c->status, memory_order_relaxed);
+
+        pthread_mutex_lock(&c->message_lock);
+        char msg_copy[MAX_HEALTH_MESSAGE_LEN];
+        strncpy(msg_copy, c->message, sizeof(msg_copy) - 1);
+        msg_copy[sizeof(msg_copy) - 1] = '\0';
+        pthread_mutex_unlock(&c->message_lock);
+
+        JAPPEND("%s{\"name\":\"%s\",\"status\":\"%s\",\"message\":\"%s\","
+                "\"last_check_ms\":%llu}",
+                i ? "," : "",
+                c->name,
+                health_status_str((health_status_t)s),
+                msg_copy,
+                (unsigned long long)c->last_check_time_ms);
     }
-    
-    if (offset < buffer_size - 2) {
-        buffer[offset++] = ']';
-        buffer[offset++] = '}';
-        buffer[offset] = '\0';
-    }
-    
-    *out_buffer = buffer;
+
+    JAPPEND("]}");
+#undef JAPPEND
+
+    if (offset < buf_size) buf[offset] = '\0';
+    *out_json = buf;
     *out_size = offset;
     return DISTRIC_OK;
 }
