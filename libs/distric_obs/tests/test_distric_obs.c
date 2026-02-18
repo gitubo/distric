@@ -22,7 +22,7 @@ void* worker_thread(void* arg) {
 
         LOG_INFO(logger, "worker", "Processing request",
                 "worker_id", "test",
-                "request_id", "test");
+                "request_id", "test", NULL);
 
         usleep(10000);
 
@@ -31,7 +31,7 @@ void* worker_thread(void* arg) {
 
         LOG_INFO(logger, "worker", "Request completed",
                 "worker_id", "test",
-                "duration_ms", "10");
+                "duration_ms", "10", NULL);
     }
 
     return NULL;
@@ -58,7 +58,7 @@ int main() {
 
     LOG_INFO(logger, "main", "Application starting",
             "version", "1.0.0",
-            "environment", "production");
+            "environment", "production", NULL);
 
     pthread_t threads[NUM_WORKERS];
     int thread_ids[NUM_WORKERS];

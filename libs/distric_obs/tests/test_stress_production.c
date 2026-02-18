@@ -70,7 +70,7 @@ static void test_p1a_reject_null_allowlist(void) {
     printf("  NULL allowlist correctly rejected with DISTRIC_ERR_HIGH_CARDINALITY\n");
 
     /* 0 allowed values = unbounded */
-    const char* empty[] = {};
+    const char* empty[1] = { NULL }; 
     metric_label_definition_t def2 = {
         .key = "status", .allowed_values = empty, .num_allowed_values = 0,
     };
@@ -92,25 +92,29 @@ static void test_p1b_reject_high_cardinality(void) {
     metrics_registry_t* reg;
     assert(metrics_init(&reg) == DISTRIC_OK);
 
-    /* 4^5 = 1024 > 256 = MAX_METRIC_CARDINALITY */
+    /* 4^DISTRIC_MAX_METRIC_LABELS = 4^8 = 65536 > 10000 = DISTRIC_MAX_METRIC_CARDINALITY */
     const char* vals[] = {"a","b","c","d"};
-    metric_label_definition_t defs[5];
-    for (int i = 0; i < 5; i++) {
-        snprintf(defs[i].key, MAX_LABEL_KEY_LEN, "dim%d", i);
+    metric_label_definition_t defs[DISTRIC_MAX_METRIC_LABELS];
+    for (int i = 0; i < DISTRIC_MAX_METRIC_LABELS; i++) {
+        snprintf(defs[i].key, DISTRIC_MAX_LABEL_KEY_LEN, "dim%d", i);
         defs[i].allowed_values    = vals;
         defs[i].num_allowed_values = 4;
     }
     metric_t* m = NULL;
     distric_err_t err = metrics_register_counter(reg, "over_cap", "test",
-                                                 defs, 5, &m);
-    assert(err == DISTRIC_ERR_HIGH_CARDINALITY && "4^5 > 256 must be rejected");
+                                                 defs, DISTRIC_MAX_METRIC_LABELS, &m);
+    assert(err == DISTRIC_ERR_HIGH_CARDINALITY &&
+           "4^DISTRIC_MAX_METRIC_LABELS > DISTRIC_MAX_METRIC_CARDINALITY must be rejected");
     assert(m == NULL);
-    printf("  4^5=1024 combinations correctly rejected\n");
+    printf("  4^%d=%llu combinations correctly rejected\n",
+           DISTRIC_MAX_METRIC_LABELS,
+           (unsigned long long)1 << (2 * DISTRIC_MAX_METRIC_LABELS)); /* 4^n = 2^(2n) */
 
     /* 4^3 = 64 <= 256 — must succeed */
     metric_t* ok = NULL;
     err = metrics_register_counter(reg, "under_cap", "test", defs, 3, &ok);
-    assert(err == DISTRIC_OK && "4^3=64 combinations must be accepted");
+    assert(err == DISTRIC_OK &&
+           "4^3=64 combinations must be accepted (64 < DISTRIC_MAX_METRIC_CARDINALITY)");
     assert(ok != NULL);
     printf("  4^3=64 combinations correctly accepted\n");
 
@@ -377,7 +381,7 @@ static void test_p2c_register_metrics(void) {
     assert(metrics_export_prometheus(reg, &prom, &sz) == DISTRIC_OK);
     assert(prom != NULL);
     /* Queue-depth gauge must appear in output */
-    assert(strstr(prom, "distric_tracing") != NULL &&
+    assert(strstr(prom, "distric_internal_tracer") != NULL &&
            "Tracing metrics must appear in Prometheus output");
     printf("  Prometheus output contains tracing metrics\n");
     free(prom);
@@ -531,7 +535,7 @@ static void* p3c_log_worker(void* arg) {
     for (int i = 0; i < P3C_LOGS; i++) {
         uint64_t t0  = now_ns();
         distric_err_t err = LOG_INFO(a->logger, "stress", "sustained pressure",
-                                     "k1", "v1", "k2", "v2");
+                                     "k1", "v1", "k2", "v2", NULL);
         uint64_t dur = now_ns() - t0;
         if (dur > a->max_ns) a->max_ns = dur;
         if (err == DISTRIC_ERR_BUFFER_OVERFLOW) a->dropped++;

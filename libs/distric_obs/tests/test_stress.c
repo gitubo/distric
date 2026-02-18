@@ -67,7 +67,7 @@ static void* log_stress_producer(void* arg) {
         char msg[64];
         snprintf(msg, sizeof(msg), "stress msg %d", i);
         distric_err_t err = LOG_INFO(a->logger, "stress", msg,
-                                     "thread", "t", "iter", "i");
+                                     "thread", "t", "iter", "i", NULL);
         a->logs_attempted++;
         if (err == DISTRIC_ERR_BUFFER_OVERFLOW) a->logs_dropped++;
     }
@@ -193,16 +193,16 @@ static void test_metric_cardinality_enforcement(void) {
     /* --- 2a: Reject registration exceeding MAX_METRIC_CARDINALITY --- */
     /* Build 9 label dimensions × 4 values = 4^9 = 262144 combinations > 256 */
     const char* vals4[] = {"a","b","c","d"};
-    metric_label_definition_t big_defs[MAX_METRIC_LABELS];
-    for (int i = 0; i < MAX_METRIC_LABELS; i++) {
-        snprintf(big_defs[i].key, MAX_LABEL_KEY_LEN, "dim%d", i);
+    metric_label_definition_t big_defs[DISTRIC_MAX_METRIC_LABELS];
+    for (int i = 0; i < DISTRIC_MAX_METRIC_LABELS; i++) {
+        snprintf(big_defs[i].key, DISTRIC_MAX_LABEL_KEY_LEN, "dim%d", i);
         big_defs[i].allowed_values     = vals4;
         big_defs[i].num_allowed_values = 4;
     }
     metric_t* overflow_metric = NULL;
     distric_err_t err = metrics_register_counter(
         registry, "overflow_metric", "too many combos",
-        big_defs, MAX_METRIC_LABELS, &overflow_metric);
+        big_defs, DISTRIC_MAX_METRIC_LABELS, &overflow_metric);
     assert(err == DISTRIC_ERR_HIGH_CARDINALITY &&
            "Must reject registration exceeding MAX_METRIC_CARDINALITY");
     assert(overflow_metric == NULL);

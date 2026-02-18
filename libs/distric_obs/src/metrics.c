@@ -248,15 +248,59 @@ static distric_err_t register_metric(metrics_registry_t* registry,
     if (type == METRIC_TYPE_COUNTER) {
         atomic_init(&m->data.counter.instances, NULL);
         pthread_mutex_init(&m->data.counter.instance_lock, NULL);
+        /* Pre-create the single unlabeled instance — hot path must never take a mutex */
+        if (label_def_count == 0) {
+            counter_instance_t* inst = calloc(1, sizeof(*inst));
+            if (inst) {
+                inst->num_labels = 0;
+                atomic_init(&inst->value, 0);
+                inst->next = NULL;
+                atomic_store_explicit(&m->data.counter.instances, inst,
+                                      memory_order_release);
+            }
+        }
     } else if (type == METRIC_TYPE_GAUGE) {
         atomic_init(&m->data.gauge.instances, NULL);
         pthread_mutex_init(&m->data.gauge.instance_lock, NULL);
+        if (label_def_count == 0) {
+            gauge_instance_t* inst = calloc(1, sizeof(*inst));
+            if (inst) {
+                inst->num_labels = 0;
+                atomic_init(&inst->value_bits, 0);
+                inst->next = NULL;
+                atomic_store_explicit(&m->data.gauge.instances, inst,
+                                      memory_order_release);
+            }
+        }
     } else {
         atomic_init(&m->data.histogram.instances, NULL);
         pthread_mutex_init(&m->data.histogram.instance_lock, NULL);
         m->data.histogram.num_buckets = HISTOGRAM_BUCKET_COUNT;
         memcpy(m->data.histogram.buckets_template, HISTOGRAM_DEFAULT_BUCKETS,
                sizeof(HISTOGRAM_DEFAULT_BUCKETS));
+        if (label_def_count == 0) {
+            histogram_instance_t* inst = calloc(1, sizeof(*inst));
+            if (inst) {
+                inst->num_labels = 0;
+                inst->num_buckets = HISTOGRAM_BUCKET_COUNT;
+                inst->buckets = calloc(HISTOGRAM_BUCKET_COUNT,
+                                       sizeof(histogram_bucket_t));
+                if (inst->buckets) {
+                    for (uint32_t b = 0; b < HISTOGRAM_BUCKET_COUNT; b++) {
+                        inst->buckets[b].upper_bound =
+                            m->data.histogram.buckets_template[b];
+                        atomic_init(&inst->buckets[b].count, 0);
+                    }
+                    atomic_init(&inst->count, 0);
+                    atomic_init(&inst->sum_bits, 0);
+                    inst->next = NULL;
+                    atomic_store_explicit(&m->data.histogram.instances, inst,
+                                          memory_order_release);
+                } else {
+                    free(inst);
+                }
+            }
+        }
     }
 
     atomic_init(&m->initialized, true);
@@ -374,10 +418,10 @@ void metrics_counter_inc(metric_t* metric) {
     if (!metric) return;
     counter_instance_t* inst =
         atomic_load_explicit(&metric->data.counter.instances, memory_order_acquire);
+    if (!inst)
+        inst = get_or_create_counter_instance(metric, NULL, 0);
     if (inst)
         atomic_fetch_add_explicit(&inst->value, 1, memory_order_relaxed);
-    else
-        get_or_create_counter_instance(metric, NULL, 0);
 }
 
 void metrics_counter_add(metric_t* metric, uint64_t value) {

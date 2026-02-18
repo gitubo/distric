@@ -648,7 +648,7 @@ distric_err_t tcp_server_stop(tcp_server_t* server) {
     }
     
     if (server->logger) {
-        LOG_INFO(server->logger, "tcp_server", "Stopping TCP server");
+        LOG_INFO(server->logger, "tcp_server", "Stopping TCP server", NULL);
     }
     
     atomic_store(&server->running, false);
@@ -667,7 +667,7 @@ distric_err_t tcp_server_stop(tcp_server_t* server) {
     }
     
     if (server->logger) {
-        LOG_INFO(server->logger, "tcp_server", "TCP server stopped");
+        LOG_INFO(server->logger, "tcp_server", "TCP server stopped", NULL);
     }
     
     return DISTRIC_OK;

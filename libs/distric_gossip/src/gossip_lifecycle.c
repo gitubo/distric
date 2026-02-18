@@ -41,7 +41,7 @@ distric_err_t gossip_init(const gossip_config_t* config, gossip_state_t** state_
     /* Allocate state */
     gossip_state_t* state = (gossip_state_t*)calloc(1, sizeof(gossip_state_t));
     if (!state) {
-        return DISTRIC_ERR_MEMORY;
+        return DISTRIC_ERR_ALLOC_FAILURE;
     }
     
     /* Copy configuration */
@@ -338,7 +338,7 @@ distric_err_t gossip_get_alive_nodes(
     gossip_node_info_t* nodes = (gossip_node_info_t*)malloc(alive_count * sizeof(gossip_node_info_t));
     if (!nodes) {
         pthread_mutex_unlock(&state->membership_lock);
-        return DISTRIC_ERR_MEMORY;
+        return DISTRIC_ERR_ALLOC_FAILURE;
     }
     
     size_t idx = 0;
@@ -389,7 +389,7 @@ distric_err_t gossip_get_nodes_by_role(
     gossip_node_info_t* nodes = (gossip_node_info_t*)malloc(match_count * sizeof(gossip_node_info_t));
     if (!nodes) {
         pthread_mutex_unlock(&state->membership_lock);
-        return DISTRIC_ERR_MEMORY;
+        return DISTRIC_ERR_ALLOC_FAILURE;
     }
     
     size_t idx = 0;

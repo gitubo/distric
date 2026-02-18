@@ -49,7 +49,7 @@ void* worker_thread(void* arg) {
         trace_add_tag(span, "request.id", "test");
 
         LOG_INFO(data->logger, "worker", "Processing request",
-                "worker_id", "1", "request_num", "test");
+                "worker_id", "1", "request_num", "test", NULL);
 
         metrics_counter_inc(data->request_counter);
 
@@ -61,14 +61,14 @@ void* worker_thread(void* arg) {
             health_update_status(data->health_component, HEALTH_DEGRADED,
                                "Temporary slowdown");
             LOG_WARN(data->logger, "worker", "Performance degraded",
-                    "worker_id", "2");
+                    "worker_id", "2", NULL);
         }
 
         trace_set_status(span, SPAN_STATUS_OK);
         trace_finish_span(data->tracer, span);
 
         LOG_INFO(data->logger, "worker", "Request completed",
-                "worker_id", "1", "request_num", "test");
+                "worker_id", "1", "request_num", "test", NULL);
     }
 
     return NULL;
@@ -151,7 +151,7 @@ int main() {
     obs_server_init(&server, 0, metrics, health);
     uint16_t port = obs_server_get_port(server);
     printf("[SERVER] Server listening on port %u\n", port);
-    LOG_INFO(logger, "main", "HTTP server started", "port", "test");
+    LOG_INFO(logger, "main", "HTTP server started", "port", "test", NULL);
     sleep(1);
 
     printf("[WORKERS] Starting worker threads...\n");
@@ -174,7 +174,7 @@ int main() {
         pthread_create(&workers[i], NULL, worker_thread, &worker_data[i]);
     }
 
-    LOG_INFO(logger, "main", "Workers started", "count", "3");
+    LOG_INFO(logger, "main", "Workers started", "count", "3", NULL);
     sleep(2);
 
     printf("\n[TEST] Testing HTTP endpoints...\n");

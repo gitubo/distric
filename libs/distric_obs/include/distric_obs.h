@@ -149,6 +149,14 @@ typedef enum {
     DISTRIC_ERR_NO_MEMORY        = -11, /* non-fatal: update dropped */
     DISTRIC_ERR_ALREADY_EXISTS   = -12,
     DISTRIC_ERR_SHUTDOWN         = -13,
+    DISTRIC_ERR_IO               = -14, 
+    DISTRIC_ERR_INVALID_STATE    = -15, 
+    DISTRIC_ERR_THREAD           = -16,    
+    DISTRIC_ERR_TIMEOUT          = -17, 
+    DISTRIC_ERR_EOF              = -18, /* clean end-of-stream (not an error per se) */
+    DISTRIC_ERR_INVALID_FORMAT   = -19, /* malformed wire data / protocol violation  */
+    DISTRIC_ERR_TYPE_MISMATCH    = -20, 
+    DISTRIC_ERR_UNAVAILABLE      = -21, /* peer/resource exists but is unreachable */
 } distric_err_t;
 
 /** Human-readable string for an error code.  Never NULL. */
@@ -249,6 +257,16 @@ void          metrics_counter_inc(metric_t* metric);
 void          metrics_counter_add(metric_t* metric, uint64_t value);
 distric_err_t metrics_counter_inc_labels(metric_t* metric, const metric_label_t* labels, uint32_t num_labels);
 distric_err_t metrics_counter_add_labels(metric_t* metric, const metric_label_t* labels, uint32_t num_labels, uint64_t value);
+
+/* Convenience alias: increment by an explicit delta with label validation.
+ * Equivalent to metrics_counter_add_labels. */
+static inline distric_err_t
+metrics_counter_inc_with_labels(metric_t* m,
+                                 const metric_label_t* labels,
+                                 uint32_t num_labels,
+                                 uint64_t value) {
+    return metrics_counter_add_labels(m, labels, num_labels, value);
+}
 
 void          metrics_gauge_set(metric_t* metric, double value);
 distric_err_t metrics_gauge_set_labels(metric_t* metric, const metric_label_t* labels, uint32_t num_labels, double value);
@@ -510,6 +528,19 @@ distric_err_t trace_add_tag(trace_span_t* span, const char* key, const char* val
 distric_err_t trace_set_status(trace_span_t* span, span_status_t status);
 distric_err_t trace_inject_context(trace_span_t* span, char* buf, size_t buf_size);
 distric_err_t trace_extract_context(const char* header, trace_context_t* out_ctx);
+
+/**
+ * Thread-local active span accessors.
+ *
+ * trace_set_active_span sets the calling thread's "current" span context.
+ * trace_get_active_span retrieves it (returns NULL if none set).
+ *
+ * Useful for implicit context propagation — set on span start,
+ * clear on span finish. These are purely advisory; the library never
+ * reads tl_active_span internally.
+ */
+void          trace_set_active_span(trace_span_t* span);
+trace_span_t* trace_get_active_span(void);
 
 /* ============================================================================
  * HEALTH MONITORING

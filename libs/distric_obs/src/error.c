@@ -20,6 +20,14 @@ const char* distric_err_str(distric_err_t err) {
         case DISTRIC_ERR_NO_MEMORY:        return "no memory (update dropped)";
         case DISTRIC_ERR_ALREADY_EXISTS:   return "already exists";
         case DISTRIC_ERR_SHUTDOWN:         return "subsystem shutdown";
+        case DISTRIC_ERR_IO:               return "network/IO failure";
+        case DISTRIC_ERR_INVALID_STATE:    return "operation invalid in current state";
+        case DISTRIC_ERR_THREAD:           return "thread creation failed";
+        case DISTRIC_ERR_TIMEOUT:          return "operation timed out";
+        case DISTRIC_ERR_EOF:              return "end of stream";
+        case DISTRIC_ERR_INVALID_FORMAT:   return "invalid wire format";
+        case DISTRIC_ERR_TYPE_MISMATCH:    return "field type mismatch";
+        case DISTRIC_ERR_UNAVAILABLE:      return "peer unavailable";
         default:                           return "unknown error";
     }
 }

@@ -97,7 +97,7 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
     
     /* Check if server is shutting down */
     if (!server->accepting_requests) {
-        LOG_DEBUG(server->logger, "rpc_server", "Rejecting connection - server shutting down");
+        LOG_DEBUG(server->logger, "rpc_server", "Rejecting connection - server shutting down", NULL);
         goto cleanup_and_exit;
     }
     
@@ -138,14 +138,14 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
             }
             
             /* Real error - close connection */
-            LOG_ERROR(server->logger, "rpc_server", "Failed to receive header");
+            LOG_ERROR(server->logger, "rpc_server", "Failed to receive header", NULL);
             if (server->errors_total) metrics_counter_inc(server->errors_total);
             if (span) trace_finish_span(server->tracer, span);
             break;
         }
         
         if (received != MESSAGE_HEADER_SIZE) {
-            LOG_ERROR(server->logger, "rpc_server", "Incomplete header");
+            LOG_ERROR(server->logger, "rpc_server", "Incomplete header", NULL);
             if (server->errors_total) metrics_counter_inc(server->errors_total);
             if (span) trace_finish_span(server->tracer, span);
             break;
@@ -156,7 +156,7 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
         
         /* Validate header */
         if (!validate_message_header(&header)) {
-            LOG_ERROR(server->logger, "rpc_server", "Invalid message header");
+            LOG_ERROR(server->logger, "rpc_server", "Invalid message header", NULL);
             if (server->errors_total) metrics_counter_inc(server->errors_total);
             if (span) trace_finish_span(server->tracer, span);
             break;
@@ -167,7 +167,7 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
         if (header.payload_len > 0) {
             payload = (uint8_t*)malloc(header.payload_len);
             if (!payload) {
-                LOG_ERROR(server->logger, "rpc_server", "Failed to allocate payload buffer");
+                LOG_ERROR(server->logger, "rpc_server", "Failed to allocate payload buffer", NULL);
                 if (server->errors_total) metrics_counter_inc(server->errors_total);
                 if (span) trace_finish_span(server->tracer, span);
                 break;
@@ -175,7 +175,7 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
             
             received = tcp_recv(conn, payload, header.payload_len, 5000); /* 5s timeout */
             if (received != (int)header.payload_len) {
-                LOG_ERROR(server->logger, "rpc_server", "Failed to receive payload");
+                LOG_ERROR(server->logger, "rpc_server", "Failed to receive payload", NULL);
                 if (server->errors_total) metrics_counter_inc(server->errors_total);
                 free(payload);
                 if (span) trace_finish_span(server->tracer, span);
@@ -185,7 +185,7 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
         
         /* Verify CRC32 */
         if (!verify_message_crc32(&header, payload, header.payload_len)) {
-            LOG_ERROR(server->logger, "rpc_server", "CRC32 verification failed");
+            LOG_ERROR(server->logger, "rpc_server", "CRC32 verification failed", NULL);
             if (server->errors_total) metrics_counter_inc(server->errors_total);
             free(payload);
             if (span) trace_finish_span(server->tracer, span);
@@ -363,7 +363,7 @@ distric_err_t rpc_server_start(rpc_server_t* server) {
         return err;
     }
     
-    LOG_INFO(server->logger, "rpc_server", "RPC server started");
+    LOG_INFO(server->logger, "rpc_server", "RPC server started", NULL);
     
     return DISTRIC_OK;
 }
@@ -373,7 +373,7 @@ void rpc_server_stop(rpc_server_t* server) {
         return;
     }
     
-    LOG_INFO(server->logger, "rpc_server", "RPC server stopping");
+    LOG_INFO(server->logger, "rpc_server", "RPC server stopping", NULL);
     
     /* Stop accepting new requests */
     server->accepting_requests = false;
@@ -404,7 +404,7 @@ void rpc_server_stop(rpc_server_t* server) {
     
     pthread_mutex_unlock(&server->active_handlers_lock);
     
-    LOG_INFO(server->logger, "rpc_server", "RPC server stopped");
+    LOG_INFO(server->logger, "rpc_server", "RPC server stopped", NULL);
 }
 
 distric_err_t rpc_server_register_handler(

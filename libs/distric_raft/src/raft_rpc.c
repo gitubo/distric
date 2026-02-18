@@ -82,7 +82,7 @@ static int handle_request_vote_rpc(
     raft_request_vote_t request_vote;
     distric_err_t err = deserialize_raft_request_vote(request, req_len, &request_vote);
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize RequestVote");
+        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize RequestVote", NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return -1;
     }
@@ -118,7 +118,7 @@ static int handle_request_vote_rpc(
             "term", resp_term_str, NULL);
     
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "raft_handle_request_vote failed");
+        LOG_ERROR(context->config.logger, "raft_rpc", "raft_handle_request_vote failed", NULL);
         free_raft_request_vote(&request_vote);
         metrics_counter_inc(context->rpc_errors_metric);
         return -1;
@@ -135,14 +135,14 @@ static int handle_request_vote_rpc(
     free_raft_request_vote(&request_vote);
     
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to serialize RequestVote response");
+        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to serialize RequestVote response", NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return -1;
     }
     
     LOG_DEBUG(context->config.logger, "raft_rpc", "RequestVote handled",
              "candidate", request_vote.candidate_id,
-             "vote_granted", vote_granted ? "true" : "false");
+             "vote_granted", vote_granted ? "true" : "false", NULL);
     
     return 0;
 }
@@ -169,7 +169,7 @@ static int handle_append_entries_rpc(
     raft_append_entries_t append_entries_wire;
     distric_err_t err = deserialize_raft_append_entries(request, req_len, &append_entries_wire);
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize AppendEntries");
+        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize AppendEntries", NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return -1;
     }
@@ -224,7 +224,7 @@ static int handle_append_entries_rpc(
     free_raft_append_entries(&append_entries_wire);
     
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "raft_handle_append_entries failed");
+        LOG_ERROR(context->config.logger, "raft_rpc", "raft_handle_append_entries failed", NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return -1;
     }
@@ -239,14 +239,14 @@ static int handle_append_entries_rpc(
     err = serialize_raft_append_entries_response(&response_msg, response, resp_len);
     
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to serialize AppendEntries response");
+        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to serialize AppendEntries response", NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return -1;
     }
     
     LOG_DEBUG(context->config.logger, "raft_rpc", "AppendEntries handled",
              "leader", append_entries_wire.leader_id,
-             "success", success ? "true" : "false");
+             "success", success ? "true" : "false", NULL);
     
     return 0;
 }
@@ -273,7 +273,7 @@ static int handle_install_snapshot_rpc(
     raft_install_snapshot_t install_snapshot;
     distric_err_t err = deserialize_raft_install_snapshot(request, req_len, &install_snapshot);
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize InstallSnapshot");
+        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize InstallSnapshot", NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return -1;
     }
@@ -307,13 +307,13 @@ static int handle_install_snapshot_rpc(
     err = serialize_raft_install_snapshot_response(&response_msg, response, resp_len);
     
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to serialize InstallSnapshot response");
+        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to serialize InstallSnapshot response", NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return -1;
     }
     
     LOG_DEBUG(context->config.logger, "raft_rpc", "InstallSnapshot handled",
-             "success", success ? "true" : "false");
+             "success", success ? "true" : "false", NULL);
     
     return 0;
 }
@@ -466,7 +466,7 @@ distric_err_t raft_rpc_start(raft_rpc_context_t* context) {
     
     context->running = true;
     
-    LOG_INFO(context->config.logger, "raft_rpc", "RPC server started");
+    LOG_INFO(context->config.logger, "raft_rpc", "RPC server started", NULL);
     
     return DISTRIC_OK;
 }
@@ -481,7 +481,7 @@ distric_err_t raft_rpc_stop(raft_rpc_context_t* context) {
     /* Stop RPC server */
     rpc_server_stop(context->rpc_server);
     
-    LOG_INFO(context->config.logger, "raft_rpc", "RPC server stopped");
+    LOG_INFO(context->config.logger, "raft_rpc", "RPC server stopped", NULL);
     
     return DISTRIC_OK;
 }
@@ -618,7 +618,7 @@ distric_err_t raft_rpc_send_request_vote(
     free(response_buf);
     
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize RequestVote response");
+        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize RequestVote response", NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return err;
     }
@@ -631,7 +631,7 @@ distric_err_t raft_rpc_send_request_vote(
     
     LOG_DEBUG(context->config.logger, "raft_rpc", "RequestVote sent",
              "peer", peer_address,
-             "vote_granted", response.vote_granted ? "true" : "false");
+             "vote_granted", response.vote_granted ? "true" : "false", NULL);
     
     return DISTRIC_OK;
 }
@@ -736,7 +736,7 @@ distric_err_t raft_rpc_send_append_entries(
     free(response_buf);
     
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize AppendEntries response");
+        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize AppendEntries response", NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return err;
     }
@@ -753,7 +753,7 @@ distric_err_t raft_rpc_send_append_entries(
     LOG_DEBUG(context->config.logger, "raft_rpc", "AppendEntries sent",
             "peer", peer_address,
             "entries", entries_str,
-            "success", response.success ? "true" : "false");
+            "success", response.success ? "true" : "false", NULL);
     
     return DISTRIC_OK;
 }
@@ -833,7 +833,7 @@ distric_err_t raft_rpc_send_install_snapshot(
     free(response_buf);
     
     if (err != DISTRIC_OK) {
-        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize InstallSnapshot response");
+        LOG_ERROR(context->config.logger, "raft_rpc", "Failed to deserialize InstallSnapshot response", NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return err;
     }

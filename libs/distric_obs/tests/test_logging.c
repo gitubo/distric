@@ -20,7 +20,7 @@ void* logging_thread(void* arg) {
         snprintf(msg, sizeof(msg), "Log message %d from thread %d", i, thread_id);
         LOG_INFO(shared_logger, "test", msg,
                 "thread_id", "1",
-                "iteration", "2");
+                "iteration", "2", NULL);
     }
     return NULL;
 }
@@ -33,10 +33,10 @@ void test_sync_logging() {
     assert(err == DISTRIC_OK);
 
     LOG_INFO(logger, "test", "Simple info message", NULL);
-    LOG_WARN(logger, "test", "Warning message", "code", "404");
+    LOG_WARN(logger, "test", "Warning message", "code", "404", NULL);
     LOG_ERROR(logger, "test", "Error occurred",
              "error", "File not found",
-             "path", "/tmp/missing");
+             "path", "/tmp/missing", NULL);
 
     log_destroy(logger);
     printf("  PASSED\n\n");
@@ -50,7 +50,7 @@ void test_async_logging() {
     assert(err == DISTRIC_OK);
 
     for (int i = 0; i < 100; i++)
-        LOG_INFO(logger, "async_test", "Async log message", "iteration", "test");
+        LOG_INFO(logger, "async_test", "Async log message", "iteration", "test", NULL);
 
     log_destroy(logger);
     printf("  PASSED\n\n");
@@ -120,7 +120,7 @@ void test_json_format() {
     assert(err == DISTRIC_OK);
 
     LOG_INFO(logger, "test", "Message with \"quotes\" and \\backslash\\",
-            "key", "value with\nnewline and\ttab");
+            "key", "value with\nnewline and\ttab", NULL);
 
     log_destroy(logger);
     close(fd);

@@ -220,7 +220,7 @@ static distric_err_t read_file(const char* path, char** data_out, size_t* len_ou
     close(fd);
     
     if (bytes_read != (ssize_t)size) {
-        LOG_ERROR(logger, "persistence", "Failed to read complete file");
+        LOG_ERROR(logger, "persistence", "Failed to read complete file", NULL);
         free(buffer);
         return DISTRIC_ERR_INIT_FAILED;
     }
@@ -306,7 +306,7 @@ static distric_err_t write_log_header(int fd, logger_t* logger) {
     uint32_t version = LOG_FILE_VERSION;
     
     if (write(fd, &magic, 4) != 4 || write(fd, &version, 4) != 4) {
-        LOG_ERROR(logger, "persistence", "Failed to write log header");
+        LOG_ERROR(logger, "persistence", "Failed to write log header", NULL);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
@@ -323,12 +323,12 @@ static distric_err_t read_log_header(int fd, logger_t* logger) {
     }
     
     if (magic != LOG_FILE_MAGIC) {
-        LOG_ERROR(logger, "persistence", "Invalid log file magic");
+        LOG_ERROR(logger, "persistence", "Invalid log file magic", NULL);
         return DISTRIC_ERR_INVALID_FORMAT;
     }
     
     if (version != LOG_FILE_VERSION) {
-        LOG_ERROR(logger, "persistence", "Unsupported log file version");
+        LOG_ERROR(logger, "persistence", "Unsupported log file version", NULL);
         return DISTRIC_ERR_INVALID_FORMAT;
     }
     
@@ -475,7 +475,7 @@ distric_err_t raft_persistence_save_state(
         snprintf(term_str, sizeof(term_str), "%u", term);
         LOG_DEBUG(persistence->logger, "persistence", "Saved state",
                  "term", term_str,
-                 "voted_for", voted_for ? voted_for : "");
+                 "voted_for", voted_for ? voted_for : "", NULL);
     }
     
     return err;
@@ -547,20 +547,20 @@ distric_err_t raft_persistence_append_log(
         write(persistence->log_fd, &term, 4) != 4 ||
         write(persistence->log_fd, &type, 1) != 1 ||
         write(persistence->log_fd, &data_len, 4) != 4) {
-        LOG_ERROR(persistence->logger, "persistence", "Failed to write log entry header");
+        LOG_ERROR(persistence->logger, "persistence", "Failed to write log entry header", NULL);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
     if (data_len > 0 && entry->data) {
         if (write(persistence->log_fd, entry->data, data_len) != (ssize_t)data_len) {
-            LOG_ERROR(persistence->logger, "persistence", "Failed to write log entry data");
+            LOG_ERROR(persistence->logger, "persistence", "Failed to write log entry data", NULL);
             return DISTRIC_ERR_INIT_FAILED;
         }
     }
     
     /* Sync */
     if (fsync(persistence->log_fd) != 0) {
-        LOG_ERROR(persistence->logger, "persistence", "Failed to fsync log");
+        LOG_ERROR(persistence->logger, "persistence", "Failed to fsync log", NULL);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
@@ -587,7 +587,7 @@ distric_err_t raft_persistence_load_log(
     
     /* Seek past header */
     if (lseek(persistence->log_fd, 8, SEEK_SET) < 0) {
-        LOG_ERROR(persistence->logger, "persistence", "Failed to seek log");
+        LOG_ERROR(persistence->logger, "persistence", "Failed to seek log", NULL);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
@@ -677,7 +677,7 @@ distric_err_t raft_persistence_load_log(
     return DISTRIC_OK;
 
 read_error:
-    LOG_ERROR(persistence->logger, "persistence", "Failed to read log file");
+    LOG_ERROR(persistence->logger, "persistence", "Failed to read log file", NULL);
     return DISTRIC_ERR_INIT_FAILED;
 }
 
@@ -789,7 +789,7 @@ distric_err_t raft_persistence_save_snapshot(
         write(fd, &last_included_term, 4) != 4 ||
         write(fd, &data_len, 4) != 4 ||
         write(fd, &crc32, 4) != 4) {
-        LOG_ERROR(persistence->logger, "persistence", "Failed to write snapshot header");
+        LOG_ERROR(persistence->logger, "persistence", "Failed to write snapshot header", NULL);
         close(fd);
         unlink(persistence->snapshot_tmp_path);
         return DISTRIC_ERR_INIT_FAILED;
@@ -874,20 +874,20 @@ distric_err_t raft_persistence_load_snapshot(
         read(fd, &last_included_term, 4) != 4 ||
         read(fd, &data_len, 4) != 4 ||
         read(fd, &stored_crc32, 4) != 4) {
-        LOG_ERROR(persistence->logger, "persistence", "Failed to read snapshot header");
+        LOG_ERROR(persistence->logger, "persistence", "Failed to read snapshot header", NULL);
         close(fd);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
     /* Validate header */
     if (magic != SNAPSHOT_MAGIC) {
-        LOG_ERROR(persistence->logger, "persistence", "Invalid snapshot magic");
+        LOG_ERROR(persistence->logger, "persistence", "Invalid snapshot magic", NULL);
         close(fd);
         return DISTRIC_ERR_INVALID_FORMAT;
     }
     
     if (version != SNAPSHOT_VERSION) {
-        LOG_ERROR(persistence->logger, "persistence", "Unsupported snapshot version");
+        LOG_ERROR(persistence->logger, "persistence", "Unsupported snapshot version", NULL);
         close(fd);
         return DISTRIC_ERR_INVALID_FORMAT;
     }
@@ -904,7 +904,7 @@ distric_err_t raft_persistence_load_snapshot(
     close(fd);
     
     if (bytes_read != (ssize_t)data_len) {
-        LOG_ERROR(persistence->logger, "persistence", "Failed to read snapshot data");
+        LOG_ERROR(persistence->logger, "persistence", "Failed to read snapshot data", NULL);
         free(data);
         return DISTRIC_ERR_INIT_FAILED;
     }

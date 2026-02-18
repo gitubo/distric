@@ -307,7 +307,7 @@ test_cluster_t* test_cluster_create(int num_nodes) {
         
         if (err != DISTRIC_OK) {
             fprintf(stderr, "Failed to create RAFT node %d: %s\n",
-                    i, distric_strerror(err));
+                    i, distric_err_str(err));
             test_cluster_destroy(cluster);
             return NULL;
         }
@@ -325,7 +325,7 @@ test_cluster_t* test_cluster_create(int num_nodes) {
         err = raft_rpc_create(&rpc_cfg, node->raft_node, &node->rpc);
         if (err != DISTRIC_OK) {
             fprintf(stderr, "Failed to create RPC context for node %d: %s\n",
-                    i, distric_strerror(err));
+                    i, distric_err_str(err));
             test_cluster_destroy(cluster);
             return NULL;
         }

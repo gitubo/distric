@@ -45,7 +45,7 @@ distric_err_t health_init(health_registry_t** registry) {
     }
 
     for (size_t i = 0; i < MAX_HEALTH_COMPONENTS; i++) {
-        atomic_init(&reg->components[i].status, (int)HEALTH_DOWN);
+        atomic_init(&reg->components[i].status, (int)HEALTH_UP);
         atomic_init(&reg->components[i].active, false);
         pthread_mutex_init(&reg->components[i].message_lock, NULL);
     }
@@ -69,7 +69,19 @@ distric_err_t health_register_component(health_registry_t*   registry,
 
     pthread_mutex_lock(&registry->register_lock);
 
-    size_t idx = atomic_load_explicit(&registry->component_count, memory_order_relaxed);
+    /* Return existing component if already registered under this name */
+    size_t count = atomic_load_explicit(&registry->component_count,
+                                        memory_order_relaxed);
+    for (size_t i = 0; i < count; i++) {
+        if (strncmp(registry->components[i].name, name,
+                    MAX_COMPONENT_NAME_LEN) == 0) {
+            *out_component = &registry->components[i];
+            pthread_mutex_unlock(&registry->register_lock);
+            return DISTRIC_OK;
+        }
+    }
+
+    size_t idx = count;
     if (idx >= MAX_HEALTH_COMPONENTS) {
         pthread_mutex_unlock(&registry->register_lock);
         return DISTRIC_ERR_REGISTRY_FULL;
@@ -78,7 +90,7 @@ distric_err_t health_register_component(health_registry_t*   registry,
     health_component_t* comp = &registry->components[idx];
     strncpy(comp->name, name, MAX_COMPONENT_NAME_LEN - 1);
     comp->name[MAX_COMPONENT_NAME_LEN - 1] = '\0';
-    atomic_store_explicit(&comp->status, (int)HEALTH_DOWN, memory_order_relaxed);
+    atomic_store_explicit(&comp->status, (int)HEALTH_UP, memory_order_relaxed);
     comp->last_check_time_ms = get_timestamp_ms();
     atomic_store_explicit(&comp->active, true, memory_order_release);
 

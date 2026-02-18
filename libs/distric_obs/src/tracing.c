@@ -49,6 +49,20 @@
 static trace_span_t g_noop_span = { .sampled = false };
 
 /* ============================================================================
+ * Thread-local active span
+ * ========================================================================= */
+
+static _Thread_local trace_span_t* tl_active_span = NULL;
+
+void trace_set_active_span(trace_span_t* span) {
+    tl_active_span = span;
+}
+
+trace_span_t* trace_get_active_span(void) {
+    return tl_active_span;
+}
+
+/* ============================================================================
  * Clock helpers
  * ========================================================================= */
 
@@ -79,34 +93,6 @@ static uint64_t gen_id(void) {
     return v ? v : 1;
 }
 
-/* ============================================================================
- * Layer 1: Span buffer operations
- * ========================================================================= */
-
-static bool span_buffer_push(span_buffer_t* buf, const trace_span_t* span) {
-    /* Claim a slot */
-    uint64_t idx = atomic_fetch_add_explicit(&buf->head, 1, memory_order_relaxed);
-
-    /* Check if buffer is full */
-    uint64_t tail = atomic_load_explicit(&buf->tail, memory_order_acquire);
-    if (idx - tail >= (uint64_t)buf->capacity) {
-        /* Can't use this slot — decrement head is complex in MPSC, just mark filled
-         * with a sentinel.  Exporter skips non-sampled spans anyway. */
-        return false;
-    }
-
-    span_slot_t* slot = &buf->slots[idx & buf->mask];
-
-    /* Wait briefly for slot to clear (exporter is the only reader) */
-    uint32_t spin = 0;
-    while (atomic_load_explicit(&slot->state, memory_order_acquire) != SPAN_SLOT_EMPTY) {
-        if (++spin > 512) return false;  /* Give up; don't block producer */
-    }
-
-    slot->span = *span;
-    atomic_store_explicit(&slot->state, SPAN_SLOT_FILLED, memory_order_release);
-    return true;
-}
 
 /* ============================================================================
  * Layer 2: Sampling policy
@@ -185,6 +171,10 @@ static void* exporter_thread_fn(void* arg) {
     /* Seed ID generator with thread-dependent value */
     atomic_fetch_add_explicit(&g_id_seed, monotonic_ns(), memory_order_relaxed);
 
+#define EXPORT_BATCH_MAX 64
+    trace_span_t* export_batch = malloc(EXPORT_BATCH_MAX * sizeof(trace_span_t));
+    if (!export_batch) return NULL;  /* OOM — can't export, but don't crash */
+
     while (!atomic_load_explicit(&t->shutdown, memory_order_acquire)) {
         /* Sleep for export interval (interruptible by shutdown) */
         struct timespec sleep_ts = {
@@ -207,10 +197,9 @@ static void* exporter_thread_fn(void* arg) {
         uint64_t head = atomic_load_explicit(&t->buffer.head, memory_order_acquire);
 
         /* Temporary export batch on stack — bounded size */
-        trace_span_t export_batch[256];
         size_t batch_count = 0;
 
-        while (tail < head && batch_count < 256) {
+        while (tail < head && batch_count < EXPORT_BATCH_MAX) {
             span_slot_t* slot = &t->buffer.slots[tail & t->buffer.mask];
             uint32_t state =
                 atomic_load_explicit(&slot->state, memory_order_acquire);
@@ -283,10 +272,9 @@ static void* exporter_thread_fn(void* arg) {
     {
         uint64_t tail = atomic_load_explicit(&t->buffer.tail, memory_order_acquire);
         uint64_t head = atomic_load_explicit(&t->buffer.head, memory_order_acquire);
-        trace_span_t export_batch[256];
         size_t batch_count = 0;
 
-        while (tail < head && batch_count < 256) {
+        while (tail < head && batch_count < EXPORT_BATCH_MAX) {
             span_slot_t* slot = &t->buffer.slots[tail & t->buffer.mask];
             uint32_t state =
                 atomic_load_explicit(&slot->state, memory_order_acquire);
@@ -302,6 +290,8 @@ static void* exporter_thread_fn(void* arg) {
             t->export_callback(export_batch, batch_count, t->user_data);
     }
 
+    free(export_batch);
+#undef EXPORT_BATCH_MAX
     return NULL;
 }
 

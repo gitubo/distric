@@ -85,19 +85,6 @@ static int format_entry(char* buf, size_t buf_size,
                          const char* message,
                          const log_kv_t* kv_pairs, size_t kv_count) {
     size_t o = 0;
-    char scratch[512];
-
-    auto inline void append_str(const char* s) {
-        size_t len = strlen(s);
-        if (o + len < buf_size) { memcpy(buf + o, s, len); o += len; }
-    }
-    auto inline void append_json_str(const char* s) {
-        int n = json_escape(buf + o, buf_size - o, s);
-        if (n > 0) o += (size_t)n;
-    }
-
-    /* Avoid GCC nested function extension for portability; use a flag approach */
-    (void)scratch;
 
     /* Build JSON manually using snprintf */
     int w;

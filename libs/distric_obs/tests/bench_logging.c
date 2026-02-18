@@ -42,7 +42,7 @@ void bench_sync_logging() {
     for (int i = 0; i < BENCH_LOG_ITERATIONS; i++) {
         LOG_INFO(logger, "benchmark", "Benchmark log message",
                 "iteration", "test",
-                "value", "42");
+                "value", "42", NULL);
     }
     
     uint64_t end = get_time_ns();
@@ -87,7 +87,7 @@ void bench_async_logging() {
     for (int i = 0; i < BENCH_LOG_ITERATIONS; i++) {
         LOG_INFO(logger, "benchmark", "Benchmark log message",
                 "iteration", "test",
-                "value", "42");
+                "value", "42", NULL);
     }
     
     uint64_t end = get_time_ns();
@@ -131,7 +131,7 @@ void* logging_bench_thread(void* arg) {
     for (int i = 0; i < iterations; i++) {
         LOG_INFO(bench_logger, "worker", "Concurrent log",
                 "thread", "test",
-                "iteration", "test");
+                "iteration", "test", NULL);
     }
     
     return NULL;
@@ -217,7 +217,7 @@ void bench_cpu_overhead() {
     for (int i = 0; i < BENCH_LOG_ITERATIONS; i++) {
         /* Added dummy key-value pair to satisfy variadic macro requirements 
            under strict compiler settings */
-        LOG_INFO(logger, "test", "Message", "bench", "overhead");
+        LOG_INFO(logger, "test", "Message", "bench", "overhead", NULL);
     }
     uint64_t logging_end = get_time_ns();
     uint64_t logging_ns = logging_end - logging_start;
