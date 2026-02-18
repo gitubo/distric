@@ -25,6 +25,7 @@ obs_test(test_distric_obs test_distric_obs.c)
 # ─── Stress and production invariant tests ────────────────────────────────────
 obs_test(test_stress             test_stress.c)
 obs_test(test_stress_production  test_stress_production.c)
+obs_test(test_production_hardening  test_production_hardening.c)
 
 # ─── Failure mode and chaos tests (new — Improvement #5) ─────────────────────
 obs_test(test_failure_modes  test_failure_modes.c)
