@@ -1,3 +1,6 @@
+/*
+ * health.c — DistriC Observability Library — Health Monitoring
+ */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 199309L
 #endif
@@ -10,7 +13,6 @@
 #include <stdatomic.h>
 #include <pthread.h>
 
-#define MAX_HEALTH_COMPONENTS 64
 #define MAX_COMPONENT_NAME_LEN 64
 #define MAX_HEALTH_MESSAGE_LEN 256
 
@@ -189,85 +191,64 @@ static void json_escape(const char* src, char* dst, size_t dst_size) {
                 dst[j++] = '\\';
                 dst[j++] = 'n';
             }
-        } else if ((unsigned char)c < 32) {
-            continue;
-        } else {
+        } else if ((unsigned char)c >= 32) {
             dst[j++] = c;
         }
     }
     dst[j] = '\0';
 }
 
-/* Export health status as JSON */
+/* Export health as JSON */
 distric_err_t health_export_json(health_registry_t* registry,
-                                 char** out_buffer,
-                                 size_t* out_size) {
+                                  char** out_buffer,
+                                  size_t* out_size) {
     if (!registry || !out_buffer || !out_size) {
         return DISTRIC_ERR_INVALID_ARG;
     }
     
-    size_t buffer_size = 64 * 1024;  /* 64KB */
+    size_t buffer_size = 65536;
     char* buffer = malloc(buffer_size);
     if (!buffer) {
-        return DISTRIC_ERR_ALLOC_FAILURE;
+        return DISTRIC_ERR_NO_MEMORY;
     }
     
+    health_status_t overall = health_get_overall_status(registry);
     size_t offset = 0;
     
-    /* Get overall status */
-    health_status_t overall = health_get_overall_status(registry);
-    
-    /* Start JSON object */
     int written = snprintf(buffer + offset, buffer_size - offset,
                           "{\"status\":\"%s\",\"components\":[",
                           health_status_str(overall));
-    if (written < 0 || (size_t)written >= buffer_size - offset) {
-        free(buffer);
-        return DISTRIC_ERR_BUFFER_OVERFLOW;
-    }
-    offset += written;
+    if (written > 0) offset += (size_t)written;
     
-    /* Add components */
     size_t count = atomic_load(&registry->component_count);
-    bool first = true;
-    
     for (size_t i = 0; i < count; i++) {
         health_component_t* comp = &registry->components[i];
         if (!atomic_load(&comp->active)) {
             continue;
         }
         
-        char escaped_message[MAX_HEALTH_MESSAGE_LEN * 2];
-        json_escape(comp->message, escaped_message, sizeof(escaped_message));
+        if (i > 0 && offset < buffer_size) {
+            buffer[offset++] = ',';
+        }
         
-        health_status_t status = atomic_load(&comp->status);
+        char escaped_msg[MAX_HEALTH_MESSAGE_LEN * 2];
+        json_escape(comp->message, escaped_msg, sizeof(escaped_msg));
         
         written = snprintf(buffer + offset, buffer_size - offset,
-                          "%s{\"name\":\"%s\",\"status\":\"%s\",\"message\":\"%s\",\"lastCheck\":%lu}",
-                          first ? "" : ",",
+                          "{\"name\":\"%s\",\"status\":\"%s\",\"message\":\"%s\"}",
                           comp->name,
-                          health_status_str(status),
-                          escaped_message,
-                          comp->last_check_time_ms);
-        
-        if (written < 0 || (size_t)written >= buffer_size - offset) {
-            free(buffer);
-            return DISTRIC_ERR_BUFFER_OVERFLOW;
-        }
-        offset += written;
-        first = false;
+                          health_status_str(atomic_load(&comp->status)),
+                          escaped_msg);
+        if (written > 0) offset += (size_t)written;
     }
     
-    /* Close JSON */
-    written = snprintf(buffer + offset, buffer_size - offset, "]}");
-    if (written < 0 || (size_t)written >= buffer_size - offset) {
-        free(buffer);
-        return DISTRIC_ERR_BUFFER_OVERFLOW;
+    if (offset < buffer_size - 2) {
+        buffer[offset++] = ']';
+        buffer[offset++] = '}';
+        buffer[offset] = '\0';
     }
-    offset += written;
     
     *out_buffer = buffer;
     *out_size = offset;
-    
     return DISTRIC_OK;
 }

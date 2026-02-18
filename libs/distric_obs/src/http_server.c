@@ -1,3 +1,6 @@
+/*
+ * http_server.c — DistriC Observability Library — Minimal HTTP Server
+ */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200112L
 #endif
@@ -8,8 +11,17 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <pthread.h>
+
+#define MAX_REQUEST_SIZE 8192
+#define MAX_RESPONSE_SIZE (1024 * 1024)
+#define REQUEST_TIMEOUT_MS 5000
 
 typedef struct {
     char method[16];
@@ -33,54 +45,38 @@ struct obs_server_s {
     metrics_registry_t* metrics;
     health_registry_t* health;
 };
-#include <sys/time.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <errno.h>
 
-#define MAX_REQUEST_SIZE 8192
-#define MAX_RESPONSE_SIZE (1024 * 1024)  /* 1MB */
-#define REQUEST_TIMEOUT_MS 5000
-
-/* IMPROVED: Buffered HTTP request reading */
+/* Read HTTP request with timeout */
 static int read_http_request(int client_fd, char* buffer, size_t buffer_size) {
     size_t total_read = 0;
     ssize_t bytes_read;
     
-    /* Set socket timeout */
     struct timeval tv;
     tv.tv_sec = REQUEST_TIMEOUT_MS / 1000;
     tv.tv_usec = (REQUEST_TIMEOUT_MS % 1000) * 1000;
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     
-    /* Read until we find \r\n\r\n or buffer is full */
     while (total_read < buffer_size - 1) {
         bytes_read = read(client_fd, buffer + total_read, buffer_size - total_read - 1);
         
         if (bytes_read < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* Timeout or would block */
                 break;
             }
-            /* Read error */
             return -1;
         }
         
         if (bytes_read == 0) {
-            /* Connection closed */
             break;
         }
         
         total_read += bytes_read;
         buffer[total_read] = '\0';
         
-        /* Check if we have complete headers (look for \r\n\r\n) */
         if (strstr(buffer, "\r\n\r\n") != NULL) {
             break;
         }
         
-        /* SECURITY: Prevent infinite loop on malformed requests */
         if (total_read >= buffer_size - 1) {
             break;
         }
@@ -89,13 +85,12 @@ static int read_http_request(int client_fd, char* buffer, size_t buffer_size) {
     return total_read;
 }
 
-/* Parse HTTP request - IMPROVED validation */
+/* Parse HTTP request */
 static int parse_request(const char* buffer, http_request_t* request) {
     if (!buffer || !request) {
         return -1;
     }
     
-    /* Parse request line: METHOD PATH VERSION */
     int parsed = sscanf(buffer, "%15s %255s %15s", 
                        request->method, request->path, request->version);
     
@@ -103,17 +98,14 @@ static int parse_request(const char* buffer, http_request_t* request) {
         return -1;
     }
     
-    /* Validate HTTP version */
     if (strncmp(request->version, "HTTP/1.", 7) != 0) {
         return -1;
     }
     
-    /* Validate method (only allow GET for observability endpoints) */
     if (strcmp(request->method, "GET") != 0) {
         return -1;
     }
     
-    /* Sanitize path (prevent directory traversal) */
     if (strstr(request->path, "..") != NULL) {
         return -1;
     }
@@ -139,7 +131,6 @@ static void send_response(int client_fd, const http_response_t* response) {
                              response->body_length);
     
     if (header_len > 0 && (size_t)header_len < sizeof(header)) {
-        /* Send header */
         ssize_t sent = 0;
         while (sent < header_len) {
             ssize_t n = write(client_fd, header + sent, header_len - sent);
@@ -147,7 +138,6 @@ static void send_response(int client_fd, const http_response_t* response) {
             sent += n;
         }
         
-        /* Send body */
         if (response->body && response->body_length > 0) {
             sent = 0;
             while (sent < (ssize_t)response->body_length) {
@@ -180,13 +170,13 @@ static void handle_metrics(obs_server_t* server, int client_fd) {
         send_response(client_fd, &response);
         free(metrics_output);
     } else {
-        const char* error_body = "Internal Server Error";
+        const char* body = "Internal error\n";
         http_response_t response = {
             .status_code = 500,
             .status_text = "Internal Server Error",
             .content_type = "text/plain",
-            .body = error_body,
-            .body_length = strlen(error_body)
+            .body = body,
+            .body_length = strlen(body)
         };
         send_response(client_fd, &response);
     }
@@ -207,35 +197,33 @@ static void handle_health_live(int client_fd) {
 
 /* Handle /health/ready endpoint */
 static void handle_health_ready(obs_server_t* server, int client_fd) {
-    char* health_output = NULL;
+    char* health_json = NULL;
     size_t health_size = 0;
     
-    distric_err_t err = health_export_json(server->health, 
-                                           &health_output, 
-                                           &health_size);
+    distric_err_t err = health_export_json(server->health, &health_json, &health_size);
     
-    if (err == DISTRIC_OK && health_output) {
-        health_status_t overall = health_get_overall_status(server->health);
-        int status_code = (overall == HEALTH_UP) ? 200 : 503;
-        const char* status_text = (overall == HEALTH_UP) ? "OK" : "Service Unavailable";
+    if (err == DISTRIC_OK && health_json) {
+        health_status_t status = health_get_overall_status(server->health);
+        int status_code = (status == HEALTH_UP) ? 200 : 503;
+        const char* status_text = (status == HEALTH_UP) ? "OK" : "Service Unavailable";
         
         http_response_t response = {
             .status_code = status_code,
             .status_text = status_text,
             .content_type = "application/json",
-            .body = health_output,
+            .body = health_json,
             .body_length = health_size
         };
         send_response(client_fd, &response);
-        free(health_output);
+        free(health_json);
     } else {
-        const char* error_body = "{\"status\":\"ERROR\"}";
+        const char* body = "{\"status\":\"DOWN\"}";
         http_response_t response = {
-            .status_code = 500,
-            .status_text = "Internal Server Error",
+            .status_code = 503,
+            .status_text = "Service Unavailable",
             .content_type = "application/json",
-            .body = error_body,
-            .body_length = strlen(error_body)
+            .body = body,
+            .body_length = strlen(body)
         };
         send_response(client_fd, &response);
     }
@@ -243,7 +231,7 @@ static void handle_health_ready(obs_server_t* server, int client_fd) {
 
 /* Handle 400 Bad Request */
 static void handle_bad_request(int client_fd) {
-    const char* body = "Bad Request";
+    const char* body = "Bad Request\n";
     http_response_t response = {
         .status_code = 400,
         .status_text = "Bad Request",
@@ -256,7 +244,7 @@ static void handle_bad_request(int client_fd) {
 
 /* Handle 404 Not Found */
 static void handle_not_found(int client_fd) {
-    const char* body = "Not Found";
+    const char* body = "Not Found\n";
     http_response_t response = {
         .status_code = 404,
         .status_text = "Not Found",
@@ -269,7 +257,7 @@ static void handle_not_found(int client_fd) {
 
 /* Handle 405 Method Not Allowed */
 static void handle_method_not_allowed(int client_fd) {
-    const char* body = "Method Not Allowed";
+    const char* body = "Method Not Allowed\n";
     http_response_t response = {
         .status_code = 405,
         .status_text = "Method Not Allowed",
@@ -280,15 +268,13 @@ static void handle_method_not_allowed(int client_fd) {
     send_response(client_fd, &response);
 }
 
-/* Handle client request - IMPROVED */
+/* Handle client request */
 static void handle_client(obs_server_t* server, int client_fd) {
     char buffer[MAX_REQUEST_SIZE];
     
-    /* Read complete request with timeout */
     int bytes_read = read_http_request(client_fd, buffer, sizeof(buffer));
     
     if (bytes_read <= 0) {
-        /* Timeout or error - just close */
         close(client_fd);
         return;
     }
@@ -322,7 +308,6 @@ static void handle_client(obs_server_t* server, int client_fd) {
 static void* server_thread_fn(void* arg) {
     obs_server_t* server = (obs_server_t*)arg;
     
-    /* Set socket to non-blocking for accept timeout */
     struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
     setsockopt(server->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     
@@ -336,19 +321,15 @@ static void* server_thread_fn(void* arg) {
         
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* Timeout - check if still running */
                 continue;
             }
-            /* Other error */
             continue;
         }
         
-        /* IMPROVED: Set client socket timeouts */
         struct timeval client_tv = { .tv_sec = 5, .tv_usec = 0 };
         setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &client_tv, sizeof(client_tv));
         setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &client_tv, sizeof(client_tv));
         
-        /* Handle client request (synchronous for now) */
         handle_client(server, client_fd);
     }
     
@@ -369,18 +350,15 @@ distric_err_t obs_server_init(obs_server_t** server,
         return DISTRIC_ERR_ALLOC_FAILURE;
     }
     
-    /* Create socket */
     srv->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (srv->socket_fd < 0) {
         free(srv);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
-    /* Set SO_REUSEADDR */
     int opt = 1;
     setsockopt(srv->socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
-    /* Bind to port */
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -393,7 +371,6 @@ distric_err_t obs_server_init(obs_server_t** server,
         return DISTRIC_ERR_INIT_FAILED;
     }
     
-    /* Get actual port if 0 was specified */
     if (port == 0) {
         socklen_t addr_len = sizeof(addr);
         if (getsockname(srv->socket_fd, (struct sockaddr*)&addr, &addr_len) == 0) {
@@ -403,7 +380,6 @@ distric_err_t obs_server_init(obs_server_t** server,
         srv->port = port;
     }
     
-    /* Listen */
     if (listen(srv->socket_fd, 10) < 0) {
         close(srv->socket_fd);
         free(srv);
@@ -414,7 +390,6 @@ distric_err_t obs_server_init(obs_server_t** server,
     srv->health = health;
     atomic_init(&srv->running, true);
     
-    /* Start server thread */
     if (pthread_create(&srv->thread, NULL, server_thread_fn, srv) != 0) {
         close(srv->socket_fd);
         free(srv);
