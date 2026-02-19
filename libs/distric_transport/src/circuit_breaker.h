@@ -8,30 +8,46 @@
  * STATES
  * ==========================================================================
  *
- *  CLOSED    Normal operation. Failures are counted. When failure count
- *            reaches the threshold within the window, transition → OPEN.
+ *  CLOSED    Normal operation. Failures counted within window_ms. When
+ *            failure count reaches threshold, transition → OPEN.
  *
- *  OPEN      All connection attempts are rejected immediately with
- *            DISTRIC_ERR_CIRCUIT_OPEN. After recovery_ms milliseconds,
- *            one probe is allowed → HALF_OPEN.
+ *  OPEN      All connection attempts rejected immediately. After recovery_ms
+ *            milliseconds, one probe is allowed → HALF_OPEN.
  *
  *  HALF_OPEN One probe attempt in flight. On success → CLOSED (counters
- *            reset). On failure → OPEN (timer restarted with backoff).
+ *            reset). On failure → OPEN (timer restarted with exponential
+ *            backoff, capped at 60 s).
  *
  * ==========================================================================
- * THREAD SAFETY
+ * THREAD SAFETY — v2
  * ==========================================================================
  *
- *  All state transitions are protected by a per-entry spinlock (atomic
- *  compare-exchange). The global registry uses a single mutex for insertion
- *  and lookup, but the hot path (state check) uses only the per-entry lock.
+ *  Registry locking uses pthread_rwlock_t instead of a plain mutex.
+ *
+ *  Read lock (shared, concurrent):
+ *    cb_is_allowed() CLOSED fast-path, cb_get_state().
+ *    Multiple callers proceed concurrently. No writer is blocked for the
+ *    dominant case (steady-state CLOSED host).
+ *
+ *  Write lock (exclusive):
+ *    cb_record_failure(), cb_record_success(), insertion/eviction, and the
+ *    OPEN → HALF_OPEN transition inside cb_is_allowed(). These are rare
+ *    relative to the read path.
+ *
+ *  Per-entry atomics (state, failure_count) provide fine-grained visibility
+ *  without additional locking for the read fast-path.
+ *
+ *  Double-check pattern in cb_is_allowed():
+ *    1. Take rdlock → find entry → read state.
+ *    2. If CLOSED → return under rdlock (no write needed).
+ *    3. Release rdlock → take wrlock → re-find → handle transition.
  *
  * ==========================================================================
  * DEFAULTS
  * ==========================================================================
  *
  *  failure_threshold  5  failures
- *  recovery_ms        5000 ms  (doubles on each consecutive OPEN event, up to 60 s)
+ *  recovery_ms        5000 ms  (doubles on each trip, capped at 60 s)
  *  window_ms          10000 ms (sliding window for failure counting)
  *  max_entries        1024     (LRU eviction when full)
  */
@@ -50,10 +66,20 @@ extern "C" {
 #endif
 
 /* ============================================================================
- * OPAQUE TYPES
+ * OPAQUE TYPE
  * ========================================================================= */
 
 typedef struct cb_registry_s cb_registry_t;
+
+/* ============================================================================
+ * CIRCUIT BREAKER STATE
+ * ========================================================================= */
+
+typedef enum {
+    CB_STATE_CLOSED    = 0,  /**< Normal — all connections allowed.           */
+    CB_STATE_OPEN      = 1,  /**< Tripped — all connections rejected.         */
+    CB_STATE_HALF_OPEN = 2,  /**< One probe allowed; outcome resets or retips.*/
+} cb_state_t;
 
 /* ============================================================================
  * CONFIGURATION
@@ -73,12 +99,10 @@ typedef struct {
 /**
  * @brief Allocate a circuit-breaker registry.
  *
- * One registry per server or pool instance is sufficient.
- *
  * @param cfg      Configuration (NULL = defaults).
- * @param metrics  Metrics registry for breaker state exports (may be NULL).
+ * @param metrics  Metrics registry (may be NULL).
  * @param logger   Logger (may be NULL).
- * @param out      [out] Created registry.
+ * @param out      [out] Created registry handle.
  * @return 0 on success, -1 on allocation failure.
  */
 int cb_registry_create(
@@ -89,53 +113,48 @@ int cb_registry_create(
 );
 
 /**
- * @brief Destroy a registry and free all memory.
+ * @brief Destroy the registry and free all resources.
  */
 void cb_registry_destroy(cb_registry_t* reg);
 
 /* ============================================================================
- * OPERATIONS
+ * CIRCUIT BREAKER API
  * ========================================================================= */
 
 /**
- * @brief Check whether a connection to host:port is permitted.
+ * @brief Check if a connection attempt to host:port is allowed.
  *
- * Called BEFORE attempting tcp_connect.
+ * CLOSED fast path uses a shared read lock — multiple callers concurrent.
+ * OPEN/HALF_OPEN transition uses exclusive write lock — rare path.
  *
- * @return true   Circuit is CLOSED or in HALF_OPEN probe window → proceed.
- * @return false  Circuit is OPEN → reject immediately.
+ * @param reg   Registry handle.
+ * @param host  Target hostname or IP.
+ * @param port  Target port.
+ * @return true if the connection should proceed; false if the circuit is open.
  */
 bool cb_is_allowed(cb_registry_t* reg, const char* host, uint16_t port);
 
 /**
- * @brief Record a successful connection or operation to host:port.
+ * @brief Record a successful connection to host:port.
  *
- * Resets the failure counter. Transitions HALF_OPEN → CLOSED.
+ * If the circuit was OPEN or HALF_OPEN, transitions to CLOSED and resets
+ * the failure counter and backoff.
  */
 void cb_record_success(cb_registry_t* reg, const char* host, uint16_t port);
 
 /**
  * @brief Record a failed connection attempt to host:port.
  *
- * Increments the failure counter. May transition CLOSED → OPEN or
- * HALF_OPEN → OPEN.
+ * Increments the failure counter. Transitions to OPEN when the failure
+ * threshold is exceeded within the counting window. Applies exponential
+ * backoff to the recovery timer.
  */
 void cb_record_failure(cb_registry_t* reg, const char* host, uint16_t port);
 
-/* ============================================================================
- * INTROSPECTION
- * ========================================================================= */
-
-typedef enum {
-    CB_STATE_CLOSED    = 0,
-    CB_STATE_OPEN      = 1,
-    CB_STATE_HALF_OPEN = 2,
-} cb_state_t;
-
 /**
- * @brief Return the current breaker state for host:port.
+ * @brief Return the current circuit state for host:port.
  *
- * Returns CB_STATE_CLOSED if the host is not tracked.
+ * Uses a shared read lock. Safe to call from any number of threads.
  */
 cb_state_t cb_get_state(cb_registry_t* reg, const char* host, uint16_t port);
 

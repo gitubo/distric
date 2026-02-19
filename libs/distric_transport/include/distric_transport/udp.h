@@ -1,9 +1,9 @@
 /**
  * @file udp.h
- * @brief DistriC UDP Transport — Non-Blocking with Rate Limiting v3
+ * @brief DistriC UDP Transport — Non-Blocking with Rate Limiting v4
  *
  * ==========================================================================
- * RATE LIMITING & PEER EVICTION (v3)
+ * RATE LIMITING & PEER EVICTION (v4)
  * ==========================================================================
  *
  * UDP is connectionless and attack-prone. This module implements per-peer
@@ -16,15 +16,25 @@
  *                    0 = 2× rate_limit_pps.
  *   max_peers        Maximum number of distinct source IPs tracked.
  *                    0 = 256 (BUCKET_TABLE_SIZE).
- *                    When this limit is reached, the peer with the oldest
- *                    last-seen timestamp is evicted (LRU eviction).
+ *                    When this limit is reached, the LRU entry is evicted.
  *   peer_ttl_s       TTL in seconds for peer state. Peers not seen within
  *                    this window are preferentially evicted.
  *                    0 = 30 seconds.
  *
  * Memory ceiling:
  *   With max_peers capped, memory usage is O(max_peers) regardless of the
- *   number of distinct source IPs seen (DoS-safe).
+ *   number of distinct source IPs seen — DoS-safe.
+ *
+ * Eviction visibility (v4):
+ *   udp_get_eviction_count() returns total LRU/TTL evictions since socket
+ *   creation. A rising eviction counter under load indicates an active
+ *   IP-spoofing flood that is consuming the peer tracking table.
+ *   Also exported as metric: udp_peer_evictions_total.
+ *
+ * Eviction correctness (v4):
+ *   evict_lru_peer() scans the full table (not stopping at hash-chain gaps)
+ *   to guarantee the true LRU candidate is always found, even under heavy
+ *   collision fragmentation from a flood.
  *
  * ==========================================================================
  * I/O MODEL
@@ -36,7 +46,7 @@
  *                    0  Wait indefinitely.
  *                   >0  Wait up to timeout_ms milliseconds.
  *
- * @version 3.0.0
+ * @version 4.0.0
  */
 
 #ifndef DISTRIC_TRANSPORT_UDP_H
@@ -80,9 +90,15 @@ typedef struct {
  * The socket is created in non-blocking mode. Pass port = 0 to let the OS
  * assign an ephemeral port (sender-only use case).
  *
- * @param bind_addr   Address to bind (e.g., "0.0.0.0", "127.0.0.1").
+ * Metrics registered (if metrics != NULL):
+ *   udp_packets_sent_total, udp_packets_recv_total,
+ *   udp_bytes_sent_total,   udp_bytes_recv_total,
+ *   udp_send_errors_total,  udp_recv_errors_total,
+ *   udp_packets_dropped_total, udp_peer_evictions_total
+ *
+ * @param bind_addr   Address to bind.
  * @param port        Port to bind (0 = ephemeral).
- * @param rate_cfg    Rate limiting config (NULL = unlimited, no peer tracking).
+ * @param rate_cfg    Rate limiting config (NULL = unlimited).
  * @param metrics     Metrics registry (NULL = no metrics).
  * @param logger      Logger instance (NULL = no logging).
  * @param sock_out    [out] Created socket handle.
@@ -100,16 +116,10 @@ distric_err_t udp_socket_create(
 /**
  * @brief Send a UDP datagram.
  *
- * @param sock       UDP socket.
- * @param data       Data to send.
- * @param len        Datagram size in bytes (max 65507).
- * @param dest_addr  Destination address string.
- * @param dest_port  Destination port.
- *
  * @return > 0                       Bytes sent.
  * @return DISTRIC_ERR_BACKPRESSURE  Kernel buffer full; retry later.
  * @return DISTRIC_ERR_IO            Send error.
- * @return DISTRIC_ERR_INVALID_ARG   NULL/bad input.
+ * @return DISTRIC_ERR_INVALID_ARG   NULL or bad address.
  */
 int udp_send(
     udp_socket_t* sock,
@@ -127,14 +137,14 @@ int udp_send(
  *
  * @param sock        UDP socket.
  * @param buffer      Receive buffer.
- * @param len         Buffer size in bytes.
+ * @param len         Buffer size.
  * @param src_addr    [out] Source address (min 64 bytes). May be NULL.
  * @param src_port    [out] Source port. May be NULL.
- * @param timeout_ms  -1 = non-blocking; 0 = infinite wait; >0 = timeout.
+ * @param timeout_ms  -1 = non-blocking; 0 = infinite; >0 = bounded wait.
  *
- * @return > 0            Bytes received.
- * @return 0              No datagram (timeout, WOULD_BLOCK, or rate-limited).
- * @return DISTRIC_ERR_IO Receive error.
+ * @return > 0             Bytes received.
+ * @return 0               No datagram (timeout, WOULD_BLOCK, rate-limited).
+ * @return DISTRIC_ERR_IO  Receive error.
  */
 int udp_recv(
     udp_socket_t* sock,
@@ -147,11 +157,25 @@ int udp_recv(
 
 /**
  * @brief Return total dropped packet count since socket creation.
+ *
+ * Incremented for every rate-limited packet. Lock-free atomic read.
  */
 uint64_t udp_get_drop_count(udp_socket_t* sock);
 
 /**
+ * @brief Return total peer table eviction count since socket creation.
+ *
+ * Incremented each time an LRU or TTL-expired peer is evicted from the
+ * token-bucket table to make room for a new peer. A rising value under
+ * flood conditions indicates the table is being saturated, likely by
+ * IP-spoofed source addresses. Lock-free atomic read.
+ */
+uint64_t udp_get_eviction_count(udp_socket_t* sock);
+
+/**
  * @brief Close and free the socket.
+ *
+ * Logs final drop and eviction counts if a logger was provided.
  */
 void udp_close(udp_socket_t* sock);
 
