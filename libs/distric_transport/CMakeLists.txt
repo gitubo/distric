@@ -18,6 +18,7 @@ find_package(Threads REQUIRED)
 set(TRANSPORT_SOURCES
     src/transport_error.c
     src/send_queue.c
+    src/circuit_breaker.c
     src/tcp.c
     src/tcp_pool.c
     src/udp.c

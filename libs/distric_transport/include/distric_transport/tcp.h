@@ -1,9 +1,35 @@
 /**
  * @file tcp.h
- * @brief DistriC TCP Transport — Non-Blocking API v2
+ * @brief DistriC TCP Transport — Non-Blocking API v3
  *
  * All sockets are strictly non-blocking (O_NONBLOCK). The library never
  * sleeps inside a send or receive call.
+ *
+ * ==========================================================================
+ * CONCURRENCY MODEL (v3)
+ * ==========================================================================
+ *
+ * The server uses a BOUNDED WORKER POOL instead of unbounded detached threads.
+ *
+ *   Accept thread  → accepts connections, submits to work queue
+ *   Worker pool    → N threads (default: CPU count) process callbacks
+ *   Work queue     → bounded MPSC ring; drops + logs when full (back-pressure)
+ *
+ * Benefits:
+ *   - Thread count is bounded to O(CPU count), not O(connections).
+ *   - No thread explosion under bursty accept rates.
+ *   - Configurable pool size via tcp_server_config_t.worker_threads.
+ *
+ * ==========================================================================
+ * GRACEFUL SHUTDOWN (v3)
+ * ==========================================================================
+ *
+ *   RUNNING → (tcp_server_stop) → DRAINING → (active == 0 or timeout) → STOPPED
+ *
+ *   In DRAINING state:
+ *     - No new connections are accepted.
+ *     - Active connections continue until their callbacks return.
+ *     - tcp_server_stop() blocks until drain completes or drain_timeout_ms.
  *
  * ==========================================================================
  * I/O MODEL
@@ -11,37 +37,24 @@
  *
  * SEND
  *   tcp_send() attempts a direct kernel send. On EAGAIN the data is buffered
- *   in a per-connection send queue. The next tcp_send() flushes the queue
- *   before appending new data. If the queue grows above its high-water mark
- *   (HWM), tcp_send() returns DISTRIC_ERR_BACKPRESSURE — the caller MUST
- *   slow down. No data is silently dropped.
+ *   in a per-connection ring-buffer send queue. When the queue grows above
+ *   its high-water mark (HWM), tcp_send() returns DISTRIC_ERR_BACKPRESSURE.
  *
  * RECEIVE
  *   tcp_recv() is non-blocking with an optional timeout. With timeout_ms = -1
- *   it returns immediately (WOULD_BLOCK → returns 0). With timeout_ms >= 0 it
- *   waits up to that many milliseconds using a single epoll_wait, then reads.
- *   It never blocks the calling thread beyond the specified timeout.
+ *   it returns immediately. With timeout_ms >= 0 it waits using a cached
+ *   per-connection epoll fd (not a temporary one-shot allocation).
  *
  * ==========================================================================
- * BACKPRESSURE SIGNALS
+ * CIRCUIT BREAKER (v3)
  * ==========================================================================
  *
- *  tcp_send() returns DISTRIC_ERR_BACKPRESSURE  → queue >= HWM, stop sending.
- *  tcp_is_writable()  returns false             → equivalent check.
+ *   tcp_connect() checks a per-server circuit breaker before dialing.
+ *   Failures transition the breaker toward OPEN, rejecting all attempts
+ *   until a recovery timeout expires and a probe succeeds.
+ *   See circuit_breaker.h for full state machine details.
  *
- *  After a BACKPRESSURE return the caller should:
- *    1. Stop sending new data.
- *    2. Call tcp_send() again later; it will flush the queue automatically.
- *    3. On persistent backpressure, drop the connection (tcp_close).
- *
- * ==========================================================================
- * ERROR HANDLING
- * ==========================================================================
- *
- *  All I/O functions return negative distric_err_t codes on hard failure.
- *  Use transport_classify_errno() / transport_err_str() for details.
- *
- * @version 2.0.0
+ * @version 3.0.0
  */
 
 #ifndef DISTRIC_TRANSPORT_TCP_H
@@ -65,11 +78,60 @@ typedef struct tcp_server_s     tcp_server_t;
 typedef struct tcp_connection_s tcp_connection_t;
 
 /* ============================================================================
+ * SERVER STATE
+ * ========================================================================= */
+
+/**
+ * @brief Graceful shutdown state machine states.
+ */
+typedef enum {
+    TCP_SERVER_RUNNING  = 0,  /**< Accepting and processing connections.    */
+    TCP_SERVER_DRAINING = 1,  /**< Not accepting; waiting for active to 0.  */
+    TCP_SERVER_STOPPED  = 2,  /**< Fully stopped; safe to destroy.          */
+} tcp_server_state_t;
+
+/* ============================================================================
+ * SERVER CONFIGURATION
+ * ========================================================================= */
+
+/**
+ * @brief Server creation configuration.
+ *
+ * Zero-initialise to use safe defaults.
+ */
+typedef struct {
+    /**
+     * Number of worker threads in the connection handler pool.
+     * 0 = auto-detect (number of logical CPUs, capped at 32).
+     */
+    uint32_t worker_threads;
+
+    /**
+     * Maximum pending connections in the worker dispatch queue.
+     * 0 = 4096. When full, new connections are rejected (closed immediately).
+     */
+    uint32_t worker_queue_depth;
+
+    /**
+     * Milliseconds to wait for active connections to finish during drain.
+     * 0 = 5000 ms.
+     */
+    uint32_t drain_timeout_ms;
+
+    /**
+     * Per-connection send queue and HWM configuration applied to all
+     * connections accepted by this server.
+     */
+    size_t conn_send_queue_capacity;
+    size_t conn_send_queue_hwm;
+} tcp_server_config_t;
+
+/* ============================================================================
  * CONNECTION CONFIGURATION
  * ========================================================================= */
 
 /**
- * @brief Per-connection configuration.
+ * @brief Per-connection configuration for outbound connections (tcp_connect).
  *
  * Zero-initialise to get safe defaults.
  */
@@ -93,9 +155,10 @@ typedef struct {
  * ========================================================================= */
 
 /**
- * @brief Callback invoked when the server accepts a new connection.
+ * @brief Callback invoked when the server dispatches a new connection.
  *
- * The callback owns the connection; it MUST call tcp_close() when done.
+ * Executed in a worker thread. The callback owns the connection and MUST
+ * call tcp_close() before returning.
  *
  * @param conn      Accepted connection.
  * @param userdata  Caller-supplied context.
@@ -107,17 +170,14 @@ typedef void (*tcp_connection_callback_t)(tcp_connection_t* conn, void* userdata
  * ========================================================================= */
 
 /**
- * @brief Create a new TCP server.
- *
- * The server socket is created and bound but not yet listening. Call
- * tcp_server_start() to begin accepting connections.
+ * @brief Create a new TCP server with default configuration.
  *
  * @param bind_addr  Address to bind (e.g., "0.0.0.0", "127.0.0.1").
  * @param port       Port to listen on.
- * @param metrics    Metrics registry (may be NULL to disable metrics).
- * @param logger     Logger instance (may be NULL to disable logging).
+ * @param metrics    Metrics registry (may be NULL).
+ * @param logger     Logger instance (may be NULL).
  * @param server     [out] Created server handle.
- * @return DISTRIC_OK on success, error code otherwise.
+ * @return DISTRIC_OK on success.
  */
 distric_err_t tcp_server_create(
     const char*         bind_addr,
@@ -128,10 +188,27 @@ distric_err_t tcp_server_create(
 );
 
 /**
- * @brief Start accepting connections in a background thread.
+ * @brief Create a new TCP server with explicit configuration.
  *
- * The accept loop runs on a dedicated thread using epoll. Each accepted
- * connection is dispatched to @p on_connection in its own detached thread.
+ * @param bind_addr  Address to bind.
+ * @param port       Port to listen on.
+ * @param cfg        Server configuration (NULL = defaults).
+ * @param metrics    Metrics registry (may be NULL).
+ * @param logger     Logger instance (may be NULL).
+ * @param server     [out] Created server handle.
+ * @return DISTRIC_OK on success.
+ */
+distric_err_t tcp_server_create_with_config(
+    const char*              bind_addr,
+    uint16_t                 port,
+    const tcp_server_config_t* cfg,
+    metrics_registry_t*      metrics,
+    logger_t*                logger,
+    tcp_server_t**           server
+);
+
+/**
+ * @brief Start accepting connections using the worker pool.
  *
  * @param server         Server to start.
  * @param on_connection  Callback for each accepted connection.
@@ -145,14 +222,25 @@ distric_err_t tcp_server_start(
 );
 
 /**
- * @brief Stop accepting new connections and wait for the accept thread to exit.
+ * @brief Transition to DRAINING and wait for active connections to finish.
  *
- * Does NOT close active connections; those are owned by their callbacks.
+ * Blocks until all active connections complete or drain_timeout_ms expires.
+ * After this call, state is TCP_SERVER_STOPPED.
  *
  * @param server  Server to stop.
  * @return DISTRIC_OK on success.
  */
 distric_err_t tcp_server_stop(tcp_server_t* server);
+
+/**
+ * @brief Return the current server state.
+ */
+tcp_server_state_t tcp_server_get_state(const tcp_server_t* server);
+
+/**
+ * @brief Return the number of currently active connections.
+ */
+int64_t tcp_server_active_connections(const tcp_server_t* server);
 
 /**
  * @brief Stop (if running) and free all server resources.
@@ -168,9 +256,10 @@ void tcp_server_destroy(tcp_server_t* server);
 /**
  * @brief Connect to a remote TCP server.
  *
- * Uses a non-blocking connect with epoll-based timeout.
+ * Checks the circuit breaker for host before dialing. Records success/failure
+ * to maintain per-host breaker state.
  *
- * @param host        Hostname or IP address (resolved via getaddrinfo).
+ * @param host        Hostname or IP address.
  * @param port        Port number.
  * @param timeout_ms  Connection timeout in milliseconds (>0 required).
  * @param config      Connection configuration (NULL = defaults).
@@ -179,6 +268,7 @@ void tcp_server_destroy(tcp_server_t* server);
  * @param conn        [out] Created connection handle.
  * @return DISTRIC_OK on success.
  *         DISTRIC_ERR_TIMEOUT if connection did not complete in time.
+ *         DISTRIC_ERR_UNAVAILABLE if circuit breaker is OPEN (host is failing).
  *         DISTRIC_ERR_INIT_FAILED on OS error.
  */
 distric_err_t tcp_connect(
@@ -194,103 +284,64 @@ distric_err_t tcp_connect(
 /**
  * @brief Send data over a connection.
  *
- * Non-blocking. Attempts a direct kernel send; on EAGAIN, buffers data in
- * the per-connection send queue.
+ * Non-blocking. Buffers into the per-connection ring-buffer send queue on
+ * EAGAIN. Returns DISTRIC_ERR_BACKPRESSURE when queue >= HWM.
  *
- * @param conn  Connection handle.
- * @param data  Data buffer.
- * @param len   Number of bytes to send.
- *
- * @return > 0  Number of bytes accepted (sent + queued). May equal len.
- * @return DISTRIC_ERR_BACKPRESSURE  Queue above HWM; caller must slow down.
- * @return DISTRIC_ERR_IO            Hard send error (connection is broken).
- * @return DISTRIC_ERR_INVALID_ARG   NULL pointer or zero length.
+ * @return > 0                    Bytes accepted (sent + queued).
+ * @return DISTRIC_ERR_BACKPRESSURE  Queue at HWM; caller must throttle.
+ * @return DISTRIC_ERR_IO            Hard send error.
+ * @return DISTRIC_ERR_INVALID_ARG   NULL or zero length.
  */
 int tcp_send(tcp_connection_t* conn, const void* data, size_t len);
 
 /**
  * @brief Receive data from a connection.
  *
+ * Uses a cached per-connection epoll fd for readiness detection (no
+ * allocation per call).
+ *
  * @param conn        Connection handle.
  * @param buffer      Receive buffer.
  * @param len         Buffer size in bytes.
- * @param timeout_ms  -1 = non-blocking (immediate return).
- *                    0  = infinite wait (blocks until data or error).
- *                    >0 = wait up to this many milliseconds.
+ * @param timeout_ms  -1 = non-blocking; 0 = infinite; >0 = bounded wait.
  *
- * @return > 0  Number of bytes received.
- * @return 0    No data available (timeout or WOULD_BLOCK).
- * @return DISTRIC_ERR_EOF  Peer closed the connection cleanly.
- * @return DISTRIC_ERR_IO   Receive error.
+ * @return > 0               Bytes received.
+ * @return 0                 No data (timeout or WOULD_BLOCK).
+ * @return DISTRIC_ERR_EOF   Peer closed the connection cleanly.
+ * @return DISTRIC_ERR_IO    Receive error.
  */
 int tcp_recv(tcp_connection_t* conn, void* buffer, size_t len, int timeout_ms);
 
 /**
- * @brief Flush the pending send queue without adding new data.
- *
- * Useful after receiving a BACKPRESSURE error to drain the queue.
- *
- * @param conn  Connection handle.
- * @return DISTRIC_OK if queue is now empty.
- *         DISTRIC_ERR_BACKPRESSURE if queue is still above HWM.
- *         DISTRIC_ERR_IO on hard send error.
+ * @brief Return pending bytes in the send queue.
  */
-distric_err_t tcp_flush(tcp_connection_t* conn);
+size_t tcp_send_queue_depth(const tcp_connection_t* conn);
 
 /**
- * @brief Return true if the send queue is below the high-water mark.
- *
- * Callers can poll this before calling tcp_send() to avoid a BACKPRESSURE
- * return.
- *
- * @param conn  Connection handle.
- * @return true if writable (queue < HWM), false if backpressure applies.
+ * @brief Return true if the send queue is below the HWM.
  */
-bool tcp_is_writable(tcp_connection_t* conn);
+bool tcp_is_writable(const tcp_connection_t* conn);
 
 /**
- * @brief Return the number of bytes currently pending in the send queue.
- *
- * @param conn  Connection handle.
- * @return Pending bytes, or 0 on NULL input.
- */
-size_t tcp_send_queue_depth(tcp_connection_t* conn);
-
-/**
- * @brief Close and free a connection.
- *
- * Safe to call with NULL. Pending send queue data is discarded.
- *
- * @param conn  Connection to close.
- */
-void tcp_close(tcp_connection_t* conn);
-
-/**
- * @brief Get the remote address and port.
- *
- * @param conn      Connection handle.
- * @param addr_out  Buffer to store address string (min 64 bytes recommended).
- * @param addr_len  Size of addr_out.
- * @param port_out  [out] Remote port.
- * @return DISTRIC_OK on success.
+ * @brief Return the remote address string.
  */
 distric_err_t tcp_get_remote_addr(
     tcp_connection_t* conn,
-    char*             addr_out,
-    size_t            addr_len,
-    uint16_t*         port_out
+    char* addr_out, size_t addr_len,
+    uint16_t* port_out
 );
 
 /**
- * @brief Return the unique connection identifier.
- *
- * IDs are monotonically increasing per process. Server-accepted connections
- * and client connections share the same counter.
- *
- * @param conn  Connection handle.
- * @return Connection ID, or 0 on NULL input.
+ * @brief Return the unique connection ID.
  */
 uint64_t tcp_get_connection_id(tcp_connection_t* conn);
+
+/**
+ * @brief Close and free the connection.
+ *
+ * After this call @p conn is invalid.
+ */
+void tcp_close(tcp_connection_t* conn);
 
 #ifdef __cplusplus
 }

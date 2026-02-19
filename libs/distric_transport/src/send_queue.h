@@ -1,28 +1,32 @@
 /**
  * @file send_queue.h
- * @brief Internal per-connection send queue with high-water mark backpressure.
+ * @brief Per-connection circular send queue with HWM-based backpressure.
  *
  * INTERNAL — do not include from outside distric_transport sources.
  *
- * Design:
- *  - A linear byte buffer holds data that could not be sent immediately
- *    (because the socket returned EAGAIN/EWOULDBLOCK).
- *  - On every tcp_send(), the queue is flushed first; new data is appended
- *    only if there is still a backlog.
- *  - If the queue grows above the high-water mark (HWM), the caller receives
- *    DISTRIC_ERR_BACKPRESSURE so it can apply upstream flow control.
- *  - The queue is NOT thread-safe by itself; callers must hold the
- *    connection's send_lock mutex.
+ * Design (v3 — true ring buffer):
+ *  - Fixed-capacity circular byte buffer. No memmove, no compaction.
+ *  - head:  read index (modulo capacity).
+ *  - len:   bytes currently buffered.
+ *  - tail:  derived as (head + len) % capacity.
  *
- * Memory layout:
+ * Push behaviour:
+ *  - Data may wrap around the end of the buffer (two-segment write).
+ *  - Returns -1 if capacity would be exceeded (caller must backpressure).
  *
- *   [ consumed | pending data | free space ]
- *     ^head      ^head+len     ^capacity
+ * Peek behaviour:
+ *  - Returns a pointer and length for the CONTIGUOUS segment at head.
+ *  - If data wraps, this is LESS than len.  The caller must loop:
+ *      peek → send → consume  until send_queue_empty().
  *
- *  head: byte offset of first unread byte.
- *  len:  number of bytes currently pending.
+ * Thread safety:
+ *  - NOT thread-safe.  The owner must hold the connection's send_lock.
  *
- * When head > capacity/2, the buffer is compacted (memmove to front).
+ * Why this is better than the previous linear-buffer model:
+ *  - No memmove on consume: O(1) head advance.
+ *  - No memmove on push: O(1) wraparound write (at most two memcpy calls).
+ *  - Cache-friendly sequential reads until the wrap point.
+ *  - Under backpressure the buffer stays full and spins O(1) per token.
  */
 
 #ifndef DISTRIC_SEND_QUEUE_H
@@ -44,15 +48,15 @@ extern "C" {
 #define SEND_QUEUE_DEFAULT_HWM       (48u  * 1024u)   /* 48 KB (75%) */
 
 /* ============================================================================
- * SEND QUEUE STRUCTURE
+ * STRUCTURE
  * ========================================================================= */
 
 typedef struct {
-    uint8_t* buf;       /**< Heap-allocated byte buffer.           */
-    size_t   capacity;  /**< Total allocated bytes.                */
+    uint8_t* buf;       /**< Heap-allocated ring buffer.           */
+    size_t   capacity;  /**< Total allocated bytes (power of 2 preferred). */
     size_t   hwm;       /**< High-water mark: backpressure trigger. */
-    size_t   head;      /**< Offset of first pending byte.         */
-    size_t   len;       /**< Number of bytes pending.              */
+    size_t   head;      /**< Index of first pending byte.          */
+    size_t   len;       /**< Number of bytes currently buffered.   */
 } send_queue_t;
 
 /* ============================================================================
@@ -60,77 +64,83 @@ typedef struct {
  * ========================================================================= */
 
 /**
- * @brief Initialize the send queue.
- * @param q         Queue to initialize.
- * @param capacity  Total buffer capacity in bytes.
- * @param hwm       High-water mark in bytes (must be <= capacity).
- * @return 0 on success, -1 on allocation failure.
+ * @brief Initialise the ring-buffer send queue.
+ * @param q         Queue to initialise.
+ * @param capacity  Total ring capacity in bytes (> 0).
+ * @param hwm       High-water mark (must be <= capacity).
+ * @return 0 on success, -1 on bad args or allocation failure.
  */
 int  send_queue_init(send_queue_t* q, size_t capacity, size_t hwm);
 
 /**
- * @brief Destroy the send queue and free its buffer.
+ * @brief Destroy the queue and free its buffer.
  */
 void send_queue_destroy(send_queue_t* q);
 
 /* ============================================================================
- * OPERATIONS
+ * WRITE PATH
  * ========================================================================= */
 
 /**
- * @brief Append data to the queue.
+ * @brief Append @p len bytes from @p data into the ring buffer.
+ *
+ * Uses at most two memcpy calls (split at wrap-around point).
+ * Returns -1 without modifying the buffer if there is not enough free space.
  *
  * @param q     Send queue.
- * @param data  Data to append.
- * @param len   Number of bytes.
- * @return 0 on success, -1 if capacity would be exceeded.
+ * @param data  Source buffer.
+ * @param len   Number of bytes to append.
+ * @return 0 on success, -1 if insufficient capacity.
  */
 int  send_queue_push(send_queue_t* q, const void* data, size_t len);
 
+/* ============================================================================
+ * READ PATH
+ * ========================================================================= */
+
 /**
- * @brief Return a pointer and length for the next pending chunk.
+ * @brief Return a pointer and length for the next CONTIGUOUS pending chunk.
+ *
+ * Due to ring-buffer wrap-around, the returned length may be less than
+ * send_queue_pending().  The caller must loop: peek → send → consume
+ * until send_queue_empty().
  *
  * @param q      Send queue.
- * @param out    [out] Pointer to pending data.
- * @param avail  [out] Number of bytes available.
+ * @param out    [out] Pointer to the start of pending data.
+ * @param avail  [out] Number of contiguous bytes available.
  */
 void send_queue_peek(const send_queue_t* q, const uint8_t** out, size_t* avail);
 
 /**
- * @brief Consume (discard) bytes from the front of the queue.
+ * @brief Advance the read pointer by @p n bytes (O(1), no data moved).
  *
- * Called after a successful send() to advance the read pointer.
- *
- * @param q    Send queue.
- * @param n    Number of bytes to consume.
+ * @param q  Send queue.
+ * @param n  Number of bytes to mark as consumed.
  */
 void send_queue_consume(send_queue_t* q, size_t n);
 
-/**
- * @brief Compact the buffer if head > capacity/2.
- *
- * Moves pending data to the front to make room for new pushes.
- * Call when a push fails to check if compaction helps.
- */
-void send_queue_compact(send_queue_t* q);
-
 /* ============================================================================
- * QUERY
+ * QUERY (inline)
  * ========================================================================= */
 
-/** @return true if there are no pending bytes. */
+/** @return true if there are no buffered bytes. */
 static inline bool send_queue_empty(const send_queue_t* q) {
     return q->len == 0;
 }
 
-/** @return true if pending bytes exceed the high-water mark. */
+/** @return true if buffered bytes >= high-water mark. */
 static inline bool send_queue_above_hwm(const send_queue_t* q) {
     return q->len >= q->hwm;
 }
 
-/** @return Number of pending bytes. */
+/** @return Number of buffered bytes. */
 static inline size_t send_queue_pending(const send_queue_t* q) {
     return q->len;
+}
+
+/** @return Number of free bytes remaining. */
+static inline size_t send_queue_free(const send_queue_t* q) {
+    return q->capacity - q->len;
 }
 
 #ifdef __cplusplus
