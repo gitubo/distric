@@ -99,10 +99,21 @@
 #define SLOT_CLAIM_MAX_SPIN 64u
 
 /* Slot state tags — atomic transitions:
- *   EMPTY ─[producer claim+fill]─► FILLED ─[consumer drain]─► EMPTY
+ *
+ *   Normal path:
+ *     EMPTY ─[producer claim+fill]─► FILLED ─[consumer drain]─► EMPTY
+ *
+ *   Over-claim drop path (producer claimed head but ring was full):
+ *     EMPTY ─[producer over-claim]─► DROPPED ─[consumer skip]─► EMPTY
+ *
+ * SLOT_DROPPED is set by a producer that incremented head (step 2) but
+ * then found at the definitive re-check (step 3) that idx - tail >= capacity.
+ * The consumer detects DROPPED and advances tail without writing to fd,
+ * preventing an indefinite spin on a slot that will never become FILLED.
  */
 #define SLOT_EMPTY  0u
 #define SLOT_FILLED 1u
+#define SLOT_DROPPED  2u   /* over-claimed; consumer must skip without reading */
 
 /*
  * Exporter liveness threshold (nanoseconds).

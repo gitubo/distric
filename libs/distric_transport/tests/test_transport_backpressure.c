@@ -201,7 +201,7 @@ void test_send_queue_depth(void) {
      * but the counter should remain non-negative */
     size_t depth = tcp_send_queue_depth(conn);
     printf("    send_queue_depth = %zu, saw_queue = %d\n", depth, saw_queue);
-    ASSERT_TRUE(depth >= 0);  /* Trivially true; verify no crash */
+    ASSERT_TRUE((int64_t)depth >= 0);  /* Trivially true; verify no crash */
 
     tcp_close(conn);
     tcp_server_destroy(server);

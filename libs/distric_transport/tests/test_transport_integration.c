@@ -80,8 +80,9 @@ static void* tcp_worker(void* arg) {
     
     for (int i = 0; i < 10 && atomic_load(&test_running); i++) {
         tcp_connection_t* conn;
-        
-        if (tcp_connect("127.0.0.1", TCP_PORT, 5000, g_metrics, g_logger, &conn) != DISTRIC_OK) {
+
+        /* NULL config = default send-queue settings */
+        if (tcp_connect("127.0.0.1", TCP_PORT, 5000, NULL, g_metrics, g_logger, &conn) != DISTRIC_OK) {
             usleep(50000);
             continue;
         }
@@ -176,10 +177,10 @@ int main(void) {
     printf("    TCP server ready\n");
     usleep(STABILIZATION_MS);  /* 500ms - let server thread stabilize */
     
-    /* [3] Create UDP socket */
+    /* [3] Create UDP socket — NULL rate_cfg = no per-peer rate limiting */
     printf("[3/7] Create UDP socket...\n");
     udp_socket_t* udp;
-    assert(udp_socket_create("127.0.0.1", UDP_PORT, g_metrics, g_logger, &udp) == DISTRIC_OK);
+    assert(udp_socket_create("127.0.0.1", UDP_PORT, NULL, g_metrics, g_logger, &udp) == DISTRIC_OK);
     
     health_update_status(udp_health, HEALTH_UP, "Running");
     printf("    UDP socket ready\n");

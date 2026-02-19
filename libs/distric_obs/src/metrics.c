@@ -381,26 +381,37 @@ static distric_err_t register_metric(metrics_registry_t*              registry,
     distric_err_t alloc_err = DISTRIC_OK;
 
     if (type == METRIC_TYPE_COUNTER) {
-        counter_instance_t* arr = calloc(card, sizeof(counter_instance_t));
+        /*
+         * Allocate one extra slot for labeled metrics.
+         * Slots 0..card-1  → labeled combinations (indexed by compute_flat_index).
+         * Slot  card        → unlabelled base (written by metrics_counter_inc/add,
+         *                      read by metrics_counter_get).
+         * For unlabelled metrics (num_label_defs == 0, card == 1) the extra slot
+         * is not needed — the single slot IS the unlabelled base.
+         */
+        size_t alloc_slots = (m->num_label_defs > 0) ? card + 1 : card;
+        counter_instance_t* arr = calloc(alloc_slots, sizeof(counter_instance_t));
         if (!arr) { alloc_err = DISTRIC_ERR_ALLOC_FAILURE; goto alloc_fail; }
-        for (size_t fi = 0; fi < card; fi++)
+        for (size_t fi = 0; fi < alloc_slots; fi++)
             atomic_init(&arr[fi].value, 0ULL);
         m->instance_array.counter = arr;
 
     } else if (type == METRIC_TYPE_GAUGE) {
-        gauge_instance_t* arr = calloc(card, sizeof(gauge_instance_t));
+        size_t alloc_slots = (m->num_label_defs > 0) ? card + 1 : card;
+        gauge_instance_t* arr = calloc(alloc_slots, sizeof(gauge_instance_t));
         if (!arr) { alloc_err = DISTRIC_ERR_ALLOC_FAILURE; goto alloc_fail; }
-        for (size_t fi = 0; fi < card; fi++)
+        for (size_t fi = 0; fi < alloc_slots; fi++)
             atomic_init(&arr[fi].value_bits, 0ULL);
         m->instance_array.gauge = arr;
 
     } else { /* METRIC_TYPE_HISTOGRAM */
         m->num_buckets = HISTOGRAM_BUCKET_COUNT;
 
-        histogram_instance_t* arr = calloc(card, sizeof(histogram_instance_t));
+        size_t alloc_slots = (m->num_label_defs > 0) ? card + 1 : card;
+        histogram_instance_t* arr = calloc(alloc_slots, sizeof(histogram_instance_t));
         if (!arr) { alloc_err = DISTRIC_ERR_ALLOC_FAILURE; goto alloc_fail; }
 
-        for (size_t fi = 0; fi < card; fi++) {
+        for (size_t fi = 0; fi < alloc_slots; fi++) {
             histogram_instance_t* inst = &arr[fi];
             inst->num_buckets = HISTOGRAM_BUCKET_COUNT;
             inst->buckets = calloc(HISTOGRAM_BUCKET_COUNT, sizeof(histogram_bucket_t));
@@ -468,14 +479,23 @@ distric_err_t metrics_register_histogram(metrics_registry_t* r, const char* name
 
 void metrics_counter_inc(metric_t* metric) {
     if (!metric || !metric->instance_array.counter) return;
-    /* Unlabelled fast path: instance 0 is always valid */
-    atomic_fetch_add_explicit(&metric->instance_array.counter[0].value,
+    /*
+     * Unlabelled fast path.
+     * For labeled metrics: use slot [cardinality] (the reserved unlabelled base).
+     * For unlabelled metrics: cardinality == 1, slot [0] is the only slot.
+     *
+     * This ensures metrics_counter_inc and metrics_counter_inc_labels never
+     * write to the same slot, giving true isolation between the two paths.
+     */
+    size_t idx = (metric->num_label_defs > 0) ? metric->cardinality : 0;
+    atomic_fetch_add_explicit(&metric->instance_array.counter[idx].value,
                               1ULL, memory_order_relaxed);
 }
 
 void metrics_counter_add(metric_t* metric, uint64_t value) {
     if (!metric || !metric->instance_array.counter) return;
-    atomic_fetch_add_explicit(&metric->instance_array.counter[0].value,
+    size_t idx = (metric->num_label_defs > 0) ? metric->cardinality : 0;
+    atomic_fetch_add_explicit(&metric->instance_array.counter[idx].value,
                               value, memory_order_relaxed);
 }
 
@@ -504,7 +524,9 @@ distric_err_t metrics_counter_add_labels(metric_t* metric,
 
 uint64_t metrics_counter_get(metric_t* metric) {
     if (!metric || !metric->instance_array.counter) return 0;
-    return atomic_load_explicit(&metric->instance_array.counter[0].value,
+    /* Reads the unlabelled base slot — same isolation rule as counter_inc. */
+    size_t idx = (metric->num_label_defs > 0) ? metric->cardinality : 0;
+    return atomic_load_explicit(&metric->instance_array.counter[idx].value,
                                 memory_order_relaxed);
 }
 

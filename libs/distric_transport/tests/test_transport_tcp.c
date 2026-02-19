@@ -87,9 +87,9 @@ void test_tcp_client_connect(void) {
     
     sleep(1); /* Let server start */
     
-    /* Connect client */
+    /* Connect client — NULL config = default send-queue settings */
     tcp_connection_t* conn;
-    ASSERT_OK(tcp_connect("127.0.0.1", TEST_PORT + 1, 5000, g_metrics, g_logger, &conn));
+    ASSERT_OK(tcp_connect("127.0.0.1", TEST_PORT + 1, 5000, NULL, g_metrics, g_logger, &conn));
     ASSERT_TRUE(conn != NULL);
     
     /* Send message */
@@ -117,12 +117,12 @@ void test_tcp_multiple_connections(void) {
     
     sleep(1);
     
-    /* Create multiple connections */
+    /* Create multiple connections — NULL config = default send-queue settings */
     #define NUM_CONNS 10
     tcp_connection_t* conns[NUM_CONNS];
     
     for (int i = 0; i < NUM_CONNS; i++) {
-        ASSERT_OK(tcp_connect("127.0.0.1", TEST_PORT + 2, 5000, g_metrics, g_logger, &conns[i]));
+        ASSERT_OK(tcp_connect("127.0.0.1", TEST_PORT + 2, 5000, NULL, g_metrics, g_logger, &conns[i]));
         
         char msg[64];
         snprintf(msg, sizeof(msg), "Message %d", i);
@@ -150,8 +150,9 @@ void test_tcp_connection_info(void) {
     
     sleep(1);
     
+    /* NULL config = default send-queue settings */
     tcp_connection_t* conn;
-    ASSERT_OK(tcp_connect("127.0.0.1", TEST_PORT + 3, 5000, g_metrics, g_logger, &conn));
+    ASSERT_OK(tcp_connect("127.0.0.1", TEST_PORT + 3, 5000, NULL, g_metrics, g_logger, &conn));
     
     char addr[256];
     uint16_t port;

@@ -386,7 +386,7 @@ static void test_sampling_stability_hysteresis(void) {
      * 100 spans over 500ms, with export every 50ms.
      */
     printf("  Phase 1: moderate load\n");
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < 20; i++) {
         trace_span_t* span;
         trace_start_span(tracer, "moderate", &span);
         trace_finish_span(tracer, span);

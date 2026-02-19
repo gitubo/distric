@@ -46,7 +46,8 @@ void test_udp_socket_create(void) {
     TEST_START();
     
     udp_socket_t* udp;
-    ASSERT_OK(udp_socket_create("127.0.0.1", TEST_PORT, g_metrics, g_logger, &udp));
+    /* NULL rate_cfg = no per-peer rate limiting */
+    ASSERT_OK(udp_socket_create("127.0.0.1", TEST_PORT, NULL, g_metrics, g_logger, &udp));
     assert(udp != NULL);
     
     udp_close(udp);
@@ -56,12 +57,12 @@ void test_udp_socket_create(void) {
 void test_udp_send_receive(void) {
     TEST_START();
     
-    /* Create sender and receiver */
+    /* Create sender and receiver — NULL rate_cfg = no rate limiting */
     udp_socket_t* sender;
     udp_socket_t* receiver;
     
-    ASSERT_OK(udp_socket_create("127.0.0.1", 0, g_metrics, g_logger, &sender));
-    ASSERT_OK(udp_socket_create("127.0.0.1", TEST_PORT + 1, g_metrics, g_logger, &receiver));
+    ASSERT_OK(udp_socket_create("127.0.0.1", 0, NULL, g_metrics, g_logger, &sender));
+    ASSERT_OK(udp_socket_create("127.0.0.1", TEST_PORT + 1, NULL, g_metrics, g_logger, &receiver));
     
     /* Send datagram */
     int sent = udp_send(sender, TEST_MESSAGE, strlen(TEST_MESSAGE), 
@@ -93,8 +94,9 @@ void test_udp_multiple_packets(void) {
     udp_socket_t* sender;
     udp_socket_t* receiver;
     
-    ASSERT_OK(udp_socket_create("127.0.0.1", 0, g_metrics, g_logger, &sender));
-    ASSERT_OK(udp_socket_create("127.0.0.1", TEST_PORT + 2, g_metrics, g_logger, &receiver));
+    /* NULL rate_cfg = no rate limiting */
+    ASSERT_OK(udp_socket_create("127.0.0.1", 0, NULL, g_metrics, g_logger, &sender));
+    ASSERT_OK(udp_socket_create("127.0.0.1", TEST_PORT + 2, NULL, g_metrics, g_logger, &receiver));
     
     /* Send multiple packets */
     #define NUM_PACKETS 100
@@ -133,7 +135,8 @@ void test_udp_timeout(void) {
     TEST_START();
     
     udp_socket_t* udp;
-    ASSERT_OK(udp_socket_create("127.0.0.1", TEST_PORT + 3, g_metrics, g_logger, &udp));
+    /* NULL rate_cfg = no rate limiting */
+    ASSERT_OK(udp_socket_create("127.0.0.1", TEST_PORT + 3, NULL, g_metrics, g_logger, &udp));
     
     /* Try to receive with timeout (should timeout) */
     char buffer[256];

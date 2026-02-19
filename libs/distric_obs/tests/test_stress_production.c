@@ -224,10 +224,17 @@ static void test_p1d_concurrent_enforcement(void) {
     int expected = P1D_THREADS * P1D_UPDATES;
     assert(total_valid   == expected && "All valid updates must be counted");
     assert(total_invalid == expected && "All invalid updates must be rejected");
-    assert(metrics_counter_get(c) == (uint64_t)expected &&
-           "Counter must equal valid update count");
-    printf("  valid=%d invalid_rejected=%d counter=%lu  OK\n",
-           total_valid, total_invalid, (unsigned long)metrics_counter_get(c));
+    /*
+     * metrics_counter_get reads the UNLABELLED base slot, which is never
+     * touched by metrics_counter_inc_with_labels.  After the slot-isolation
+     * fix (labeled slots 0..card-1, unlabelled base at slot card), this
+     * correctly returns 0.  The valid/invalid assertions above are the
+     * authoritative checks for labeled-counter correctness.
+     */
+    assert(metrics_counter_get(c) == 0 &&
+           "Unlabelled base must be untouched by labeled updates");
+    printf("  valid=%d invalid_rejected=%d unlabelled_base=0  OK\n",
+           total_valid, total_invalid);
 
     metrics_destroy(reg);
     printf("  PASSED\n\n");

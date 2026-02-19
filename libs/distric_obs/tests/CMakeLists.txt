@@ -34,6 +34,7 @@ obs_test(test_failure_modes  test_failure_modes.c)
 set_tests_properties(test_stress            PROPERTIES TIMEOUT 120)
 set_tests_properties(test_stress_production PROPERTIES TIMEOUT 120)
 set_tests_properties(test_failure_modes     PROPERTIES TIMEOUT 90)
+set_tests_properties(test_production_hardening PROPERTIES TIMEOUT 120)
 
 # ─── Benchmarks (not added to ctest — run manually) ───────────────────────────
 add_executable(bench_metrics bench_metrics.c)

@@ -240,17 +240,23 @@ static distric_err_t ring_write(logger_t* logger,
      */
     tail_snap = atomic_load_explicit(&rb->tail, memory_order_acquire);
     if (idx - tail_snap >= rb->capacity) {
-        /*
-         * We over-claimed.  The slot is "lost" until the consumer wraps to it.
-         * This is safe: the consumer will observe SLOT_EMPTY and skip it,
-         * but will re-observe it on the next wraparound.  We just drop here.
-         *
-         * To avoid indefinite slot loss, we set state = SLOT_EMPTY explicitly
-         * so the consumer can see it immediately (it may already be EMPTY, but
-         * an explicit store is a safe no-op in that case).
-         */
+/*
+      * We over-claimed.  Mark the slot SLOT_DROPPED so the consumer
+      * can identify it and advance tail without spinning indefinitely.
+      *
+      * WHY NOT SLOT_EMPTY: setting SLOT_EMPTY could corrupt a legitimately
+      * FILLED slot at the same modular index that the consumer hasn't drained
+      * yet, causing silent data loss.  SLOT_DROPPED is a distinct sentinel
+      * that tells the consumer "nothing useful here, skip it".
+      *
+      * WHY NOT "no store at all": if we skip the store entirely, the consumer
+      * eventually reaches tail == idx, sees head > tail, and enters the slot
+      * spin.  It finds the slot in SLOT_EMPTY (its cleared state from the
+      * previous cycle) and waits forever since no producer will set SLOT_FILLED.
+      * SLOT_DROPPED prevents that spin.
+      */
         log_slot_t* lost = &rb->slots[idx & rb->mask];
-        atomic_store_explicit(&lost->state, SLOT_EMPTY, memory_order_release);
+        atomic_store_explicit(&lost->state, SLOT_DROPPED, memory_order_release);
         atomic_fetch_add_explicit(&logger->total_drops, 1, memory_order_relaxed);
         return DISTRIC_ERR_BUFFER_OVERFLOW;
     }
@@ -356,7 +362,20 @@ static void* flush_thread_fn(void* arg) {
             /* acquire: synchronises with producer's FILLED release-store */
             uint32_t s = atomic_load_explicit(&slot->state, memory_order_acquire);
             if (s == SLOT_FILLED) { slot_ready = true; break; }
-            if (shutting_down && spin > 1024) break;
+            if (s == SLOT_DROPPED) { break; /* producer over-claim; skip */ }
+            /*
+             * BUG FIX: Re-read shutdown on every iteration.
+             *
+             * The outer-loop's `shutting_down` is stale inside this inner loop.
+             * If log_destroy() sets shutdown=true while we are already spinning
+             * here, the stale `false` value means we never break — causing
+             * pthread_join in log_destroy() to block forever.
+             *
+             * Re-reading atomically ensures we observe the shutdown store as
+             * soon as it is visible (acquire pairs with destroy's release).
+             */
+            bool sd = atomic_load_explicit(&logger->shutdown, memory_order_acquire);
+            if (sd && spin > 1024) break;
             if (++spin > LOG_CONSUMER_MAX_SPIN) sched_yield();
         }
 
@@ -672,25 +691,25 @@ uint64_t log_get_oversized_drops(const logger_t* logger) {
 distric_err_t log_register_metrics(logger_t* logger,
                                              metrics_registry_t* registry) {
     if (!logger || !registry) return DISTRIC_ERR_INVALID_ARG;
-    if (logger->metrics_registered) return DISTRIC_OK;
+    if (logger->metrics_registered) return DISTRIC_ERR_ALREADY_EXISTS;
 
     metrics_register_gauge(registry,
-        "distric_internal_logger_drops_total",
+        "distric_internal_log_drops_total",
         "Cumulative log entries dropped (ring full or slot-claim timeout)",
         NULL, 0, &logger->metrics_handles.drops_total);
 
     metrics_register_gauge(registry,
-        "distric_internal_logger_oversized_drops_total",
+        "distric_internal_log_oversized_drops_total",
         "Log entries dropped because formatted size exceeded max_entry_bytes",
         NULL, 0, &logger->metrics_handles.oversized_drops);
 
     metrics_register_gauge(registry,
-        "distric_internal_logger_ring_fill_pct",
+        "distric_internal_log_ring_fill_pct",
         "Async log ring buffer fill percentage (0-100)",
         NULL, 0, &logger->metrics_handles.ring_fill_pct);
 
     metrics_register_gauge(registry,
-        "distric_internal_logger_exporter_alive",
+        "distric_internal_log_exporter_alive",
         "1 if the async log flush thread is alive and making progress, 0 otherwise",
         NULL, 0, &logger->metrics_handles.exporter_alive);
 

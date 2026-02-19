@@ -374,7 +374,7 @@ static distric_err_t tracer_alloc_and_init(tracer_t** out,
 distric_err_t trace_init(tracer_t** tracer,
                           void (*export_cb)(trace_span_t*, size_t, void*),
                           void* user_data) {
-    if (!tracer || !export_cb) return DISTRIC_ERR_INVALID_ARG;
+    if (!tracer) return DISTRIC_ERR_INVALID_ARG;
     tracer_config_t cfg = {
         .sampling = {
             .always_sample       = 1, .always_drop         = 0,
