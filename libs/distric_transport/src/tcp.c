@@ -1279,7 +1279,7 @@ int tcp_send(tcp_connection_t* conn, const void* data, size_t len) {
             return DISTRIC_ERR_BACKPRESSURE;
         }
         pthread_mutex_unlock(&conn->send_lock);
-        return DISTRIC_OK;
+        return (int)len;
     }
 
     /* Queue empty — try direct send. */
@@ -1319,7 +1319,7 @@ int tcp_send(tcp_connection_t* conn, const void* data, size_t len) {
     }
 
     pthread_mutex_unlock(&conn->send_lock);
-    return DISTRIC_OK;
+    return (int)len;
 }
 
 int tcp_flush(tcp_connection_t* conn) {

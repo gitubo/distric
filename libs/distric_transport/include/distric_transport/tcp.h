@@ -398,7 +398,7 @@ distric_err_t tcp_connect(
  * @param conn  Connection handle.
  * @param data  Data to send.
  * @param len   Number of bytes to send.
- * @return DISTRIC_OK              Data sent or queued.
+ * @return > 0                  Number of bytes sent or queued.
  * @return DISTRIC_ERR_BACKPRESSURE Queue HWM exceeded; stop sending.
  * @return DISTRIC_ERR_IO          Socket error (connection broken).
  */
