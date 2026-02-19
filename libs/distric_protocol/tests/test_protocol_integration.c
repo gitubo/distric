@@ -263,8 +263,27 @@ void test_protocol_version_check() {
     ASSERT_TRUE(validate_message_header(&header));
     
     /* Incompatible version */
+    /*
+     * Version field layout (Item 7 — major/minor version negotiation):
+     *
+     *   version = (major << 8) | minor
+     *
+     * PROTOCOL_VERSION = 0x0001 → major = 0x00, minor = 0x01
+     *
+     * A minor-version difference (same high byte) MUST be tolerated —
+     * validate_message_header() only rejects on major-byte mismatch.
+     * A major-version mismatch (different high byte) MUST be rejected.
+     */
+
+    /* Minor bump only (0x0001 → 0x0002): same major byte 0x00 — must be ACCEPTED */
     header.version = 0x0002;
+    ASSERT_TRUE(validate_message_header(&header));
+    header.version = PROTOCOL_VERSION; /* restore */
+
+    /* Major version mismatch (0x0001 → 0x0100): major byte 0x01 ≠ 0x00 — must be REJECTED */
+    header.version = 0x0100;
     ASSERT_TRUE(!validate_message_header(&header));
+    header.version = PROTOCOL_VERSION; /* restore */
     
     printf("  Version validation works\n");
     

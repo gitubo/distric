@@ -24,3 +24,7 @@ add_test(NAME test_protocol_rpc COMMAND test_protocol_rpc)
 add_executable(test_protocol_integration test_protocol_integration.c)
 target_link_libraries(test_protocol_integration distric_protocol distric_transport distric_obs Threads::Threads)
 add_test(NAME test_protocol_integration COMMAND test_protocol_integration)
+
+add_executable(test_protocol_production test_protocol_production.c)
+target_link_libraries(test_protocol_production distric_protocol distric_transport distric_obs Threads::Threads)
+add_test(NAME test_protocol_production COMMAND test_protocol_production)

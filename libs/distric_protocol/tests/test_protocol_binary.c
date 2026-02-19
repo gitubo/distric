@@ -171,9 +171,15 @@ void test_header_validation() {
     ASSERT_TRUE(!validate_message_header(&header));
     header.msg_type = MSG_CLIENT_QUERY;
     
-    /* Payload too large */
-    header.payload_len = 20 * 1024 * 1024;  /* 20MB */
+    /* Payload too large — use PROTOCOL_MAX_PAYLOAD_SIZE+1 so the test
+     * always tracks the actual configured ceiling regardless of its value. */
+    header.payload_len = PROTOCOL_MAX_PAYLOAD_SIZE + 1;
     ASSERT_TRUE(!validate_message_header(&header));
+    header.payload_len = 100;
+
+    /* Payload exactly at the limit — must be accepted */
+    header.payload_len = PROTOCOL_MAX_PAYLOAD_SIZE;
+    ASSERT_TRUE(validate_message_header(&header));
     header.payload_len = 100;
     
     /* Reserved field non-zero */
