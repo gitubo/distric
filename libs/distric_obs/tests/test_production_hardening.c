@@ -68,7 +68,7 @@ static void test_log_oversized_entry_detection(void) {
     int fd = open("/dev/null", O_WRONLY);
     assert(fd >= 0);
 
-    log_config_t cfg = {
+    logging_config_t cfg = {
         .fd              = fd,
         .mode            = LOG_MODE_ASYNC,
         .max_entry_bytes = 128,  /* very small to trigger oversized path */
@@ -151,7 +151,7 @@ static void test_ring_buffer_wraparound(void) {
      * Small ring forces many wraparounds.
      * 64-slot ring with 4 threads × 50K = 200K total attempts.
      */
-    log_config_t cfg = {
+    logging_config_t cfg = {
         .fd                   = fd,
         .mode                 = LOG_MODE_ASYNC,
         .ring_buffer_capacity = 64,
@@ -317,7 +317,7 @@ static void test_log_nonblocking_under_full_ring(void) {
     assert(fd >= 0);
 
     /* Tiny ring = 16 slots; consumer thread still draining */
-    log_config_t cfg = {
+    logging_config_t cfg = {
         .fd                   = fd,
         .mode                 = LOG_MODE_ASYNC,
         .ring_buffer_capacity = 16,
@@ -393,12 +393,13 @@ static void test_sampling_stability_hysteresis(void) {
         sleep_ms(5);
     }
 
-    trace_stats_t stats1 = trace_get_stats(tracer);
+    tracer_stats_t stats1;
+    trace_get_stats(tracer, &stats1);
     printf("  Phase 1 stats: created=%llu in=%llu out=%llu dropped=%llu\n",
            (unsigned long long)stats1.spans_created,
            (unsigned long long)stats1.spans_sampled_in,
            (unsigned long long)stats1.spans_sampled_out,
-           (unsigned long long)stats1.spans_dropped);
+           (unsigned long long)stats1.spans_dropped_backpressure);
 
     /*
      * Phase 2: Burst load — overwhelm the buffer to trigger backpressure.
@@ -411,15 +412,16 @@ static void test_sampling_stability_hysteresis(void) {
         trace_finish_span(tracer, span);
     }
 
-    trace_stats_t stats2 = trace_get_stats(tracer);
+    tracer_stats_t stats2;
+    trace_get_stats(tracer, &stats2);
     printf("  Phase 2 stats: created=%llu in=%llu out=%llu dropped=%llu\n",
            (unsigned long long)stats2.spans_created,
            (unsigned long long)stats2.spans_sampled_in,
            (unsigned long long)stats2.spans_sampled_out,
-           (unsigned long long)stats2.spans_dropped);
+           (unsigned long long)stats2.spans_dropped_backpressure);
 
     /* Under burst: sampled_out + dropped > 0 (adaptive sampling activated) */
-    uint64_t load_reduced = stats2.spans_sampled_out + stats2.spans_dropped;
+    uint64_t load_reduced = stats2.spans_sampled_out + stats2.spans_dropped_backpressure;
     assert(load_reduced > 0 &&
            "Expected load reduction under burst — adaptive sampling not triggered");
 
@@ -457,12 +459,12 @@ static void test_self_monitoring_metrics(void) {
     /* Logger internal metrics */
     logger_t* logger;
     assert(log_init(&logger, fd, LOG_MODE_ASYNC) == DISTRIC_OK);
-    assert(log_register_internal_metrics(logger, reg) == DISTRIC_OK);
+    assert(log_register_metrics(logger, reg) == DISTRIC_OK);
 
     /* Tracer internal metrics */
     tracer_t* tracer;
     assert(trace_init(&tracer, NULL, NULL) == DISTRIC_OK);
-    assert(trace_register_internal_metrics(tracer, reg) == DISTRIC_OK);
+    assert(trace_register_metrics(tracer, reg) == DISTRIC_OK);
 
     /* HTTP server internal metrics */
     health_registry_t* health;
@@ -473,7 +475,7 @@ static void test_self_monitoring_metrics(void) {
     assert(obs_server_register_internal_metrics(server, reg) == DISTRIC_OK);
 
     /* Write some log drops to populate drop counter */
-    log_config_t tiny_cfg = {
+    logging_config_t tiny_cfg = {
         .fd                   = fd,
         .mode                 = LOG_MODE_ASYNC,
         .ring_buffer_capacity = 4,

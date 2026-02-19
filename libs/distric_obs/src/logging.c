@@ -34,7 +34,7 @@
  *   - Partial JSON is never written to the ring.
  *
  * #9 Self-Monitoring Completeness
- *   - log_register_internal_metrics() registers distric_internal_logger_* gauges.
+ *   - log_register_metrics() registers distric_internal_logger_* gauges.
  *   - Flush thread updates gauges after each drain cycle.
  *
  * Two APIs:
@@ -669,7 +669,7 @@ uint64_t log_get_oversized_drops(const logger_t* logger) {
  * both the logger and the metrics registry are initialised.  Not thread-safe
  * relative to other registration calls — call during startup only.
  * ========================================================================= */
-distric_err_t log_register_internal_metrics(logger_t* logger,
+distric_err_t log_register_metrics(logger_t* logger,
                                              metrics_registry_t* registry) {
     if (!logger || !registry) return DISTRIC_ERR_INVALID_ARG;
     if (logger->metrics_registered) return DISTRIC_OK;

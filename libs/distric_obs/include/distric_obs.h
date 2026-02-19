@@ -393,6 +393,12 @@ distric_err_t log_register_metrics(logger_t* logger, metrics_registry_t* registr
 #define LOG_ERROR(l,c,m,...) log_write((l),LOG_LEVEL_ERROR,(c),(m),__VA_ARGS__)
 #define LOG_FATAL(l,c,m,...) log_write((l),LOG_LEVEL_FATAL,(c),(m),__VA_ARGS__)
 
+/** Returns the count of entries dropped because they exceeded max_entry_bytes. */
+uint64_t log_get_oversized_drops(const logger_t* logger);
+
+/** Returns true if the async flush thread is alive and making progress. */
+bool log_is_exporter_healthy(const logger_t* logger);
+
 /* ============================================================================
  * DISTRIBUTED TRACING
  *
@@ -519,6 +525,8 @@ void trace_get_stats(tracer_t* tracer, tracer_stats_t* out);
  *   distric_internal_tracer_in_backpressure   (gauge)
  */
 distric_err_t trace_register_metrics(tracer_t* tracer, metrics_registry_t* registry);
+/** Returns true if the tracer exporter thread is alive and making progress. */
+bool trace_is_exporter_healthy(const tracer_t* tracer);
 
 distric_err_t trace_start_span(tracer_t* tracer, const char* operation, trace_span_t** out_span);
 distric_err_t trace_start_child_span(tracer_t* tracer, trace_span_t* parent, const char* operation, trace_span_t** out_span);
@@ -637,6 +645,10 @@ distric_err_t obs_server_init_with_config(
 void     obs_server_destroy(obs_server_t* server);
 uint16_t obs_server_get_port(obs_server_t* server);
 
+/** Register internal HTTP server Prometheus metrics with a registry. */
+distric_err_t obs_server_register_internal_metrics(obs_server_t* server,
+                                                    metrics_registry_t* registry);
+                                                    
 #ifdef __cplusplus
 }
 #endif
