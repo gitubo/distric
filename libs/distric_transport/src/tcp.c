@@ -27,6 +27,12 @@
  * 5. EPOLL-BASED SERVER ACCEPT LOOP
  *    Uses epoll_wait with 100ms timeout for clean shutdown. Each accepted
  *    connection is dispatched to a detached thread via the user callback.
+ *
+ * FIX (backpressure): When tcp_connection_config_t.send_queue_capacity is set,
+ *    SO_SNDBUF is capped to that value before connect(). This disables Linux
+ *    TCP autotuning for the socket so the kernel send buffer stays small and
+ *    send() returns EAGAIN promptly, activating the user-space HWM-based
+ *    backpressure rather than silently absorbing megabytes of data.
  */
 
 #define _DEFAULT_SOURCE
@@ -132,6 +138,26 @@ static int set_reuseaddr(int fd) {
 static int set_tcp_nodelay(int fd) {
     int opt = 1;
     return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+}
+
+/**
+ * @brief Cap the kernel socket send buffer to @p size bytes.
+ *
+ * When a custom send_queue_capacity is configured, this prevents Linux TCP
+ * autotuning from inflating SO_SNDBUF to several MB, which would mask the
+ * user-space HWM-based backpressure.  The kernel may round the value up to
+ * wmem_min (~4 KB) and doubles it internally, but the result is still far
+ * smaller than the autotuned default, so send() returns EAGAIN promptly and
+ * the user-space send queue is exercised as intended.
+ *
+ * Setting SO_SNDBUF explicitly also disables per-socket autotuning on Linux.
+ *
+ * Non-fatal: if the syscall fails (e.g. permission), backpressure will simply
+ * trigger later than configured.
+ */
+static void set_sndbuf(int fd, size_t size) {
+    int opt = (int)size;
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &opt, sizeof(opt));
 }
 
 /* ============================================================================
@@ -270,7 +296,31 @@ distric_err_t tcp_connect(
     set_nonblocking(fd);
     set_tcp_nodelay(fd);
 
+    /*
+     * FIX: backpressure correctness with autotuned kernels.
+     *
+     * When the caller requests a custom (small) send-queue capacity, cap the
+     * kernel send buffer to the same value before connecting.  Without this,
+     * Linux TCP autotuning can allocate several MB of kernel send buffer,
+     * meaning send() never returns EAGAIN even when sending megabytes of data
+     * to a non-reading peer.  As a result, data never enters the user-space
+     * send_queue_t, the HWM is never exceeded, and DISTRIC_ERR_BACKPRESSURE
+     * is never returned — breaking the entire backpressure contract.
+     *
+     * The kernel enforces a minimum (net.ipv4.tcp_wmem[0], typically 4 KB)
+     * and doubles SO_SNDBUF internally, so the effective buffer is ~8 KB even
+     * for the smallest requested capacity.  That is still small enough that a
+     * flood loop exhausts it quickly and EAGAIN fires promptly.
+     *
+     * Setting SO_SNDBUF explicitly also disables per-socket autotuning on
+     * Linux (see tcp(7): "Setting this option disables automatic tuning").
+     */
+    if (config && config->send_queue_capacity > 0) {
+        set_sndbuf(fd, config->send_queue_capacity);
+    }
+
     int cr = connect(fd, result->ai_addr, result->ai_addrlen);
+
     /* Save addr before freeing */
     struct sockaddr_in saved_addr;
     memcpy(&saved_addr, result->ai_addr,
@@ -354,218 +404,6 @@ distric_err_t tcp_connect(
 }
 
 /* ============================================================================
- * tcp_send
- * ========================================================================= */
-
-int tcp_send(tcp_connection_t* conn, const void* data, size_t len) {
-    if (!conn || !data || len == 0) return DISTRIC_ERR_INVALID_ARG;
-
-    pthread_mutex_lock(&conn->send_lock);
-
-    /* 1. Flush any previously-queued data first */
-    if (!send_queue_empty(&conn->send_queue)) {
-        int fl = flush_send_queue_locked(conn);
-        if (fl < 0) {
-            transport_err_t terr = transport_classify_errno(errno);
-            if (conn->send_errors_metric) metrics_counter_inc(conn->send_errors_metric);
-            if (conn->logger) {
-                LOG_ERROR(conn->logger, "tcp", "Send queue flush failed",
-                         "error", transport_err_str(terr), NULL);
-            }
-            pthread_mutex_unlock(&conn->send_lock);
-            return DISTRIC_ERR_IO;
-        }
-    }
-
-    size_t total_accepted = 0;
-
-    /* 2. If queue still has data, we can't send directly — append to queue */
-    if (!send_queue_empty(&conn->send_queue)) {
-        goto queue_data;
-    }
-
-    /* 3. Try direct send */
-    {
-        const uint8_t* ptr     = (const uint8_t*)data;
-        size_t         remaining = len;
-
-        while (remaining > 0) {
-            ssize_t sent = send(conn->fd, ptr, remaining, MSG_NOSIGNAL);
-            if (sent > 0) {
-                ptr           += sent;
-                remaining     -= (size_t)sent;
-                total_accepted += (size_t)sent;
-            } else if (sent < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* Buffer the rest */
-                    data = ptr;
-                    len  = remaining;
-                    goto queue_data;
-                }
-                /* Hard error */
-                transport_err_t terr = transport_classify_errno(errno);
-                if (conn->send_errors_metric) metrics_counter_inc(conn->send_errors_metric);
-                if (conn->logger) {
-                    LOG_ERROR(conn->logger, "tcp", "Send failed",
-                             "error", transport_err_str(terr), NULL);
-                }
-                pthread_mutex_unlock(&conn->send_lock);
-                return DISTRIC_ERR_IO;
-            } else {
-                /* sent == 0: unexpected on stream socket; treat as error */
-                pthread_mutex_unlock(&conn->send_lock);
-                return DISTRIC_ERR_IO;
-            }
-        }
-
-        /* All data sent directly */
-        if (conn->bytes_sent_metric) {
-            metrics_counter_add(conn->bytes_sent_metric, total_accepted);
-        }
-        pthread_mutex_unlock(&conn->send_lock);
-        return (int)total_accepted;
-    }
-
-queue_data:
-    /* 4. Append to send queue */
-    if (send_queue_push(&conn->send_queue, data, len) != 0) {
-        /* Queue full — signal backpressure */
-        if (conn->backpressure_metric) metrics_counter_inc(conn->backpressure_metric);
-        if (conn->send_errors_metric)  metrics_counter_inc(conn->send_errors_metric);
-        pthread_mutex_unlock(&conn->send_lock);
-        return DISTRIC_ERR_BACKPRESSURE;
-    }
-
-    total_accepted += len;
-
-    /* 5. Update metrics for accepted bytes (queued counts as accepted) */
-    if (conn->bytes_sent_metric) {
-        metrics_counter_add(conn->bytes_sent_metric, total_accepted);
-    }
-
-    /* 6. Check HWM after push */
-    if (send_queue_above_hwm(&conn->send_queue)) {
-        if (conn->backpressure_metric) metrics_counter_inc(conn->backpressure_metric);
-        pthread_mutex_unlock(&conn->send_lock);
-        return DISTRIC_ERR_BACKPRESSURE;
-    }
-
-    pthread_mutex_unlock(&conn->send_lock);
-    return (int)total_accepted;
-}
-
-/* ============================================================================
- * tcp_flush
- * ========================================================================= */
-
-distric_err_t tcp_flush(tcp_connection_t* conn) {
-    if (!conn) return DISTRIC_ERR_INVALID_ARG;
-
-    pthread_mutex_lock(&conn->send_lock);
-
-    int fl = flush_send_queue_locked(conn);
-    if (fl < 0) {
-        if (conn->send_errors_metric) metrics_counter_inc(conn->send_errors_metric);
-        pthread_mutex_unlock(&conn->send_lock);
-        return DISTRIC_ERR_IO;
-    }
-
-    bool above = send_queue_above_hwm(&conn->send_queue);
-    pthread_mutex_unlock(&conn->send_lock);
-
-    return above ? DISTRIC_ERR_BACKPRESSURE : DISTRIC_OK;
-}
-
-/* ============================================================================
- * tcp_is_writable / tcp_send_queue_depth
- * ========================================================================= */
-
-bool tcp_is_writable(tcp_connection_t* conn) {
-    if (!conn) return false;
-    pthread_mutex_lock(&conn->send_lock);
-    bool writable = !send_queue_above_hwm(&conn->send_queue);
-    pthread_mutex_unlock(&conn->send_lock);
-    return writable;
-}
-
-size_t tcp_send_queue_depth(tcp_connection_t* conn) {
-    if (!conn) return 0;
-    pthread_mutex_lock(&conn->send_lock);
-    size_t depth = send_queue_pending(&conn->send_queue);
-    pthread_mutex_unlock(&conn->send_lock);
-    return depth;
-}
-
-/* ============================================================================
- * tcp_recv
- * ========================================================================= */
-
-int tcp_recv(tcp_connection_t* conn, void* buffer, size_t len, int timeout_ms) {
-    if (!conn || !buffer || len == 0) return DISTRIC_ERR_INVALID_ARG;
-
-    /* Optional wait for data using epoll */
-    if (timeout_ms >= 0) {
-        int efd = epoll_create1(0);
-        if (efd < 0) return DISTRIC_ERR_IO;
-
-        struct epoll_event ev = {
-            .events  = TCP_RECV_EPOLL_FLAGS,
-            .data.fd = conn->fd
-        };
-        epoll_ctl(efd, EPOLL_CTL_ADD, conn->fd, &ev);
-
-        struct epoll_event events[1];
-        int nev = epoll_wait(efd, events, 1, timeout_ms == 0 ? -1 : timeout_ms);
-        close(efd);
-
-        if (nev == 0) return 0;    /* Timeout */
-        if (nev < 0) {
-            if (conn->recv_errors_metric) metrics_counter_inc(conn->recv_errors_metric);
-            return DISTRIC_ERR_IO;
-        }
-
-        /* Check for HUP/ERR without data */
-        if (events[0].events & (EPOLLHUP | EPOLLERR)) {
-            if (!(events[0].events & EPOLLIN)) {
-                return DISTRIC_ERR_EOF;
-            }
-        }
-    }
-
-    ssize_t received = recv(conn->fd, buffer, len, 0);
-
-    if (received > 0) {
-        /* Hot path: lock-free metric update only */
-        if (conn->bytes_recv_metric) {
-            metrics_counter_add(conn->bytes_recv_metric, (uint64_t)received);
-        }
-        return (int)received;
-    }
-
-    if (received == 0) {
-        /* Graceful close */
-        if (conn->logger) {
-            LOG_INFO(conn->logger, "tcp", "Peer closed connection",
-                    "remote_addr", conn->remote_addr, NULL);
-        }
-        return DISTRIC_ERR_EOF;
-    }
-
-    /* received < 0 */
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return 0;  /* Non-blocking: no data available */
-    }
-
-    transport_err_t terr = transport_classify_errno(errno);
-    if (conn->recv_errors_metric) metrics_counter_inc(conn->recv_errors_metric);
-    if (conn->logger) {
-        LOG_ERROR(conn->logger, "tcp", "Recv failed",
-                 "error", transport_err_str(terr), NULL);
-    }
-    return DISTRIC_ERR_IO;
-}
-
-/* ============================================================================
  * tcp_close
  * ========================================================================= */
 
@@ -584,28 +422,6 @@ void tcp_close(tcp_connection_t* conn) {
     send_queue_destroy(&conn->send_queue);
     pthread_mutex_destroy(&conn->send_lock);
     free(conn);
-}
-
-/* ============================================================================
- * tcp_get_remote_addr / tcp_get_connection_id
- * ========================================================================= */
-
-distric_err_t tcp_get_remote_addr(
-    tcp_connection_t* conn,
-    char*             addr_out,
-    size_t            addr_len,
-    uint16_t*         port_out
-) {
-    if (!conn || !addr_out || addr_len == 0) return DISTRIC_ERR_INVALID_ARG;
-
-    strncpy(addr_out, conn->remote_addr, addr_len - 1);
-    addr_out[addr_len - 1] = '\0';
-    if (port_out) *port_out = conn->remote_port;
-    return DISTRIC_OK;
-}
-
-uint64_t tcp_get_connection_id(tcp_connection_t* conn) {
-    return conn ? conn->connection_id : 0;
 }
 
 /* ============================================================================
@@ -806,7 +622,7 @@ distric_err_t tcp_server_create(
 }
 
 /* ============================================================================
- * tcp_server_start / stop / destroy
+ * tcp_server_start
  * ========================================================================= */
 
 distric_err_t tcp_server_start(
@@ -815,13 +631,13 @@ distric_err_t tcp_server_start(
     void*                     userdata
 ) {
     if (!server || !on_connection) return DISTRIC_ERR_INVALID_ARG;
+    if (atomic_load(&server->running)) return DISTRIC_OK;
 
     server->callback = on_connection;
     server->userdata = userdata;
     atomic_store(&server->running, true);
 
-    if (pthread_create(&server->accept_thread, NULL,
-                       accept_thread_func, server) != 0) {
+    if (pthread_create(&server->accept_thread, NULL, accept_thread_func, server) != 0) {
         atomic_store(&server->running, false);
         return DISTRIC_ERR_INIT_FAILED;
     }
@@ -836,34 +652,255 @@ distric_err_t tcp_server_start(
     return DISTRIC_OK;
 }
 
+/* ============================================================================
+ * tcp_server_stop
+ * ========================================================================= */
+
 distric_err_t tcp_server_stop(tcp_server_t* server) {
     if (!server) return DISTRIC_ERR_INVALID_ARG;
     if (!atomic_load(&server->running)) return DISTRIC_OK;
 
-    if (server->logger)
+    if (server->logger) {
         LOG_INFO(server->logger, "tcp_server", "Stopping server", NULL);
+    }
 
     atomic_store(&server->running, false);
-
-    /* Wake up epoll_wait by closing the listen fd's duplicate.
-     * epoll_wait will unblock because the fd is removed. */
-    shutdown(server->listen_fd, SHUT_RDWR);
-
     pthread_join(server->accept_thread, NULL);
 
-    if (server->logger)
+    if (server->logger) {
         LOG_INFO(server->logger, "tcp_server", "Server stopped", NULL);
+    }
 
     return DISTRIC_OK;
 }
 
+/* ============================================================================
+ * tcp_server_destroy
+ * ========================================================================= */
+
 void tcp_server_destroy(tcp_server_t* server) {
     if (!server) return;
-
-    if (atomic_load(&server->running))
-        tcp_server_stop(server);
-
+    tcp_server_stop(server);
     close(server->listen_fd);
     close(server->epoll_fd);
     free(server);
+}
+
+/* ============================================================================
+ * tcp_send
+ * ========================================================================= */
+
+int tcp_send(tcp_connection_t* conn, const void* data, size_t len) {
+    if (!conn || !data || len == 0) return DISTRIC_ERR_INVALID_ARG;
+
+    pthread_mutex_lock(&conn->send_lock);
+
+    /* 1. Flush any previously-queued data first */
+    if (!send_queue_empty(&conn->send_queue)) {
+        int fl = flush_send_queue_locked(conn);
+        if (fl < 0) {
+            transport_err_t terr = transport_classify_errno(errno);
+            if (conn->send_errors_metric) metrics_counter_inc(conn->send_errors_metric);
+            if (conn->logger) {
+                LOG_ERROR(conn->logger, "tcp", "Send queue flush failed",
+                         "error", transport_err_str(terr), NULL);
+            }
+            pthread_mutex_unlock(&conn->send_lock);
+            return DISTRIC_ERR_IO;
+        }
+    }
+
+    size_t total_accepted = 0;
+
+    /* 2. If queue still has data, we can't send directly — append to queue */
+    if (!send_queue_empty(&conn->send_queue)) {
+        goto queue_data;
+    }
+
+    /* 3. Try direct send */
+    {
+        const uint8_t* ptr       = (const uint8_t*)data;
+        size_t         remaining = len;
+
+        while (remaining > 0) {
+            ssize_t sent = send(conn->fd, ptr, remaining, MSG_NOSIGNAL);
+            if (sent > 0) {
+                ptr            += sent;
+                remaining      -= (size_t)sent;
+                total_accepted += (size_t)sent;
+            } else if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    /* Buffer the rest */
+                    data = ptr;
+                    len  = remaining;
+                    goto queue_data;
+                }
+                /* Hard error */
+                transport_err_t terr = transport_classify_errno(errno);
+                if (conn->send_errors_metric) metrics_counter_inc(conn->send_errors_metric);
+                if (conn->logger) {
+                    LOG_ERROR(conn->logger, "tcp", "Send failed",
+                             "error", transport_err_str(terr), NULL);
+                }
+                pthread_mutex_unlock(&conn->send_lock);
+                return DISTRIC_ERR_IO;
+            } else {
+                /* sent == 0: unexpected on stream socket; treat as error */
+                pthread_mutex_unlock(&conn->send_lock);
+                return DISTRIC_ERR_IO;
+            }
+        }
+
+        /* All data sent directly */
+        if (conn->bytes_sent_metric) {
+            metrics_counter_add(conn->bytes_sent_metric, total_accepted);
+        }
+        pthread_mutex_unlock(&conn->send_lock);
+        return (int)total_accepted;
+    }
+
+queue_data:
+    /* 4. Append to send queue */
+    if (send_queue_push(&conn->send_queue, data, len) != 0) {
+        /* Queue full — signal backpressure */
+        if (conn->backpressure_metric) metrics_counter_inc(conn->backpressure_metric);
+        if (conn->send_errors_metric)  metrics_counter_inc(conn->send_errors_metric);
+        pthread_mutex_unlock(&conn->send_lock);
+        return DISTRIC_ERR_BACKPRESSURE;
+    }
+
+    total_accepted += len;
+
+    /* 5. Update metrics for accepted bytes (queued counts as accepted) */
+    if (conn->bytes_sent_metric) {
+        metrics_counter_add(conn->bytes_sent_metric, total_accepted);
+    }
+
+    /* 6. Check HWM after push */
+    if (send_queue_above_hwm(&conn->send_queue)) {
+        if (conn->backpressure_metric) metrics_counter_inc(conn->backpressure_metric);
+        pthread_mutex_unlock(&conn->send_lock);
+        return DISTRIC_ERR_BACKPRESSURE;
+    }
+
+    pthread_mutex_unlock(&conn->send_lock);
+    return (int)total_accepted;
+}
+
+/* ============================================================================
+ * tcp_flush
+ * ========================================================================= */
+
+distric_err_t tcp_flush(tcp_connection_t* conn) {
+    if (!conn) return DISTRIC_ERR_INVALID_ARG;
+
+    pthread_mutex_lock(&conn->send_lock);
+
+    int fl = flush_send_queue_locked(conn);
+    if (fl < 0) {
+        if (conn->send_errors_metric) metrics_counter_inc(conn->send_errors_metric);
+        pthread_mutex_unlock(&conn->send_lock);
+        return DISTRIC_ERR_IO;
+    }
+
+    bool above = send_queue_above_hwm(&conn->send_queue);
+    pthread_mutex_unlock(&conn->send_lock);
+
+    return above ? DISTRIC_ERR_BACKPRESSURE : DISTRIC_OK;
+}
+
+/* ============================================================================
+ * tcp_is_writable / tcp_send_queue_depth
+ * ========================================================================= */
+
+bool tcp_is_writable(tcp_connection_t* conn) {
+    if (!conn) return false;
+    pthread_mutex_lock(&conn->send_lock);
+    bool writable = !send_queue_above_hwm(&conn->send_queue);
+    pthread_mutex_unlock(&conn->send_lock);
+    return writable;
+}
+
+size_t tcp_send_queue_depth(tcp_connection_t* conn) {
+    if (!conn) return 0;
+    pthread_mutex_lock(&conn->send_lock);
+    size_t depth = send_queue_pending(&conn->send_queue);
+    pthread_mutex_unlock(&conn->send_lock);
+    return depth;
+}
+
+/* ============================================================================
+ * tcp_get_remote_addr / tcp_get_connection_id
+ * ========================================================================= */
+
+distric_err_t tcp_get_remote_addr(
+    tcp_connection_t* conn,
+    char*             addr_out,
+    size_t            addr_len,
+    uint16_t*         port_out
+) {
+    if (!conn || !addr_out || addr_len == 0) return DISTRIC_ERR_INVALID_ARG;
+
+    strncpy(addr_out, conn->remote_addr, addr_len - 1);
+    addr_out[addr_len - 1] = '\0';
+    if (port_out) *port_out = conn->remote_port;
+    return DISTRIC_OK;
+}
+
+uint64_t tcp_get_connection_id(tcp_connection_t* conn) {
+    return conn ? conn->connection_id : 0;
+}
+
+/* ============================================================================
+ * tcp_recv
+ * ========================================================================= */
+
+int tcp_recv(tcp_connection_t* conn, void* buffer, size_t len, int timeout_ms) {
+    if (!conn || !buffer || len == 0) return DISTRIC_ERR_INVALID_ARG;
+
+    /* Optional wait for data using epoll */
+    if (timeout_ms >= 0) {
+        int efd = epoll_create1(0);
+        if (efd < 0) return DISTRIC_ERR_IO;
+
+        struct epoll_event ev = {
+            .events  = TCP_RECV_EPOLL_FLAGS,
+            .data.fd = conn->fd
+        };
+        epoll_ctl(efd, EPOLL_CTL_ADD, conn->fd, &ev);
+
+        struct epoll_event events[1];
+        int nev = epoll_wait(efd, events, 1, timeout_ms == 0 ? -1 : timeout_ms);
+        close(efd);
+
+        if (nev == 0) return 0;    /* Timeout */
+        if (nev < 0) {
+            if (conn->recv_errors_metric) metrics_counter_inc(conn->recv_errors_metric);
+            return DISTRIC_ERR_IO;
+        }
+
+        /* Check for HUP/ERR without data */
+        if (events[0].events & (EPOLLHUP | EPOLLERR)) {
+            if (!(events[0].events & EPOLLIN)) {
+                return DISTRIC_ERR_EOF;
+            }
+        }
+    }
+    /* timeout_ms == -1: fall through to non-blocking recv immediately */
+
+    ssize_t n = recv(conn->fd, buffer, len, MSG_DONTWAIT);
+    if (n > 0) {        if (conn->bytes_recv_metric) {
+            metrics_counter_add(conn->bytes_recv_metric, (uint64_t)n);
+        }
+        return (int)n;
+    }
+    if (n == 0) {
+        return DISTRIC_ERR_EOF;
+    }
+    /* n < 0 */
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return 0;   /* No data available */
+    }
+    if (conn->recv_errors_metric) metrics_counter_inc(conn->recv_errors_metric);
+    return DISTRIC_ERR_IO;
 }
