@@ -164,8 +164,12 @@ static void test_p1c_reject_invalid_label_updates(void) {
     printf("  Excess label count correctly rejected\n");
 
     /* Counter must reflect only the one valid update */
-    assert(metrics_counter_get(c) == 1 && "only valid update must be counted");
-    printf("  Counter value == 1 (only valid update counted)\n");
+    assert(metrics_counter_get_labeled_total(c) == 1 &&
+           "only valid update must be counted (labeled total)");
+    assert(metrics_counter_get(c) == 0 &&
+           "unlabelled base must be untouched by labeled writes");
+    printf("  Labeled total == 1, unlabelled base == 0 (only valid update counted)\n");
+
 
     metrics_destroy(reg);
     printf("  PASSED\n\n");

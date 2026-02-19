@@ -268,11 +268,15 @@ static void test_metric_cardinality_enforcement(void) {
     assert(total_invalid == expected_invalid && "All invalid updates must be rejected");
 
     /* Verify the counter reflects exactly the valid updates. */
-    uint64_t counter_value = metrics_counter_get(valid_counter);
+    uint64_t counter_value = metrics_counter_get_labeled_total(valid_counter);
     assert(counter_value == (uint64_t)expected_valid &&
            "Counter value must equal number of valid updates");
 
-    printf("  [2e] Concurrent: %d valid, %d invalid rejected, counter=%lu\n",
+    /* Unlabelled base slot must remain 0 — no metrics_counter_inc() was called. */
+    assert(metrics_counter_get(valid_counter) == 0 &&
+           "Unlabelled base slot must be untouched by labeled updates");
+
+    printf("  [2e] Concurrent: %d valid, %d invalid rejected, labeled_total=%lu, unlabelled_base=0\n",
            total_valid, total_invalid, counter_value);
 
     metrics_destroy(registry);

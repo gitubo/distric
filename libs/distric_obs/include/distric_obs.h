@@ -277,6 +277,7 @@ distric_err_t metrics_histogram_observe_labels(metric_t* metric, const metric_la
 /* --- Read-back (approximate; for testing / debugging) --- */
 
 uint64_t metrics_counter_get(metric_t* metric);
+uint64_t metrics_counter_get_labeled_total(metric_t* metric);
 double   metrics_gauge_get(metric_t* metric);
 uint64_t metrics_histogram_get_count(metric_t* metric);
 double   metrics_histogram_get_sum(metric_t* metric);
@@ -648,7 +649,7 @@ uint16_t obs_server_get_port(obs_server_t* server);
 /** Register internal HTTP server Prometheus metrics with a registry. */
 distric_err_t obs_server_register_internal_metrics(obs_server_t* server,
                                                     metrics_registry_t* registry);
-                                                    
+
 #ifdef __cplusplus
 }
 #endif

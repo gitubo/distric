@@ -530,6 +530,22 @@ uint64_t metrics_counter_get(metric_t* metric) {
                                 memory_order_relaxed);
 }
 
+uint64_t metrics_counter_get_labeled_total(metric_t* metric) {
+    if (!metric || !metric->instance_array.counter) return 0;
+    if (metric->num_label_defs == 0 || metric->cardinality == 0) {
+        /* Unlabelled metric — single slot at index 0. */
+        return atomic_load_explicit(&metric->instance_array.counter[0].value,
+                                    memory_order_relaxed);
+    }
+    /* Sum all labeled slots [0..cardinality-1]. */
+    uint64_t total = 0;
+    for (size_t i = 0; i < metric->cardinality; i++) {
+        total += atomic_load_explicit(&metric->instance_array.counter[i].value,
+                                      memory_order_relaxed);
+    }
+    return total;
+}
+
 /* ============================================================================
  * Gauge operations — lock-free, O(D) label lookup
  * ========================================================================= */

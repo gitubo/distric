@@ -694,22 +694,22 @@ distric_err_t log_register_metrics(logger_t* logger,
     if (logger->metrics_registered) return DISTRIC_ERR_ALREADY_EXISTS;
 
     metrics_register_gauge(registry,
-        "distric_internal_log_drops_total",
+        "distric_internal_logger_drops_total",
         "Cumulative log entries dropped (ring full or slot-claim timeout)",
         NULL, 0, &logger->metrics_handles.drops_total);
 
     metrics_register_gauge(registry,
-        "distric_internal_log_oversized_drops_total",
+        "distric_internal_logger_oversized_drops_total",
         "Log entries dropped because formatted size exceeded max_entry_bytes",
         NULL, 0, &logger->metrics_handles.oversized_drops);
 
     metrics_register_gauge(registry,
-        "distric_internal_log_ring_fill_pct",
+        "distric_internal_logger_ring_fill_pct",
         "Async log ring buffer fill percentage (0-100)",
         NULL, 0, &logger->metrics_handles.ring_fill_pct);
 
     metrics_register_gauge(registry,
-        "distric_internal_log_exporter_alive",
+        "distric_internal_logger_exporter_alive",
         "1 if the async log flush thread is alive and making progress, 0 otherwise",
         NULL, 0, &logger->metrics_handles.exporter_alive);
 

@@ -467,8 +467,8 @@ void test_fm9_backpressure_metrics(void) {
     char* buf = NULL;
     size_t sz = 0;
     assert(metrics_export_prometheus(registry, &buf, &sz) == DISTRIC_OK);
-    assert(strstr(buf, "distric_internal_log_drops_total") != NULL);
-    assert(strstr(buf, "distric_internal_log_ring_fill_pct") != NULL);
+    assert(strstr(buf, "distric_internal_logger_drops_total") != NULL);
+    assert(strstr(buf, "distric_internal_logger_ring_fill_pct") != NULL);
     assert(strstr(buf, "distric_internal_tracer_queue_depth") != NULL);
     assert(strstr(buf, "distric_internal_tracer_sample_rate_pct") != NULL);
     free(buf);
