@@ -1,12 +1,12 @@
 /**
  * @file tcp.h
- * @brief DistriC TCP Transport — Non-Blocking API v4
+ * @brief DistriC TCP Transport — Non-Blocking API v5
  *
  * All sockets are strictly non-blocking (O_NONBLOCK). The library never
  * sleeps inside a send or receive call.
  *
  * ==========================================================================
- * CONCURRENCY MODEL (v4)
+ * CONCURRENCY MODEL (v4+)
  * ==========================================================================
  *
  * The server uses a BOUNDED WORKER POOL instead of unbounded detached threads.
@@ -22,7 +22,23 @@
  *   - Producer (head) and consumer (tail) indices on separate cache lines.
  *
  * ==========================================================================
- * ACCEPT BACKPRESSURE (v4)
+ * WORKER POOL SATURATION PROTECTION (v5)
+ * ==========================================================================
+ *
+ *   Worker utilisation is tracked via an atomic busy_workers counter.
+ *   The ratio busy_workers / worker_count is exported as a Prometheus gauge:
+ *     tcp_worker_busy_ratio
+ *
+ *   Each handler invocation is timed with CLOCK_MONOTONIC. If the duration
+ *   exceeds handler_warn_duration_ms (in tcp_server_config_t), a LOG_WARN
+ *   is emitted and tcp_handler_slow_total is incremented. This makes slow
+ *   handlers immediately visible without requiring external profiling.
+ *
+ *   Additionally, queue depth is exported as:
+ *     tcp_worker_queue_depth
+ *
+ * ==========================================================================
+ * ACCEPT BACKPRESSURE (v4+)
  * ==========================================================================
  *
  *   When the worker queue saturation reaches TCP_QUEUE_PAUSE_PCT% (90%),
@@ -33,7 +49,18 @@
  *   Metric exported: tcp_server_accept_rejections_total
  *
  * ==========================================================================
- * GRACEFUL SHUTDOWN (v4)
+ * GLOBAL MEMORY BUDGET (v5)
+ * ==========================================================================
+ *
+ *   New connections are rejected (DISTRIC_ERR_ALLOC_FAILURE) when the
+ *   process-wide transport send-queue allocation would exceed
+ *   transport_global_config_t.max_transport_memory_bytes. This prevents
+ *   OOM crashes under downstream slowdowns.
+ *
+ *   Metric: connections_rejected_memory_total (in transport_config module).
+ *
+ * ==========================================================================
+ * GRACEFUL SHUTDOWN (v4+)
  * ==========================================================================
  *
  *   RUNNING → (tcp_server_stop) → DRAINING → (active == 0 or timeout) → STOPPED
@@ -46,7 +73,7 @@
  *     - All worker threads are joined before tcp_server_stop() returns.
  *
  * ==========================================================================
- * I/O MODEL (v4)
+ * I/O MODEL (v4+)
  * ==========================================================================
  *
  * SEND
@@ -62,7 +89,7 @@
  *   The helper tcp_is_readable() uses the cached per-connection epoll fd.
  *
  * ==========================================================================
- * OBSERVABILITY LIFECYCLE (v4)
+ * OBSERVABILITY LIFECYCLE (v4+)
  * ==========================================================================
  *
  *   Logger and metrics are stored as atomic pointers inside tcp_server_s.
@@ -77,7 +104,20 @@
  *   The breaker uses a reader-writer lock: CLOSED path uses rdlock (fast),
  *   OPEN/HALF_OPEN transitions use wrlock (rare).
  *
- * @version 4.0.0
+ * ==========================================================================
+ * API VERSIONING AND COMPATIBILITY (v5)
+ * ==========================================================================
+ *
+ *   Semantic versioning applies to the public API. DISTRIC_DEPRECATED marks
+ *   functions/parameters scheduled for removal in the next major release.
+ *   Deprecated items will be removed in v6.0.0. See migration notes below.
+ *
+ *   Migration notes:
+ *   - tcp_recv(timeout_ms > 0): use tcp_is_readable() + tcp_recv(-1) instead.
+ *   - tcp_server_create() without config: prefer tcp_server_create_with_config()
+ *     to take advantage of handler_warn_duration_ms and other v5 config fields.
+ *
+ * @version 5.0.0
  */
 
 #ifndef DISTRIC_TRANSPORT_TCP_H
@@ -91,6 +131,22 @@
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/* ============================================================================
+ * DEPRECATION MACRO (Item 7)
+ *
+ * Usage:
+ *   DISTRIC_DEPRECATED("use foo_v2() instead")
+ *   void old_function(void);
+ * ========================================================================= */
+
+#if defined(__GNUC__) || defined(__clang__)
+#  define DISTRIC_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#elif defined(_MSC_VER)
+#  define DISTRIC_DEPRECATED(msg) __declspec(deprecated(msg))
+#else
+#  define DISTRIC_DEPRECATED(msg) /* no-op */
 #endif
 
 /* ============================================================================
@@ -148,6 +204,27 @@ typedef struct {
      */
     size_t conn_send_queue_capacity;
     size_t conn_send_queue_hwm;
+
+    /**
+     * @brief (v5) Slow-handler warning threshold in milliseconds.
+     *
+     * If a connection callback runs longer than this value, a LOG_WARN is
+     * emitted and tcp_handler_slow_total is incremented.
+     * 0 = disabled (also falls back to transport_global_config_t.handler_warn_duration_ms).
+     *
+     * Recommended: 500–2000 ms for most services. Set to 0 to use the global
+     * default configured via transport_config_apply().
+     */
+    uint32_t handler_warn_duration_ms;
+
+    /**
+     * @brief (v5) Per-server observability sampling percentage (1–100).
+     *
+     * Overrides transport_global_config_t.observability_sample_pct for this
+     * server's accept and dispatch log calls. 0 = inherit global setting.
+     * Does not affect WARN or ERROR — those are always emitted.
+     */
+    uint32_t observability_sample_pct;
 } tcp_server_config_t;
 
 /* ============================================================================
@@ -195,6 +272,9 @@ typedef void (*tcp_connection_callback_t)(tcp_connection_t* conn, void* userdata
 
 /**
  * @brief Create a new TCP server with default configuration.
+ *
+ * @deprecated Prefer tcp_server_create_with_config() to access v5 features
+ *             (handler_warn_duration_ms, observability_sample_pct).
  */
 distric_err_t tcp_server_create(
     const char*         bind_addr,
@@ -213,7 +293,7 @@ distric_err_t tcp_server_create_with_config(
     const tcp_server_config_t* cfg,
     metrics_registry_t*        metrics,
     logger_t*                  logger,
-    tcp_server_t**             server
+    tcp_server_t**             server_out
 );
 
 /**
@@ -264,6 +344,15 @@ tcp_server_state_t tcp_server_get_state(const tcp_server_t* server);
  */
 int64_t tcp_server_active_connections(const tcp_server_t* server);
 
+/**
+ * @brief (v5) Return the current worker busy ratio as a float in [0.0, 1.0].
+ *
+ * Ratio = busy_workers / worker_count.
+ * Thread-safe, lock-free atomic read.
+ * Useful for health checks and adaptive load-shedding decisions.
+ */
+float tcp_server_worker_busy_ratio(const tcp_server_t* server);
+
 /* ============================================================================
  * TCP CLIENT API
  * ========================================================================= */
@@ -279,10 +368,11 @@ int64_t tcp_server_active_connections(const tcp_server_t* server);
  * @param logger      Logger instance (may be NULL).
  * @param conn        [out] Created connection handle.
  *
- * @return DISTRIC_OK           on success.
- * @return DISTRIC_ERR_TIMEOUT  if connection did not complete in time.
+ * @return DISTRIC_OK             on success.
+ * @return DISTRIC_ERR_TIMEOUT    if connection did not complete in time.
  * @return DISTRIC_ERR_UNAVAILABLE if circuit breaker is OPEN.
  * @return DISTRIC_ERR_INIT_FAILED on OS error.
+ * @return DISTRIC_ERR_ALLOC_FAILURE if global memory budget is exhausted.
  */
 distric_err_t tcp_connect(
     const char*                    host,
@@ -299,84 +389,125 @@ distric_err_t tcp_connect(
  * ========================================================================= */
 
 /**
- * @brief Send data over a connection.
+ * @brief Non-blocking send with automatic buffering.
  *
- * Non-blocking. Buffers into the per-connection ring-buffer send queue on
- * EAGAIN. Returns DISTRIC_ERR_BACKPRESSURE when queue >= HWM.
+ * Attempts a direct kernel send. On EAGAIN, data is appended to the
+ * per-connection send queue. Returns DISTRIC_ERR_BACKPRESSURE when the
+ * queue exceeds its high-water mark.
  *
- * @return > 0                     Bytes accepted (sent + queued).
- * @return DISTRIC_ERR_BACKPRESSURE Queue at HWM; caller must throttle.
- * @return DISTRIC_ERR_IO           Hard send error.
+ * @param conn  Connection handle.
+ * @param data  Data to send.
+ * @param len   Number of bytes to send.
+ * @return DISTRIC_OK              Data sent or queued.
+ * @return DISTRIC_ERR_BACKPRESSURE Queue HWM exceeded; stop sending.
+ * @return DISTRIC_ERR_IO          Socket error (connection broken).
  */
 int tcp_send(tcp_connection_t* conn, const void* data, size_t len);
 
 /**
- * @brief Receive data from a connection.
+ * @brief Attempt to flush the send queue to the kernel.
  *
- * Uses the cached per-connection epoll fd for readiness detection.
+ * Call after a backpressure condition clears (e.g., after the peer
+ * acknowledges data and EPOLLOUT fires). Returns DISTRIC_ERR_IO on error.
  *
- * @param conn        Connection handle.
- * @param buffer      Receive buffer.
- * @param len         Buffer size in bytes.
- * @param timeout_ms  -1 = non-blocking (preferred); 0 = infinite; >0 = wait.
+ * @param conn Connection handle.
+ * @return DISTRIC_OK or DISTRIC_ERR_IO.
+ */
+int tcp_flush(tcp_connection_t* conn);
+
+/**
+ * @brief Non-blocking receive.
  *
- * @deprecated timeout_ms >= 0 blocks inside this function and creates
- * tail-latency jitter under load. Migrate to:
- *   - timeout_ms = -1 (always non-blocking), plus
- *   - tcp_is_readable() for readiness polling from an external event loop.
+ * @param conn       Connection handle.
+ * @param buffer     Receive buffer.
+ * @param len        Buffer size.
+ * @param timeout_ms Receive timeout:
+ *                    -1 = non-blocking (returns 0 if no data).
+ *                     0 = block indefinitely.
+ *                    >0 = block up to timeout_ms ms.
  *
- * @return > 0             Bytes received.
- * @return 0               No data (timeout or WOULD_BLOCK).
- * @return DISTRIC_ERR_EOF Peer closed the connection cleanly.
- * @return DISTRIC_ERR_IO  Receive error.
+ * @note timeout_ms > 0 is DEPRECATED. Prefer timeout_ms = -1 combined with
+ *       tcp_is_readable() or an external epoll loop.
+ *
+ * @return > 0  Bytes received.
+ * @return   0  No data available (non-blocking / timeout).
+ * @return < 0  DISTRIC_ERR_IO (connection closed or error).
  */
 int tcp_recv(tcp_connection_t* conn, void* buffer, size_t len, int timeout_ms);
 
 /**
- * @brief Poll read readiness without blocking.
+ * @brief Poll connection readability without blocking.
  *
- * Returns true if the connection has data available to read immediately.
- * Uses the cached per-connection epoll fd (zero-cost, no allocation).
+ * Uses a cached per-connection epoll fd. O(1), no syscall on each call
+ * (epoll_wait with timeout 0).
  *
- * Preferred alternative to passing timeout_ms >= 0 to tcp_recv(). Callers
- * managing their own event loop should poll readiness here and call
- * tcp_recv() with timeout_ms = -1 only when this returns true.
- *
- * @param conn  Connection handle.
- * @return true if EPOLLIN is set; false otherwise (or if conn is NULL).
+ * @return true  Data available for reading.
+ * @return false No data or connection error.
  */
-bool tcp_is_readable(const tcp_connection_t* conn);
+bool tcp_is_readable(tcp_connection_t* conn);
 
 /**
- * @brief Return pending bytes in the send queue.
+ * @brief Poll whether the connection send path is unblocked.
+ *
+ * Returns true when the per-connection send queue is below its high-water
+ * mark, meaning tcp_send() will accept data without returning
+ * DISTRIC_ERR_BACKPRESSURE.
+ *
+ * Thread-safe (acquires send_lock briefly).
+ *
+ * @return true  Send queue below HWM — safe to write.
+ * @return false Send queue at or above HWM — backpressure active.
  */
-size_t tcp_send_queue_depth(const tcp_connection_t* conn);
+bool tcp_is_writable(tcp_connection_t* conn);
 
 /**
- * @brief Return true if the send queue is below the HWM (safe to send more).
+ * @brief Return the number of bytes currently buffered in the send queue.
+ *
+ * Useful for monitoring and adaptive flow control. Thread-safe.
+ *
+ * @return Bytes pending in the send queue, or 0 for NULL conn.
  */
-bool tcp_is_writable(const tcp_connection_t* conn);
+size_t tcp_send_queue_depth(tcp_connection_t* conn);
 
 /**
- * @brief Return the remote address and port.
+ * @brief Close and free a TCP connection.
+ *
+ * Releases the send queue (updating the global memory counter) and closes
+ * the file descriptor. Safe to call from any thread that owns the connection.
+ */
+void tcp_close(tcp_connection_t* conn);
+
+/**
+ * @brief Return the raw file descriptor of a connection.
+ *
+ * Intended for use in external epoll loops. Do NOT call close() on the fd
+ * directly — use tcp_close() instead.
+ */
+int tcp_connection_get_fd(const tcp_connection_t* conn);
+
+/**
+ * @brief Fill @p addr_out and @p port_out with the remote address and port.
+ *
+ * @param conn      Connection handle.
+ * @param addr_out  Buffer to receive the dotted-decimal IP string (min 64 bytes).
+ * @param addr_len  Size of @p addr_out.
+ * @param port_out  [out] Remote port number.
+ * @return DISTRIC_OK or DISTRIC_ERR_INVALID_ARG.
  */
 distric_err_t tcp_get_remote_addr(
-    tcp_connection_t* conn,
-    char* addr_out, size_t addr_len,
-    uint16_t* port_out
+    const tcp_connection_t* conn,
+    char*                   addr_out,
+    size_t                  addr_len,
+    uint16_t*               port_out
 );
 
 /**
- * @brief Return the unique monotonic connection ID.
- */
-uint64_t tcp_get_connection_id(tcp_connection_t* conn);
-
-/**
- * @brief Close and free the connection.
+ * @brief Return the unique monotonically-increasing connection identifier.
  *
- * After this call @p conn is invalid. Safe to call with NULL.
+ * Assigned at connection_alloc() time from a global atomic counter.
+ * Zero is never a valid id.
  */
-void tcp_close(tcp_connection_t* conn);
+uint64_t tcp_get_connection_id(const tcp_connection_t* conn);
 
 #ifdef __cplusplus
 }

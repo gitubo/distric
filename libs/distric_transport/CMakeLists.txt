@@ -17,6 +17,7 @@ find_package(Threads REQUIRED)
 # Source files
 set(TRANSPORT_SOURCES
     src/transport_error.c
+    src/transport_config.c
     src/send_queue.c
     src/circuit_breaker.c
     src/tcp.c

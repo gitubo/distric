@@ -35,3 +35,20 @@ add_test(NAME test_transport_shutdown COMMAND test_transport_shutdown)
 add_executable(test_transport_udp_ratelimits test_transport_udp_ratelimits.c)
 target_link_libraries(test_transport_udp_ratelimits distric_transport distric_obs Threads::Threads)
 add_test(NAME test_transport_udp_ratelimits COMMAND test_transport_udp_ratelimits)
+
+# =============================================================================
+# Chaos and Failure-Injection Tests (v3 — Item 5)
+#
+# These tests validate behaviour under degraded conditions:
+#   - slow handlers (saturation protection)
+#   - global memory budget enforcement
+#   - backpressure under slow receivers
+#   - connection storms (fd leak detection)
+#   - observability sampling correctness
+#   - environment variable configuration override
+# =============================================================================
+add_executable(test_transport_chaos test_transport_chaos.c)
+target_link_libraries(test_transport_chaos distric_transport distric_obs Threads::Threads)
+# Chaos tests are slower — give them a generous timeout.
+add_test(NAME test_transport_chaos COMMAND test_transport_chaos)
+set_tests_properties(test_transport_chaos PROPERTIES TIMEOUT 60)
