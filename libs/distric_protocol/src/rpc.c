@@ -209,7 +209,7 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
             /* Only log if server is still accepting requests */
             if (server->accepting_requests) {
                 LOG_WARN(server->logger, "rpc_server", "No handler registered",
-                        "msg_type", message_type_to_string(header.msg_type));
+                        "msg_type", message_type_to_string(header.msg_type), NULL);
             }
             if (server->errors_total) metrics_counter_inc(server->errors_total);
             free(payload);
@@ -267,7 +267,7 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
         snprintf(duration_str, sizeof(duration_str), "%llu", (unsigned long long)(duration_us / 1000));
         LOG_DEBUG(server->logger, "rpc_server", "Request handled",
                  "msg_type", message_type_to_string(header.msg_type),
-                 "duration_ms", duration_str);
+                 "duration_ms", duration_str, NULL);
         
         /* Finish trace span */
         if (span) {
@@ -397,7 +397,7 @@ void rpc_server_stop(rpc_server_t* server) {
             snprintf(count_str, sizeof(count_str), "%zu", server->active_handlers_count);
             LOG_WARN(server->logger, "rpc_server", 
                     "Timeout waiting for handlers to complete",
-                    "active_count", count_str);
+                    "active_count", count_str, NULL);
             break;
         }
     }
@@ -432,7 +432,7 @@ distric_err_t rpc_server_register_handler(
     pthread_rwlock_unlock(&server->handlers_lock);
     
     LOG_DEBUG(server->logger, "rpc_server", "Handler registered",
-             "msg_type", message_type_to_string(msg_type));
+             "msg_type", message_type_to_string(msg_type), NULL);
     
     return DISTRIC_OK;
 }
@@ -606,7 +606,7 @@ distric_err_t rpc_call(
     snprintf(duration_str, sizeof(duration_str), "%llu", (unsigned long long)(duration_us / 1000));
     LOG_DEBUG(client->logger, "rpc_client", "RPC call completed",
              "msg_type", message_type_to_string(msg_type),
-             "duration_ms", duration_str);
+             "duration_ms", duration_str, NULL);
     
     *response_out = response;
     *resp_len_out = resp_header.payload_len;

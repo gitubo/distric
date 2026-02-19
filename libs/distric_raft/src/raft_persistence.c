@@ -112,7 +112,7 @@ static distric_err_t ensure_directory(const char* path, logger_t* logger) {
         if (S_ISDIR(st.st_mode)) {
             return DISTRIC_OK;
         }
-        LOG_ERROR(logger, "persistence", "Path exists but is not a directory", "path", path);
+        LOG_ERROR(logger, "persistence", "Path exists but is not a directory", "path", path, NULL);
         return DISTRIC_ERR_INVALID_ARG;
     }
     
@@ -120,11 +120,11 @@ static distric_err_t ensure_directory(const char* path, logger_t* logger) {
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
         LOG_ERROR(logger, "persistence", "Failed to create directory",
-                 "path", path, "errno", errno_str);
+                 "path", path, "errno", errno_str, NULL);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
-    LOG_INFO(logger, "persistence", "Created directory", "path", path);
+    LOG_INFO(logger, "persistence", "Created directory", "path", path, NULL);
     return DISTRIC_OK;
 }
 
@@ -136,7 +136,7 @@ static distric_err_t write_file_atomic(const char* path, const char* tmp_path,
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
         LOG_ERROR(logger, "persistence", "Failed to create tmp file",
-                 "path", tmp_path, "errno", errno_str);
+                 "path", tmp_path, "errno", errno_str, NULL);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
@@ -146,7 +146,7 @@ static distric_err_t write_file_atomic(const char* path, const char* tmp_path,
         snprintf(expected_str, sizeof(expected_str), "%zu", len);
         snprintf(written_str, sizeof(written_str), "%zd", written);
         LOG_ERROR(logger, "persistence", "Failed to write tmp file",
-                 "expected", expected_str, "written", written_str);
+                 "expected", expected_str, "written", written_str, NULL);
         close(fd);
         unlink(tmp_path);
         return DISTRIC_ERR_INIT_FAILED;
@@ -156,7 +156,7 @@ static distric_err_t write_file_atomic(const char* path, const char* tmp_path,
     if (fsync(fd) != 0) {
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
-        LOG_ERROR(logger, "persistence", "Failed to fsync tmp file", "errno", errno_str);
+        LOG_ERROR(logger, "persistence", "Failed to fsync tmp file", "errno", errno_str, NULL);
         close(fd);
         unlink(tmp_path);
         return DISTRIC_ERR_INIT_FAILED;
@@ -168,7 +168,7 @@ static distric_err_t write_file_atomic(const char* path, const char* tmp_path,
     if (rename(tmp_path, path) != 0) {
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
-        LOG_ERROR(logger, "persistence", "Failed to rename tmp file", "errno", errno_str);
+        LOG_ERROR(logger, "persistence", "Failed to rename tmp file", "errno", errno_str, NULL);
         unlink(tmp_path);
         return DISTRIC_ERR_INIT_FAILED;
     }
@@ -186,7 +186,7 @@ static distric_err_t read_file(const char* path, char** data_out, size_t* len_ou
         }
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
-        LOG_ERROR(logger, "persistence", "Failed to open file", "path", path, "errno", errno_str);
+        LOG_ERROR(logger, "persistence", "Failed to open file", "path", path, "errno", errno_str, NULL);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
@@ -195,7 +195,7 @@ static distric_err_t read_file(const char* path, char** data_out, size_t* len_ou
     if (fstat(fd, &st) != 0) {
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
-        LOG_ERROR(logger, "persistence", "Failed to stat file", "errno", errno_str);
+        LOG_ERROR(logger, "persistence", "Failed to stat file", "errno", errno_str, NULL);
         close(fd);
         return DISTRIC_ERR_INIT_FAILED;
     }
@@ -376,7 +376,7 @@ distric_err_t raft_persistence_init(
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
         LOG_ERROR(p->logger, "persistence", "Failed to open log file",
-                 "path", p->log_path, "errno", errno_str);
+                 "path", p->log_path, "errno", errno_str, NULL);
         free(p);
         return DISTRIC_ERR_INIT_FAILED;
     }
@@ -390,7 +390,7 @@ distric_err_t raft_persistence_init(
     }
     
     LOG_INFO(p->logger, "persistence", "Initialized",
-            "data_dir", p->data_dir);
+            "data_dir", p->data_dir, NULL);
     
     *persistence_out = p;
     return DISTRIC_OK;
@@ -512,7 +512,7 @@ distric_err_t raft_persistence_load_state(
     snprintf(term_str, sizeof(term_str), "%u", *term_out);
     LOG_DEBUG(persistence->logger, "persistence", "Loaded state",
              "term", term_str,
-             "voted_for", voted_for_out);
+             "voted_for", voted_for_out, NULL);
     
     return err;
 }
@@ -533,7 +533,7 @@ distric_err_t raft_persistence_append_log(
     if (lseek(persistence->log_fd, 0, SEEK_END) < 0) {
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
-        LOG_ERROR(persistence->logger, "persistence", "Failed to seek log", "errno", errno_str);
+        LOG_ERROR(persistence->logger, "persistence", "Failed to seek log", "errno", errno_str, NULL);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
@@ -568,7 +568,7 @@ distric_err_t raft_persistence_append_log(
     snprintf(idx_str, sizeof(idx_str), "%u", index);
     snprintf(term_str, sizeof(term_str), "%u", term);
     LOG_DEBUG(persistence->logger, "persistence", "Appended log entry",
-             "index", idx_str, "term", term_str);
+             "index", idx_str, "term", term_str, NULL);
     
     return DISTRIC_OK;
 }
@@ -672,7 +672,7 @@ distric_err_t raft_persistence_load_log(
     char count_str[32];
     snprintf(count_str, sizeof(count_str), "%zu", count);
     LOG_INFO(persistence->logger, "persistence", "Loaded log",
-            "entry_count", count_str);
+            "entry_count", count_str, NULL);
     
     return DISTRIC_OK;
 
@@ -735,7 +735,7 @@ distric_err_t raft_persistence_truncate_log(
     snprintf(kept_str, sizeof(kept_str), "%zu", kept);
     LOG_INFO(persistence->logger, "persistence", "Truncated log",
             "from_index", from_idx_str,
-            "kept", kept_str);
+            "kept", kept_str, NULL);
     
     return DISTRIC_OK;
 }
@@ -771,7 +771,7 @@ distric_err_t raft_persistence_save_snapshot(
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
         LOG_ERROR(persistence->logger, "persistence", "Failed to create snapshot tmp file",
-                 "errno", errno_str);
+                 "errno", errno_str, NULL);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
@@ -802,7 +802,7 @@ distric_err_t raft_persistence_save_snapshot(
         snprintf(expected_str, sizeof(expected_str), "%zu", snapshot_len);
         snprintf(written_str, sizeof(written_str), "%zd", written);
         LOG_ERROR(persistence->logger, "persistence", "Failed to write snapshot data",
-                 "expected", expected_str, "written", written_str);
+                 "expected", expected_str, "written", written_str, NULL);
         close(fd);
         unlink(persistence->snapshot_tmp_path);
         return DISTRIC_ERR_INIT_FAILED;
@@ -812,7 +812,7 @@ distric_err_t raft_persistence_save_snapshot(
     if (fsync(fd) != 0) {
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
-        LOG_ERROR(persistence->logger, "persistence", "Failed to fsync snapshot", "errno", errno_str);
+        LOG_ERROR(persistence->logger, "persistence", "Failed to fsync snapshot", "errno", errno_str, NULL);
         close(fd);
         unlink(persistence->snapshot_tmp_path);
         return DISTRIC_ERR_INIT_FAILED;
@@ -824,7 +824,7 @@ distric_err_t raft_persistence_save_snapshot(
     if (rename(persistence->snapshot_tmp_path, persistence->snapshot_path) != 0) {
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
-        LOG_ERROR(persistence->logger, "persistence", "Failed to rename snapshot", "errno", errno_str);
+        LOG_ERROR(persistence->logger, "persistence", "Failed to rename snapshot", "errno", errno_str, NULL);
         unlink(persistence->snapshot_tmp_path);
         return DISTRIC_ERR_INIT_FAILED;
     }
@@ -836,7 +836,7 @@ distric_err_t raft_persistence_save_snapshot(
     LOG_INFO(persistence->logger, "persistence", "Saved snapshot",
             "last_included_index", idx_str,
             "last_included_term", term_str,
-            "size", size_str);
+            "size", size_str, NULL);
     
     return DISTRIC_OK;
 }
@@ -861,7 +861,7 @@ distric_err_t raft_persistence_load_snapshot(
         }
         char errno_str[32];
         snprintf(errno_str, sizeof(errno_str), "%d", errno);
-        LOG_ERROR(persistence->logger, "persistence", "Failed to open snapshot", "errno", errno_str);
+        LOG_ERROR(persistence->logger, "persistence", "Failed to open snapshot", "errno", errno_str, NULL);
         return DISTRIC_ERR_INIT_FAILED;
     }
     
@@ -917,7 +917,7 @@ distric_err_t raft_persistence_load_snapshot(
         snprintf(computed_str, sizeof(computed_str), "%u", computed_crc32);
         LOG_ERROR(persistence->logger, "persistence", "Snapshot CRC32 mismatch",
                  "expected", expected_str,
-                 "computed", computed_str);
+                 "computed", computed_str, NULL);
         free(data);
         return DISTRIC_ERR_INVALID_FORMAT;
     }
@@ -934,7 +934,7 @@ distric_err_t raft_persistence_load_snapshot(
     LOG_INFO(persistence->logger, "persistence", "Loaded snapshot",
             "last_included_index", idx_str,
             "last_included_term", term_str,
-            "size", size_str);
+            "size", size_str, NULL);
     
     return DISTRIC_OK;
 }

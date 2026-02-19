@@ -1660,20 +1660,20 @@ distric_err_t raft_process_election_result(raft_node_t* node, uint32_t votes_rec
     LOG_DEBUG(node->config.logger, "raft", "Processing election result",
              "votes", votes_str,
              "majority", majority_str,
-             "term", term_str);
+             "term", term_str, NULL);
     
     /* Check if we won */
     if (votes_received >= majority) {
         LOG_INFO(node->config.logger, "raft", "Election won - transitioning to LEADER",
                 "votes", votes_str,
                 "majority", majority_str,
-                "term", term_str);
+                "term", term_str, NULL);
         
         transition_to_leader(node);
     } else {
         LOG_DEBUG(node->config.logger, "raft", "Election incomplete - need more votes",
                  "votes", votes_str,
-                 "majority", majority_str);
+                 "majority", majority_str, NULL);
     }
     
     pthread_rwlock_unlock(&node->lock);

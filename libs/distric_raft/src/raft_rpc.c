@@ -448,7 +448,7 @@ distric_err_t raft_rpc_create(
     
     LOG_INFO(config->logger, "raft_rpc", "RPC context created",
             "bind_address", config->bind_address,
-            "bind_port", port_str);
+            "bind_port", port_str, NULL);
     
     return DISTRIC_OK;
 }
@@ -541,7 +541,7 @@ distric_err_t raft_rpc_send_request_vote(
     if (context->send_filter) {
         if (!context->send_filter(context->send_filter_userdata, peer_address, peer_port)) {
             LOG_DEBUG(context->config.logger, "raft_rpc", "RequestVote blocked by send filter",
-                     "peer", peer_address);
+                     "peer", peer_address, NULL);
             return DISTRIC_ERR_UNAVAILABLE;
         }
     }
@@ -598,7 +598,7 @@ distric_err_t raft_rpc_send_request_vote(
             snprintf(retry_str, sizeof(retry_str), "%u", retries);
             LOG_WARN(context->config.logger, "raft_rpc", "RequestVote RPC failed, retrying",
                     "peer", peer_address,
-                    "retry", retry_str);
+                    "retry", retry_str, NULL);
             usleep(100000);  /* 100ms backoff */
         }
     }
@@ -607,7 +607,7 @@ distric_err_t raft_rpc_send_request_vote(
     
     if (err != DISTRIC_OK) {
         LOG_ERROR(context->config.logger, "raft_rpc", "RequestVote RPC failed after retries",
-                 "peer", peer_address);
+                 "peer", peer_address, NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return err;
     }
@@ -725,7 +725,7 @@ distric_err_t raft_rpc_send_append_entries(
     
     if (err != DISTRIC_OK) {
         LOG_WARN(context->config.logger, "raft_rpc", "AppendEntries RPC failed",
-                "peer", peer_address);
+                "peer", peer_address, NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return err;
     }
@@ -779,7 +779,7 @@ distric_err_t raft_rpc_send_install_snapshot(
     if (context->send_filter) {
         if (!context->send_filter(context->send_filter_userdata, peer_address, peer_port)) {
             LOG_DEBUG(context->config.logger, "raft_rpc", "InstallSnapshot blocked by send filter",
-                     "peer", peer_address);
+                     "peer", peer_address, NULL);
             return DISTRIC_ERR_UNAVAILABLE;
         }
     }
@@ -822,7 +822,7 @@ distric_err_t raft_rpc_send_install_snapshot(
     
     if (err != DISTRIC_OK) {
         LOG_ERROR(context->config.logger, "raft_rpc", "InstallSnapshot RPC failed",
-                 "peer", peer_address);
+                 "peer", peer_address, NULL);
         metrics_counter_inc(context->rpc_errors_metric);
         return err;
     }
@@ -946,7 +946,7 @@ distric_err_t raft_rpc_broadcast_request_vote(
         if (args[i].completed && args[i].peer_term > term) {
             LOG_INFO(context->config.logger, "raft_rpc", "Discovered higher term during election",
                     "our_term", &term,
-                    "peer_term", &(int){args[i].peer_term});
+                    "peer_term", &(int){args[i].peer_term}, NULL);
             
             /* Transition to follower */
             raft_step_down(raft_node, args[i].peer_term);
@@ -963,7 +963,7 @@ distric_err_t raft_rpc_broadcast_request_vote(
     snprintf(needed_str, sizeof(needed_str), "%zu", (config->peer_count + 1) / 2 + 1);
     LOG_INFO(context->config.logger, "raft_rpc", "RequestVote broadcast complete",
             "votes", votes_str,
-            "needed", needed_str);
+            "needed", needed_str, NULL);
     
     return DISTRIC_OK;
 }
