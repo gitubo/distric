@@ -62,6 +62,7 @@ extern "C" {
 #define FIELD_SNAPSHOT_INDEX        0x010C  /**< Snapshot last index */
 #define FIELD_SNAPSHOT_TERM         0x010D  /**< Snapshot last term */
 #define FIELD_SNAPSHOT_DATA         0x010E  /**< Snapshot data */
+#define FIELD_MATCH_INDEX           0x010F  /**< AppendEntries match index */  
 
 /* Log entry fields */
 #define FIELD_ENTRY_INDEX           0x0110  /**< Entry index */
@@ -88,6 +89,10 @@ extern "C" {
 #define FIELD_MEMBERSHIP_UPDATES    0x0209  /**< Membership update array */
 #define FIELD_PROTOCOL_VERSION      0x020A  /**< Protocol version */
 #define FIELD_METADATA              0x020B  /**< Node metadata */
+#define FIELD_NODE_INFO             0x020C  /**< Serialised node info (bytes) */
+
+/* Alias for indirect ping target — messages.c uses the shorter name */
+#define FIELD_TARGET_ID             FIELD_INDIRECT_TARGET_ID  
 
 /* Load metrics (0x0220-0x022F) */
 #define FIELD_CPU_USAGE             0x0220  /**< CPU usage percentage (0-100) */
@@ -116,6 +121,7 @@ extern "C" {
 #define FIELD_RESPONSE_CODE         0x0404  /**< Response code */
 #define FIELD_RESPONSE_MESSAGE      0x0405  /**< Response message */
 #define FIELD_WORKFLOWS_TRIGGERED   0x0406  /**< Triggered workflow IDs */
+#define FIELD_TRIGGERED             FIELD_WORKFLOWS_TRIGGERED 
 #define FIELD_ERROR_CODE            0x0407  /**< Error code */
 #define FIELD_ERROR_DETAILS         0x0408  /**< Error details */
 #define FIELD_QUERY_TYPE            0x0409  /**< Query type */

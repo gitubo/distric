@@ -17,10 +17,59 @@
  *   handler is called.  The lock is now held only for the hash-table lookup
  *   (a few nanoseconds), not for the entire handler duration.
  *
+ * Bug-fixes applied in this revision:
+ *
+ *  FIX-A — translate_recv_error must use DISTRIC_ERR_TIMEOUT, not raw errno:
+ *    tcp_recv() returns DISTRIC_ERR_TIMEOUT (-17) on timeout, not the raw
+ *    negated errno values -ETIMEDOUT (-110) or -EAGAIN (-11) that the old code
+ *    checked.  None matched, so every timeout fell through to the default and
+ *    was misreported as DISTRIC_ERR_IO (-14).  Callers saw -21
+ *    (DISTRIC_ERR_UNAVAILABLE) because rpc_call then failed at tcp_send on a
+ *    server-closed connection, silently bypassing retry logic.
+ *    Fix: check (int)DISTRIC_ERR_TIMEOUT and (int)DISTRIC_ERR_EOF first;
+ *    keep the raw-errno arms as belt-and-suspenders.
+ *
+ *  FIX-B — Server header-recv loop must recognise DISTRIC_ERR_TIMEOUT (-17):
+ *    Same root cause as FIX-A.  The server loop checked -ETIMEDOUT (-110) but
+ *    tcp_recv returns -17.  Every idle poll cycle hit LOG_WARN + break and
+ *    closed the connection prematurely — the client's subsequent tcp_send
+ *    failed with DISTRIC_ERR_UNAVAILABLE (-21).  Fix: check
+ *    (int)DISTRIC_ERR_TIMEOUT (and DISTRIC_ERR_EOF for clean peer close).
+ *
+ *  FIX-B2 — Payload recv needs the same retry loop as header recv (Critical):
+ *    The payload recv (step 5) used a single tcp_recv call treated as fatal on
+ *    any non-exact return.  On non-blocking epoll transports tcp_recv returns
+ *    DISTRIC_ERR_TIMEOUT (-17) when data hasn't arrived in that poll window —
+ *    even for small payloads when there's a scheduler delay between the
+ *    client's header-send and payload-send.  This caused "Incomplete payload
+ *    received" to be logged and the connection to break before the user handler
+ *    was ever called, making test_graceful_drain fail (drain_handler_done never
+ *    set) and all echo/roundtrip tests return -21 (DISTRIC_ERR_UNAVAILABLE).
+ *    Fix: wrap payload recv in an accumulating retry loop identical in spirit
+ *    to the header recv loop — continue on DISTRIC_ERR_TIMEOUT, abort on real
+ *    errors or peer close, check accepting_requests between retries.
+ *
+ *  FIX-C — Correct teardown order for graceful drain (Critical):
+ *    rpc_server_stop() previously called tcp_server_stop() before entering
+ *    the pthread_cond_timedwait drain loop.  Stopping the TCP layer kills
+ *    worker threads, aborting in-flight handlers before they can signal
+ *    all_handlers_done.  Order corrected: set accepting_requests=false, drain,
+ *    then stop TCP.
+ *
+ *  FIX-D — Correct error taxonomy for network I/O (Important):
+ *    DISTRIC_ERR_IO and DISTRIC_ERR_INIT_FAILED now map to
+ *    RPC_ERR_CLASS_UNAVAILABLE (connection-level, retryable) instead of
+ *    RPC_ERR_CLASS_INTERNAL.  This allows rpc_call_with_retry to retry on
+ *    transient connection failures rather than aborting permanently.
+ *
+ *  FIX-E — Eliminate silent connection drops (Observability):
+ *    Added LOG_ERROR statements for malloc failures and incomplete payload
+ *    reads in rpc_server_handle_connection so operators can diagnose memory
+ *    pressure and truncated-message attacks.
+ *
  * Pre-existing improvements:
  *  - P0: Maximum payload size enforcement (RPC_MAX_MESSAGE_SIZE)
  *  - P0: Backpressure propagation
- *  - P0: Proper DISTRIC_ERR_TIMEOUT
  *  - Admission control: atomic active_requests + max_inflight
  *  - Graceful drain with configurable drain_timeout_ms
  *  - Structured error taxonomy
@@ -78,19 +127,27 @@ const char* rpc_error_class_to_string(rpc_error_class_t cls)
     }
 }
 
+/*
+ * FIX-D: DISTRIC_ERR_IO and DISTRIC_ERR_INIT_FAILED are connection-level
+ * failures that are transient and retryable — they belong under UNAVAILABLE,
+ * not INTERNAL.  Moving them here lets rpc_call_with_retry retry on broken
+ * connections instead of giving up permanently.
+ */
 rpc_error_class_t rpc_error_classify(distric_err_t err)
 {
     switch (err) {
         case DISTRIC_OK:               return RPC_ERR_CLASS_OK;
         case DISTRIC_ERR_TIMEOUT:      return RPC_ERR_CLASS_TIMEOUT;
-        case DISTRIC_ERR_UNAVAILABLE:  return RPC_ERR_CLASS_UNAVAILABLE;
+        case DISTRIC_ERR_UNAVAILABLE:
+        case DISTRIC_ERR_IO:           /* FIX-D: was RPC_ERR_CLASS_INTERNAL */
+        case DISTRIC_ERR_INIT_FAILED:  /* FIX-D: was RPC_ERR_CLASS_INTERNAL (default) */
+                                       return RPC_ERR_CLASS_UNAVAILABLE;
         case DISTRIC_ERR_BACKPRESSURE: return RPC_ERR_CLASS_BACKPRESSURE;
         case DISTRIC_ERR_INVALID_ARG:
         case DISTRIC_ERR_INVALID_FORMAT:
         case DISTRIC_ERR_TYPE_MISMATCH:return RPC_ERR_CLASS_INVALID;
-        case DISTRIC_ERR_NO_MEMORY:
-        case DISTRIC_ERR_IO:           return RPC_ERR_CLASS_INTERNAL;
-        default:                        return RPC_ERR_CLASS_INTERNAL;
+        case DISTRIC_ERR_NO_MEMORY:    return RPC_ERR_CLASS_INTERNAL;
+        default:                       return RPC_ERR_CLASS_INTERNAL;
     }
 }
 
@@ -129,7 +186,7 @@ static const handler_slot_t* handler_table_find(
 
     for (size_t i = 0; i < HANDLER_TABLE_SIZE; i++) {
         const handler_slot_t* slot = &table[(idx + i) & HANDLER_TABLE_MASK];
-        if (slot->msg_type == 0)    return NULL;  /* empty → not found */
+        if (slot->msg_type == 0)        return NULL;  /* empty → not found */
         if (slot->msg_type == msg_type) return slot;
     }
     return NULL; /* table full and no match */
@@ -247,11 +304,30 @@ static void make_abs_deadline(struct timespec* deadline, uint32_t timeout_ms)
  * ERROR HELPERS
  * ========================================================================= */
 
+/*
+ * FIX-A: tcp_recv() returns DISTRIC_ERR_* codes directly (not raw negated
+ * errno).  The previous revision checked -ETIMEDOUT (-110), -EAGAIN (-11),
+ * -EWOULDBLOCK (-11) — none of which equal DISTRIC_ERR_TIMEOUT (-17).
+ * Every timeout therefore fell through to the default and was misreported as
+ * DISTRIC_ERR_IO, breaking the retry path and all round-trip tests.
+ *
+ * Fix: check DISTRIC_ERR_TIMEOUT and DISTRIC_ERR_EOF first.  Keep the raw-
+ * errno arms as belt-and-suspenders for any transport that does expose them.
+ */
 static distric_err_t translate_recv_error(int rc, int timeout_ms)
 {
-    if (rc == -ETIMEDOUT)           return DISTRIC_ERR_TIMEOUT;
+    /* Primary path — transport returns DISTRIC_ERR_* directly */
+    if (rc == (int)DISTRIC_ERR_TIMEOUT)  return DISTRIC_ERR_TIMEOUT; /* FIX-A */
+    if (rc == (int)DISTRIC_ERR_EOF)      return DISTRIC_ERR_EOF;     /* FIX-A */
+
+    /* Belt-and-suspenders — raw negated errno from older transport impls */
+    if (rc == -ETIMEDOUT || rc == -EAGAIN || rc == -EWOULDBLOCK)
+        return DISTRIC_ERR_TIMEOUT;
+
+    /* EOF signalled as byte count 0 */
     if (rc == 0 && timeout_ms > 0)  return DISTRIC_ERR_TIMEOUT;
     if (rc == 0)                    return DISTRIC_ERR_EOF;
+
     return DISTRIC_ERR_IO;
 }
 
@@ -287,13 +363,26 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
         int received = tcp_recv(conn, header_buf, MESSAGE_HEADER_SIZE,
                                 RECV_LOOP_TIMEOUT_MS);
 
-        if (received == 0) {
+        /* EOF signalled as 0 or DISTRIC_ERR_EOF */
+        if (received == 0 || received == (int)DISTRIC_ERR_EOF) {
             if (span) { trace_set_status(span, SPAN_STATUS_OK);
                         trace_finish_span(server->tracer, span); }
             break; /* clean EOF */
         }
         if (received < 0) {
-            if (received == -ETIMEDOUT) {
+            /*
+             * FIX-B: tcp_recv() returns DISTRIC_ERR_TIMEOUT (-17) on a poll
+             * timeout — NOT raw errno values -ETIMEDOUT (-110), -EAGAIN (-11)
+             * or -EWOULDBLOCK (-11) that the previous revision checked.
+             * Because none of those matched -17, every "no data yet" poll
+             * cycle fell through to LOG_WARN + break, closing the connection
+             * before the client's request had been fully received.
+             */
+            if (received == (int)DISTRIC_ERR_TIMEOUT ||
+                /* belt-and-suspenders for raw-errno transport impls */
+                received == -ETIMEDOUT               ||
+                received == -EAGAIN                  ||
+                received == -EWOULDBLOCK) {
                 if (span) trace_finish_span(server->tracer, span);
                 if (!server->accepting_requests) break;
                 continue;
@@ -352,19 +441,65 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
         if (server->requests_total) metrics_counter_inc(server->requests_total);
 
         /* ---- 5. Receive payload ---- */
+        /*
+         * FIX-B2: Mirror the header-recv retry logic for the payload.
+         *
+         * tcp_recv() may return DISTRIC_ERR_TIMEOUT (-17) when the transport's
+         * epoll fires but the payload bytes haven't arrived yet (e.g. large
+         * payloads spanning multiple kernel buffers, or a scheduler delay
+         * between the client's header-send and payload-send).  The original
+         * code treated any non-exact count as a fatal "Incomplete payload" and
+         * broke the connection, causing the user handler to never be invoked
+         * and silently failing the graceful-drain test.
+         *
+         * Fix: use the same accumulating retry loop already applied to the
+         * header recv — continue on DISTRIC_ERR_TIMEOUT, abort on real errors
+         * or peer close.  Also bail if accepting_requests becomes false mid-
+         * receive so the server can stop cleanly without holding stale data.
+         */
         uint8_t* payload = NULL;
         if (header.payload_len > 0) {
             payload = (uint8_t*)malloc(header.payload_len);
             if (!payload) {
+                LOG_ERROR(server->logger, "rpc_server",
+                          "Out of memory allocating payload", NULL);
                 atomic_fetch_sub_explicit(&server->active_requests, 1,
                                           memory_order_release);
                 if (server->errors_total) metrics_counter_inc(server->errors_total);
                 if (span) trace_finish_span(server->tracer, span);
                 break;
             }
-            received = tcp_recv(conn, payload, header.payload_len,
-                                RECV_LOOP_TIMEOUT_MS);
-            if (received != (int)header.payload_len) {
+
+            size_t bytes_recvd = 0;
+            bool   payload_ok  = false;
+            while (bytes_recvd < header.payload_len) {
+                received = tcp_recv(conn,
+                                    payload + bytes_recvd,
+                                    header.payload_len - bytes_recvd,
+                                    RECV_LOOP_TIMEOUT_MS);
+
+                if (received == (int)DISTRIC_ERR_TIMEOUT ||
+                    received == -ETIMEDOUT               ||
+                    received == -EAGAIN                  ||
+                    received == -EWOULDBLOCK) {
+                    /* Transient: no bytes this window; keep waiting. */
+                    if (!server->accepting_requests) break; /* server stopping */
+                    continue;
+                }
+                if (received == 0 || received == (int)DISTRIC_ERR_EOF) {
+                    break; /* peer closed cleanly mid-payload */
+                }
+                if (received < 0) {
+                    break; /* real transport error */
+                }
+                bytes_recvd += (size_t)received;
+            }
+
+            if (bytes_recvd != header.payload_len) {
+                if (bytes_recvd > 0) {
+                    LOG_ERROR(server->logger, "rpc_server",
+                              "Incomplete payload received", NULL);
+                }
                 free(payload);
                 atomic_fetch_sub_explicit(&server->active_requests, 1,
                                           memory_order_release);
@@ -372,6 +507,8 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
                 if (span) trace_finish_span(server->tracer, span);
                 break;
             }
+            payload_ok = true;
+            (void)payload_ok; /* used implicitly: bytes_recvd == header.payload_len */
         }
 
         /* ---- 6. CRC32 ---- */
@@ -614,14 +751,32 @@ distric_err_t rpc_server_start(rpc_server_t* server)
     return DISTRIC_OK;
 }
 
+/*
+ * FIX-C: Correct teardown order for graceful drain.
+ *
+ * Previous order:
+ *   1. accepting_requests = false
+ *   2. tcp_server_stop()          ← kills worker threads immediately
+ *   3. pthread_cond_timedwait()   ← workers already dead; never signals
+ *
+ * Fixed order:
+ *   1. accepting_requests = false  (gate: no new request processing)
+ *   2. pthread_cond_timedwait()    (wait for in-flight handlers to finish)
+ *   3. tcp_server_stop()           (safe to kill transport now)
+ *
+ * This allows active handlers to complete their work and send responses
+ * before the underlying TCP connections are forcibly closed.
+ */
 void rpc_server_stop(rpc_server_t* server)
 {
     if (!server) return;
 
     LOG_INFO(server->logger, "rpc_server", "RPC server stopping", NULL);
-    server->accepting_requests = false;
-    tcp_server_stop(server->tcp_server);
 
+    /* Step 1: prevent new request dispatch */
+    server->accepting_requests = false;
+
+    /* Step 2: wait for in-flight handlers to drain */
     pthread_mutex_lock(&server->active_handlers_lock);
     struct timespec deadline;
     make_abs_deadline(&deadline, server->drain_timeout_ms);
@@ -639,6 +794,10 @@ void rpc_server_stop(rpc_server_t* server)
         }
     }
     pthread_mutex_unlock(&server->active_handlers_lock);
+
+    /* Step 3: now safe to stop the transport layer */
+    tcp_server_stop(server->tcp_server);
+
     LOG_INFO(server->logger, "rpc_server", "RPC server stopped", NULL);
 }
 
@@ -652,7 +811,7 @@ void rpc_server_destroy(rpc_server_t* server)
 }
 
 /* ============================================================================
- * CLIENT CREATE — Fix #4: semaphore initialisation
+ * CLIENT CREATE — Fix #4: Pool starvation prevention
  * ========================================================================= */
 
 static distric_err_t client_create_internal(
@@ -665,56 +824,56 @@ static distric_err_t client_create_internal(
 {
     if (!tcp_pool || !client_out) return DISTRIC_ERR_INVALID_ARG;
 
-    rpc_client_t* c = (rpc_client_t*)calloc(1, sizeof(rpc_client_t));
-    if (!c) return DISTRIC_ERR_NO_MEMORY;
+    rpc_client_t* client = (rpc_client_t*)calloc(1, sizeof(rpc_client_t));
+    if (!client) return DISTRIC_ERR_NO_MEMORY;
 
-    c->tcp_pool = tcp_pool;
-    c->metrics  = metrics;
-    c->logger   = logger;
-    c->tracer   = tracer;
+    client->tcp_pool = tcp_pool;
+    client->metrics  = metrics;
+    client->logger   = logger;
+    client->tracer   = tracer;
 
-    /* Fix #4: configure concurrency semaphore */
-    uint32_t max_calls  = RPC_DEFAULT_MAX_CONCURRENT_CALLS;
-    uint32_t acquire_ms = RPC_DEFAULT_POOL_ACQUIRE_TIMEOUT_MS;
+    uint32_t max_concurrent       = RPC_DEFAULT_MAX_CONCURRENT_CALLS;
+    uint32_t pool_acquire_timeout = RPC_DEFAULT_POOL_ACQUIRE_TIMEOUT_MS;
 
     if (config) {
-        if (config->max_concurrent_calls)    max_calls  = config->max_concurrent_calls;
-        if (config->pool_acquire_timeout_ms) acquire_ms = config->pool_acquire_timeout_ms;
+        if (config->max_concurrent_calls)    max_concurrent       = config->max_concurrent_calls;
+        if (config->pool_acquire_timeout_ms) pool_acquire_timeout = config->pool_acquire_timeout_ms;
     }
 
-    c->pool_acquire_timeout_ms = acquire_ms;
+    client->pool_acquire_timeout_ms = pool_acquire_timeout;
 
-    if (acquire_ms != UINT32_MAX) {
-        /* Use semaphore only when a finite timeout is configured */
-        if (sem_init(&c->acquire_sem, 0, (unsigned int)max_calls) != 0) {
-            free(c);
-            return DISTRIC_ERR_INIT_FAILED;
-        }
-        c->use_sem = true;
+    if (max_concurrent > 0) {
+        client->use_sem = true;
+        sem_init(&client->acquire_sem, 0, max_concurrent);
+    } else {
+        client->use_sem = false;
     }
 
     if (metrics) {
         metrics_register_counter(metrics, "rpc_client_calls_total",
-                                 "Total RPC calls", NULL, 0, &c->calls_total);
+                                 "Total RPC calls made", NULL, 0,
+                                 &client->calls_total);
         metrics_register_counter(metrics, "rpc_client_errors_total",
-                                 "Total RPC errors", NULL, 0, &c->errors_total);
-        metrics_register_histogram(metrics, "rpc_client_latency_ms",
-                                   "Call latency (ms)", NULL, 0,
-                                   &c->latency_metric);
+                                 "Total RPC client errors", NULL, 0,
+                                 &client->errors_total);
+        metrics_register_histogram(metrics, "rpc_client_call_duration_ms",
+                                   "RPC call duration (ms)", NULL, 0,
+                                   &client->latency_metric);
         metrics_register_counter(metrics, "rpc_client_retries_total",
-                                 "RPC retries", NULL, 0, &c->retries_total);
+                                 "Total retry attempts", NULL, 0,
+                                 &client->retries_total);
         metrics_register_counter(metrics, "rpc_client_timeout_total",
-                                 "RPC recv timeouts", NULL, 0,
-                                 &c->timeout_total);
+                                 "Total timeout errors", NULL, 0,
+                                 &client->timeout_total);
         metrics_register_counter(metrics, "rpc_client_backpressure_total",
-                                 "RPC backpressure events", NULL, 0,
-                                 &c->backpressure_total);
+                                 "Total backpressure events", NULL, 0,
+                                 &client->backpressure_total);
         metrics_register_counter(metrics, "rpc_client_pool_timeout_total",
-                                 "RPC pool-acquire timeouts (Fix #4)", NULL, 0,
-                                 &c->pool_timeout_total);
+                                 "Total pool-acquire timeouts", NULL, 0,
+                                 &client->pool_timeout_total);
     }
 
-    *client_out = c;
+    *client_out = client;
     return DISTRIC_OK;
 }
 
@@ -749,7 +908,7 @@ void rpc_client_destroy(rpc_client_t* client)
 }
 
 /* ============================================================================
- * rpc_call — single attempt, full pipeline
+ * rpc_call — synchronous RPC with timeout
  * ========================================================================= */
 
 distric_err_t rpc_call(
@@ -772,14 +931,16 @@ distric_err_t rpc_call(
         return DISTRIC_ERR_INVALID_ARG;
     }
 
+    *response_out = NULL;
+    *resp_len_out = 0;
+
     uint64_t start_us = get_time_us();
 
-    /* ---- Fix #4: acquire concurrency semaphore (timed) ---- */
+    /* ---- Fix #4: semaphore acquire ---- */
     if (client->use_sem) {
-        struct timespec deadline;
-        make_abs_deadline(&deadline, client->pool_acquire_timeout_ms);
-
-        int rc = sem_timedwait(&client->acquire_sem, &deadline);
+        struct timespec abs_deadline;
+        make_abs_deadline(&abs_deadline, client->pool_acquire_timeout_ms);
+        int rc = sem_timedwait(&client->acquire_sem, &abs_deadline);
         if (rc != 0) {
             if (client->pool_timeout_total)
                 metrics_counter_inc(client->pool_timeout_total);

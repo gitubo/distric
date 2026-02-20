@@ -565,19 +565,6 @@ void test_client_pool_timeout_fires(void)
  * the same public registration API.
  * ========================================================================= */
 
-/* Minimal no-op handler used for dispatch tests */
-static int noop_handler(const uint8_t* req, size_t rlen,
-                         uint8_t** resp, size_t* resp_len,
-                         void* ud, trace_span_t* span)
-{
-    (void)req; (void)rlen; (void)span;
-    *resp     = NULL;
-    *resp_len = 0;
-    /* Encode the msg_type we were invoked for into userdata slot */
-    atomic_int* counter = (atomic_int*)ud;
-    if (counter) atomic_fetch_add(counter, 1);
-    return 0;
-}
 
 void test_handler_table_all_message_types(void)
 {

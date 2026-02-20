@@ -1416,3 +1416,62 @@ void free_client_response(client_response_t* msg)
     msg->workflows_triggered = NULL;
     msg->workflow_count      = 0;
 }
+
+/* ============================================================================
+ * UTILITY FUNCTIONS
+ * Human-readable string representations for wire-format enum types.
+ * These are declared in messages.h but were missing their implementations.
+ * ========================================================================= */
+
+const char* raft_entry_type_to_string(uint8_t type)
+{
+    switch (type) {
+        case RAFT_ENTRY_NORMAL: return "NORMAL";
+        case RAFT_ENTRY_CONFIG: return "CONFIG";
+        case RAFT_ENTRY_NOOP:   return "NOOP";
+        default:                return "UNKNOWN";
+    }
+}
+
+const char* config_change_type_to_string(config_change_type_t type)
+{
+    switch (type) {
+        case CONFIG_CHANGE_ADD_NODE:    return "ADD_NODE";
+        case CONFIG_CHANGE_REMOVE_NODE: return "REMOVE_NODE";
+        case CONFIG_CHANGE_REPLACE:     return "REPLACE";
+        default:                        return "UNKNOWN";
+    }
+}
+
+const char* node_state_to_string(node_state_t state)
+{
+    switch (state) {
+        case NODE_STATE_ALIVE:     return "ALIVE";
+        case NODE_STATE_SUSPECTED: return "SUSPECTED";
+        case NODE_STATE_FAILED:    return "FAILED";
+        case NODE_STATE_LEFT:      return "LEFT";
+        default:                   return "UNKNOWN";
+    }
+}
+
+const char* node_role_to_string(node_role_t role)
+{
+    switch (role) {
+        case NODE_ROLE_COORDINATOR: return "COORDINATOR";
+        case NODE_ROLE_WORKER:      return "WORKER";
+        default:                    return "UNKNOWN";
+    }
+}
+
+const char* task_status_to_string(task_status_t status)
+{
+    switch (status) {
+        case TASK_STATUS_PENDING:   return "PENDING";
+        case TASK_STATUS_RUNNING:   return "RUNNING";
+        case TASK_STATUS_COMPLETED: return "COMPLETED";
+        case TASK_STATUS_FAILED:    return "FAILED";
+        case TASK_STATUS_TIMEOUT:   return "TIMEOUT";
+        case TASK_STATUS_CANCELLED: return "CANCELLED";
+        default:                    return "UNKNOWN";
+    }
+}
