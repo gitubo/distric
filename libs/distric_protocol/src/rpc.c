@@ -265,8 +265,8 @@ struct rpc_client {
     tracer_t*           tracer;
 
     /* Fix #4: concurrency semaphore */
-    bool    use_sem;
-    sem_t   acquire_sem;
+    bool     use_sem;
+    sem_t    acquire_sem;
     uint32_t pool_acquire_timeout_ms;
 
     metric_t* calls_total;
@@ -482,7 +482,8 @@ static void rpc_server_handle_connection(tcp_connection_t* conn, void* userdata)
                     received == -ETIMEDOUT               ||
                     received == -EAGAIN                  ||
                     received == -EWOULDBLOCK) {
-                    /* Transient: no bytes this window; keep waiting. */
+                    /* Transient: no bytes this window; keep waiting.
+                     * FIX-B2: this is the critical path that was missing. */
                     if (!server->accepting_requests) break; /* server stopping */
                     continue;
                 }
