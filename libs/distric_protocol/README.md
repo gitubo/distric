@@ -1,255 +1,227 @@
-# DistriC Protocol Layer
+# distric_protocol
 
-Binary protocol implementation with fixed 32-byte headers, CRC32 checksums, and network byte order serialization.
+Binary wire protocol library for the DistriC platform. Provides a fixed 32-byte message header, TLV payload encoding, CRC32 integrity checking, and complete serialisation/deserialisation for all DistriC message types.
+
+## Overview
+
+`distric_protocol` defines and implements the on-wire format used by all DistriC nodes. Every message consists of a fixed 32-byte header in network byte order followed by a variable-length payload encoded in Type-Length-Value (TLV) format. CRC32 covers both header and payload, providing corruption detection at the transport boundary.
 
 ## Features
 
-- **Fixed 32-byte header**: Predictable, cache-friendly message structure
-- **Network byte order**: Big-endian serialization for cross-platform compatibility
-- **CRC32 checksums**: IEEE 802.3 polynomial for corruption detection
-- **Message type system**: Organized by subsystem (Raft, Gossip, Task, Client)
-- **Zero dependencies**: Only standard C library + distric_obs
-- **Portable**: Tested on little-endian and big-endian systems
+- Fixed 32-byte header with magic number, version, message type, and CRC32
+- Network byte order (big-endian) throughout
+- TLV payload encoding with dynamic buffer growth and zero-copy decoding
+- Forward-compatibility: unknown TLV fields are safely skipped
+- CRC32 (IEEE 802.3) for corruption detection
+- Complete message definitions for Raft, Gossip, Task, and Client protocols
+- No external dependencies beyond `distric_obs`
 
-## Quick Start
+## Requirements
 
-### Include
+- C11 compiler with GNU extensions
+- CMake 3.15 or later
+- `distric_obs` library
 
-```c
-#include <distric_protocol.h>
+## Build
+
+```bash
+cmake -B build -DBUILD_TESTING=ON
+cmake --build build
+cd build && ctest -R test_binary --output-on-failure
 ```
 
-### Create and Send Message
+## Wire Format
 
-```c
-// Initialize header
-message_header_t header;
-message_header_init(&header, MSG_RAFT_REQUEST_VOTE, payload_len);
-
-// Create payload
-uint8_t payload[1024];
-// ... fill payload ...
-
-// Compute CRC32
-compute_header_crc32(&header, payload, payload_len);
-
-// Serialize header
-uint8_t wire_buffer[MESSAGE_HEADER_SIZE];
-serialize_header(&header, wire_buffer);
-
-// Send: wire_buffer (32 bytes) followed by payload
-send(socket, wire_buffer, MESSAGE_HEADER_SIZE, 0);
-send(socket, payload, payload_len, 0);
-```
-
-### Receive and Validate Message
-
-```c
-// Receive header
-uint8_t wire_buffer[MESSAGE_HEADER_SIZE];
-recv(socket, wire_buffer, MESSAGE_HEADER_SIZE, 0);
-
-// Deserialize
-message_header_t header;
-deserialize_header(wire_buffer, &header);
-
-// Validate header
-if (!validate_message_header(&header)) {
-    // Invalid header
-    return;
-}
-
-// Receive payload
-uint8_t* payload = malloc(header.payload_len);
-recv(socket, payload, header.payload_len, 0);
-
-// Verify CRC32
-if (!verify_message_crc32(&header, payload, header.payload_len)) {
-    // Corruption detected
-    free(payload);
-    return;
-}
-
-// Process message
-printf("Message type: %s\n", message_type_to_string(header.msg_type));
-// ...
-
-free(payload);
-```
-
-## Message Header Structure
+### Header Layout (32 bytes)
 
 ```
-┌─────────────────────────────────────────┐
-│  Offset | Size | Field                  │
-├─────────┼──────┼────────────────────────┤
-│  0      | 4    | Magic (0x44495354)     │
-│  4      | 2    | Version (0x0001)       │
-│  6      | 2    | Message Type           │
-│  8      | 2    | Flags                  │
-│  10     | 2    | Reserved               │
-│  12     | 4    | Payload Length         │
-│  16     | 8    | Message ID             │
-│  24     | 4    | Timestamp (seconds)    │
-│  28     | 4    | CRC32                  │
-└─────────────────────────────────────────┘
-Total: 32 bytes (packed, network byte order)
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                           Magic (0xD15C0000)                  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Version              |         Message Type          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|            Flags              |           Reserved            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         Payload Length                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Message ID (high)                       |
+|                       Message ID (low)                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         Timestamp µs                          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                            CRC32                              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+Total: 32 bytes, packed, network byte order.
+
+### TLV Field Layout
+
+```
+Byte 0    : Type  (uint8_t)
+Bytes 1-2 : Tag   (uint16_t, big-endian)
+Bytes 3-6 : Length (uint32_t, big-endian)
+Bytes 7+  : Value  (N bytes)
 ```
 
 ## Message Types
 
 ### Raft Consensus (0x1xxx)
-- `MSG_RAFT_REQUEST_VOTE` (0x1001)
-- `MSG_RAFT_APPEND_ENTRIES` (0x1003)
-- `MSG_RAFT_INSTALL_SNAPSHOT` (0x1005)
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MSG_RAFT_REQUEST_VOTE` | 0x1001 | Leader election vote request |
+| `MSG_RAFT_APPEND_ENTRIES` | 0x1003 | Log replication / heartbeat |
+| `MSG_RAFT_INSTALL_SNAPSHOT` | 0x1005 | Snapshot transfer |
 
 ### Gossip Protocol (0x2xxx)
-- `MSG_GOSSIP_PING` (0x2001)
-- `MSG_GOSSIP_ACK` (0x2002)
-- `MSG_GOSSIP_MEMBERSHIP_UPDATE` (0x2004)
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MSG_GOSSIP_PING` | 0x2001 | Failure detection probe |
+| `MSG_GOSSIP_ACK` | 0x2002 | Probe acknowledgement |
+| `MSG_GOSSIP_MEMBERSHIP_UPDATE` | 0x2004 | Membership state push |
 
 ### Task Execution (0x3xxx)
-- `MSG_TASK_ASSIGNMENT` (0x3001)
-- `MSG_TASK_RESULT` (0x3002)
-- `MSG_TASK_STATUS` (0x3003)
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MSG_TASK_ASSIGNMENT` | 0x3001 | Assign task to worker |
+| `MSG_TASK_RESULT` | 0x3002 | Worker result delivery |
+| `MSG_TASK_STATUS` | 0x3003 | In-progress status update |
 
 ### Client API (0x4xxx)
-- `MSG_CLIENT_SUBMIT` (0x4001)
-- `MSG_CLIENT_RESPONSE` (0x4002)
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MSG_CLIENT_SUBMIT` | 0x4001 | Submit event for processing |
+| `MSG_CLIENT_RESPONSE` | 0x4002 | Processing acknowledgement |
 
 ## Message Flags
 
 ```c
-MSG_FLAG_NONE           // No flags
-MSG_FLAG_COMPRESSED     // Payload is compressed
-MSG_FLAG_ENCRYPTED      // Payload is encrypted
-MSG_FLAG_URGENT         // High-priority message
-MSG_FLAG_RETRY          // This is a retry
-MSG_FLAG_RESPONSE       // This is a response
+MSG_FLAG_NONE        /* No flags set               */
+MSG_FLAG_COMPRESSED  /* Payload is compressed       */
+MSG_FLAG_ENCRYPTED   /* Payload is encrypted        */
+MSG_FLAG_URGENT      /* High-priority routing hint  */
+MSG_FLAG_RETRY       /* This is a retransmission    */
+MSG_FLAG_RESPONSE    /* This is a response message  */
 ```
 
-## API Reference
+## Quick Start
 
-### Header Initialization
+### Encoding
 
 ```c
-distric_err_t message_header_init(
-    message_header_t* header,
-    message_type_t msg_type,
-    uint32_t payload_len
-);
+#include <distric_protocol.h>
+
+/* 1. Build TLV payload */
+tlv_encoder_t* enc = tlv_encoder_create(256);
+tlv_encode_uint32(enc, FIELD_TERM, 42);
+tlv_encode_string(enc, FIELD_CANDIDATE_ID, "node-123");
+
+size_t   payload_len;
+uint8_t* payload = tlv_encoder_finalize(enc, &payload_len);
+
+/* 2. Initialise header */
+message_header_t header;
+message_header_init(&header, MSG_RAFT_REQUEST_VOTE, (uint32_t)payload_len);
+
+/* 3. Compute and embed CRC32 */
+compute_header_crc32(&header, payload, payload_len);
+
+/* 4. Serialise header to wire bytes */
+uint8_t header_buf[MESSAGE_HEADER_SIZE];
+serialize_header(&header, header_buf);
+
+/* 5. Transmit */
+send(sock, header_buf, MESSAGE_HEADER_SIZE, 0);
+send(sock, payload,    payload_len,          0);
+
+tlv_encoder_free(enc);
 ```
 
-Initializes header with magic, version, unique message_id, and timestamp.
-
-### Serialization
+### Decoding
 
 ```c
-distric_err_t serialize_header(
-    const message_header_t* header,
-    uint8_t* buffer
-);
+/* 1. Receive fixed header */
+uint8_t header_buf[MESSAGE_HEADER_SIZE];
+recv(sock, header_buf, MESSAGE_HEADER_SIZE, 0);
+
+/* 2. Deserialise and validate */
+message_header_t header;
+deserialize_header(header_buf, &header);
+
+if (!validate_message_header(&header)) { /* reject */ }
+
+/* 3. Receive payload */
+uint8_t* payload = malloc(header.payload_len);
+recv(sock, payload, header.payload_len, 0);
+
+/* 4. Verify integrity */
+if (!verify_message_crc32(&header, payload, header.payload_len)) {
+    free(payload);
+    /* reject */
+}
+
+/* 5. Decode TLV fields */
+tlv_decoder_t* dec = tlv_decoder_create(payload, header.payload_len);
+tlv_field_t field;
+while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
+    switch (field.tag) {
+        case FIELD_TERM: {
+            uint32_t term;
+            tlv_field_get_uint32(&field, &term);
+            break;
+        }
+        case FIELD_CANDIDATE_ID: {
+            const char* id = tlv_field_get_string(&field);
+            break;
+        }
+    }
+}
+tlv_decoder_free(dec);
+free(payload);
 ```
-
-Converts header to network byte order (big-endian).
-
-### Deserialization
-
-```c
-distric_err_t deserialize_header(
-    const uint8_t* buffer,
-    message_header_t* header
-);
-```
-
-Converts from network byte order to host byte order.
-
-### Validation
-
-```c
-bool validate_message_header(const message_header_t* header);
-```
-
-Checks magic, version, message type, and payload length.
-
-### CRC32
-
-```c
-distric_err_t compute_header_crc32(
-    message_header_t* header,
-    const uint8_t* payload,
-    size_t payload_len
-);
-
-bool verify_message_crc32(
-    const message_header_t* header,
-    const uint8_t* payload,
-    size_t payload_len
-);
-```
-
-Compute or verify CRC32 checksum over header + payload.
-
-## Build
-
-From project root:
-
-```bash
-# Configure
-cmake -B build -DBUILD_TESTING=ON
-
-# Build
-cmake --build build
-
-# Run tests
-cd build && ctest -R test_binary --output-on-failure
-```
-
-## Testing
-
-Run comprehensive test suite:
-
-```bash
-./build/libs/distric_protocol/tests/test_binary
-```
-
-Tests verify:
-- Header size (exactly 32 bytes)
-- Serialization/deserialization round-trip
-- Network byte order conversion
-- CRC32 computation and verification
-- Corruption detection (single-bit errors)
-- Message validation
-- Unique message ID generation
-- Portability across endianness
 
 ## Performance Characteristics
 
-- **Header serialization**: ~50-100 ns
-- **CRC32 computation**: ~5-10 cycles/byte (table-based)
-- **Memory footprint**: 32 bytes per header
-- **Cache-friendly**: Header fits in single cache line (64 bytes)
+| Operation | Latency |
+|-----------|---------|
+| Header serialisation | ~50–100 ns |
+| Header deserialisation | ~50–100 ns |
+| CRC32 computation | ~5–10 cycles/byte |
+| Header memory footprint | 32 bytes (fits single cache line) |
 
-## Implementation Status
+## Directory Structure
 
-- [x] **Session 2.1**: Binary Protocol Foundation ✓
-  - [x] Fixed 32-byte header structure
-  - [x] Network byte order serialization
-  - [x] CRC32 checksum (IEEE 802.3)
-  - [x] Message validation
-  - [x] Comprehensive tests
-  
-- [ ] **Session 2.2**: TLV Encoder/Decoder
-- [ ] **Session 2.3**: Message Definitions
-- [ ] **Session 2.4**: RPC Framework
-- [ ] **Session 2.5**: Phase 2 Integration
+```
+libs/distric_protocol/
+├── CMakeLists.txt
+├── README.md
+├── API.md
+├── include/
+│   ├── distric_protocol.h          # Single public header (use this)
+│   └── distric_protocol/           # Internal sub-headers
+│       ├── binary.h
+│       ├── crc32.h
+│       ├── tlv.h
+│       ├── messages.h
+│       └── rpc.h
+└── src/
+    ├── binary.c
+    ├── crc32.c
+    ├── tlv.c
+    ├── messages.c
+    └── rpc.c
+```
 
-**Phase 2 Progress**: 20% (1/5 sessions complete)
+## API Stability
 
-## Next Steps
-
-Session 2.2 will implement Type-Length-Value (TLV) encoding for flexible payload serialization.
+`include/distric_protocol.h` is the only stable public interface. Sub-headers under `include/distric_protocol/` are internal and must not be included directly.
 
 ## License
 
-TBD
+See repository root for license information.
