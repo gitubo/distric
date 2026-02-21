@@ -2,19 +2,8 @@
  * @file messages.c
  * @brief Protocol Message Serialization/Deserialization Implementation
  *
- * Fix #3 — Required-field validation:
- *   All deserialize_*() functions previously returned DISTRIC_OK even when
- *   mandatory fields (e.g., candidate_id in RequestVote, task_id in
- *   TaskAssignment) were absent from the TLV payload.  A truncated or
- *   adversarially crafted message was indistinguishable from a valid one
- *   with empty strings and zero numerics.
- *
- *   Each deserializer now maintains a `uint32_t seen` bitmask.  Each decoded
- *   field sets its corresponding bit.  After the decode loop the function
- *   checks that all required bits are set, returning DISTRIC_ERR_INVALID_FORMAT
- *   (re-used; consumers should treat this as "message malformed / missing field")
- *   on failure.  Optional fields — those that have sensible zero/NULL defaults —
- *   are deliberately NOT required.
+ * Fix #3 — Required-field validation via uint32_t seen bitmask.
+ * Fix #API — tlv_field_get_*() functions return values; assignments updated.
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -27,17 +16,13 @@
 
 /* ============================================================================
  * REQUIRED-FIELD BITMASK HELPERS
- * Each message defines a set of bit constants and a REQUIRED mask.
- * Bits are assigned in the order fields appear in the struct (0 = bit 0 etc.).
  * ========================================================================= */
-
-/* Return DISTRIC_ERR_INVALID_FORMAT and free decoder if required bits missing */
-#define CHECK_REQUIRED(dec, seen, required)                         \
-    do {                                                             \
-        if (((seen) & (required)) != (required)) {                   \
-            tlv_decoder_free(dec);                                   \
-            return DISTRIC_ERR_INVALID_FORMAT;                       \
-        }                                                            \
+#define CHECK_REQUIRED(dec, seen, required)                             \
+    do {                                                                 \
+        if (((seen) & (required)) != (required)) {                       \
+            tlv_decoder_free(dec);                                       \
+            return DISTRIC_ERR_INVALID_FORMAT;                           \
+        }                                                                \
     } while (0)
 
 /* ============================================================================
@@ -90,26 +75,24 @@ distric_err_t deserialize_raft_request_vote(
     while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
         switch (field.tag) {
             case FIELD_TERM:
-                tlv_field_get_uint32(&field, &msg_out->term);
+                msg_out->term = tlv_field_get_uint32(&field);
                 seen |= RV_SEEN_TERM;
                 break;
             case FIELD_CANDIDATE_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->candidate_id, s,
-                                 sizeof(msg_out->candidate_id) - 1); }
+                if (s) strncpy(msg_out->candidate_id, s, sizeof(msg_out->candidate_id) - 1);
                 seen |= RV_SEEN_CANDIDATE_ID;
                 break;
             }
             case FIELD_LAST_LOG_INDEX:
-                tlv_field_get_uint32(&field, &msg_out->last_log_index);
+                msg_out->last_log_index = tlv_field_get_uint32(&field);
                 seen |= RV_SEEN_LAST_LOG_INDEX;
                 break;
             case FIELD_LAST_LOG_TERM:
-                tlv_field_get_uint32(&field, &msg_out->last_log_term);
+                msg_out->last_log_term = tlv_field_get_uint32(&field);
                 seen |= RV_SEEN_LAST_LOG_TERM;
                 break;
-            default:
-                break;
+            default: break;
         }
     }
 
@@ -170,22 +153,20 @@ distric_err_t deserialize_raft_request_vote_response(
     while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
         switch (field.tag) {
             case FIELD_TERM:
-                tlv_field_get_uint32(&field, &msg_out->term);
+                msg_out->term = tlv_field_get_uint32(&field);
                 seen |= RVR_SEEN_TERM;
                 break;
             case FIELD_VOTE_GRANTED:
-                tlv_field_get_bool(&field, &msg_out->vote_granted);
+                msg_out->vote_granted = tlv_field_get_bool(&field);
                 seen |= RVR_SEEN_VOTE_GRANTED;
                 break;
             case FIELD_NODE_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->node_id, s,
-                                 sizeof(msg_out->node_id) - 1); }
+                if (s) strncpy(msg_out->node_id, s, sizeof(msg_out->node_id) - 1);
                 seen |= RVR_SEEN_NODE_ID;
                 break;
             }
-            default:
-                break;
+            default: break;
         }
     }
 
@@ -224,7 +205,6 @@ distric_err_t serialize_raft_append_entries(
     tlv_encode_uint32(enc, FIELD_PREV_LOG_TERM,  msg->prev_log_term);
     tlv_encode_uint32(enc, FIELD_LEADER_COMMIT,  msg->leader_commit);
 
-    /* Encode entries — each as a nested TLV bytes blob */
     for (size_t i = 0; i < msg->entry_count; i++) {
         const raft_log_entry_wire_t* e = &msg->entries[i];
         tlv_encoder_t* entry_enc = tlv_encoder_create(128);
@@ -233,9 +213,8 @@ distric_err_t serialize_raft_append_entries(
         tlv_encode_uint32(entry_enc, FIELD_ENTRY_INDEX, e->index);
         tlv_encode_uint32(entry_enc, FIELD_ENTRY_TERM,  e->term);
         tlv_encode_uint8 (entry_enc, FIELD_ENTRY_TYPE,  e->entry_type);
-        if (e->data && e->data_len > 0) {
+        if (e->data && e->data_len > 0)
             tlv_encode_bytes(entry_enc, FIELD_ENTRY_DATA, e->data, e->data_len);
-        }
 
         size_t   entry_len;
         uint8_t* entry_buf = tlv_encoder_detach(entry_enc, &entry_len);
@@ -274,12 +253,8 @@ distric_err_t deserialize_raft_append_entries(
     }
 
     if (entry_count > 0) {
-        msg_out->entries = (raft_log_entry_wire_t*)calloc(
-                               entry_count, sizeof(raft_log_entry_wire_t));
-        if (!msg_out->entries) {
-            tlv_decoder_free(dec);
-            return DISTRIC_ERR_NO_MEMORY;
-        }
+        msg_out->entries = (raft_log_entry_wire_t*)calloc(entry_count, sizeof(raft_log_entry_wire_t));
+        if (!msg_out->entries) { tlv_decoder_free(dec); return DISTRIC_ERR_NO_MEMORY; }
     }
 
     /* Second pass: decode */
@@ -289,26 +264,25 @@ distric_err_t deserialize_raft_append_entries(
     while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
         switch (field.tag) {
             case FIELD_TERM:
-                tlv_field_get_uint32(&field, &msg_out->term);
+                msg_out->term = tlv_field_get_uint32(&field);
                 seen |= AE_SEEN_TERM;
                 break;
             case FIELD_LEADER_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->leader_id, s,
-                                 sizeof(msg_out->leader_id) - 1); }
+                if (s) strncpy(msg_out->leader_id, s, sizeof(msg_out->leader_id) - 1);
                 seen |= AE_SEEN_LEADER_ID;
                 break;
             }
             case FIELD_PREV_LOG_INDEX:
-                tlv_field_get_uint32(&field, &msg_out->prev_log_index);
+                msg_out->prev_log_index = tlv_field_get_uint32(&field);
                 seen |= AE_SEEN_PREV_LOG_INDEX;
                 break;
             case FIELD_PREV_LOG_TERM:
-                tlv_field_get_uint32(&field, &msg_out->prev_log_term);
+                msg_out->prev_log_term = tlv_field_get_uint32(&field);
                 seen |= AE_SEEN_PREV_LOG_TERM;
                 break;
             case FIELD_LEADER_COMMIT:
-                tlv_field_get_uint32(&field, &msg_out->leader_commit);
+                msg_out->leader_commit = tlv_field_get_uint32(&field);
                 seen |= AE_SEEN_LEADER_COMMIT;
                 break;
             case FIELD_ENTRIES: {
@@ -321,20 +295,17 @@ distric_err_t deserialize_raft_append_entries(
                     while (tlv_decode_next(nd, &nf) == DISTRIC_OK) {
                         switch (nf.tag) {
                             case FIELD_ENTRY_INDEX:
-                                tlv_field_get_uint32(&nf, &e->index); break;
+                                e->index = tlv_field_get_uint32(&nf); break;
                             case FIELD_ENTRY_TERM:
-                                tlv_field_get_uint32(&nf, &e->term);  break;
+                                e->term  = tlv_field_get_uint32(&nf); break;
                             case FIELD_ENTRY_TYPE:
-                                tlv_field_get_uint8(&nf, &e->entry_type); break;
+                                e->entry_type = tlv_field_get_uint8(&nf); break;
                             case FIELD_ENTRY_DATA: {
                                 size_t dlen;
                                 const uint8_t* d = tlv_field_get_bytes(&nf, &dlen);
                                 if (d && dlen > 0) {
                                     e->data = (uint8_t*)malloc(dlen);
-                                    if (e->data) {
-                                        memcpy(e->data, d, dlen);
-                                        e->data_len = dlen;
-                                    }
+                                    if (e->data) { memcpy(e->data, d, dlen); e->data_len = dlen; }
                                 }
                                 break;
                             }
@@ -345,68 +316,33 @@ distric_err_t deserialize_raft_append_entries(
                 }
                 break;
             }
-            default:
-                break;
+            default: break;
         }
     }
 
     msg_out->entry_count = entry_idx;
-
     CHECK_REQUIRED(dec, seen, AE_REQUIRED);
     tlv_decoder_free(dec);
     return DISTRIC_OK;
 }
 
-distric_err_t deserialize_raft_append_entries_response(
-    const uint8_t*                    buffer,
-    size_t                            len,
-    raft_append_entries_response_t*   msg_out)
+void free_raft_append_entries(raft_append_entries_t* msg)
 {
-    if (!buffer || !msg_out || len == 0) return DISTRIC_ERR_INVALID_ARG;
-    if (!tlv_validate_buffer(buffer, len)) return DISTRIC_ERR_INVALID_FORMAT;
+    if (!msg) return;
+    for (size_t i = 0; i < msg->entry_count; i++) free(msg->entries[i].data);
+    free(msg->entries);
+    msg->entries     = NULL;
+    msg->entry_count = 0;
+}
 
-    memset(msg_out, 0, sizeof(*msg_out));
-
-    tlv_decoder_t* dec = tlv_decoder_create(buffer, len);
-    if (!dec) return DISTRIC_ERR_NO_MEMORY;
-
-    /* Required: term, success, node_id */
-    uint32_t seen = 0;
+/* ============================================================================
+ * RAFT — APPEND ENTRIES RESPONSE
+ * Required: term, success, node_id
+ * ========================================================================= */
 #define AER_SEEN_TERM    (1u << 0)
 #define AER_SEEN_SUCCESS (1u << 1)
 #define AER_SEEN_NODE_ID (1u << 2)
 #define AER_REQUIRED     (AER_SEEN_TERM | AER_SEEN_SUCCESS | AER_SEEN_NODE_ID)
-
-    tlv_field_t field;
-    while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
-        switch (field.tag) {
-            case FIELD_TERM:
-                tlv_field_get_uint32(&field, &msg_out->term);
-                seen |= AER_SEEN_TERM;
-                break;
-            case FIELD_SUCCESS:
-                tlv_field_get_bool(&field, &msg_out->success);
-                seen |= AER_SEEN_SUCCESS;
-                break;
-            case FIELD_NODE_ID: {
-                const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->node_id, s,
-                                 sizeof(msg_out->node_id) - 1); }
-                seen |= AER_SEEN_NODE_ID;
-                break;
-            }
-            case FIELD_MATCH_INDEX:
-                tlv_field_get_uint32(&field, &msg_out->match_index);
-                break;
-            default:
-                break;
-        }
-    }
-
-    CHECK_REQUIRED(dec, seen, AER_REQUIRED);
-    tlv_decoder_free(dec);
-    return DISTRIC_OK;
-}
 
 distric_err_t serialize_raft_append_entries_response(
     const raft_append_entries_response_t* msg,
@@ -428,23 +364,60 @@ distric_err_t serialize_raft_append_entries_response(
     return *buffer_out ? DISTRIC_OK : DISTRIC_ERR_NO_MEMORY;
 }
 
-void free_raft_append_entries(raft_append_entries_t* msg)
+distric_err_t deserialize_raft_append_entries_response(
+    const uint8_t*                    buffer,
+    size_t                            len,
+    raft_append_entries_response_t*   msg_out)
 {
-    if (!msg) return;
-    if (msg->entries) {
-        for (size_t i = 0; i < msg->entry_count; i++) {
-            free(msg->entries[i].data);
+    if (!buffer || !msg_out || len == 0) return DISTRIC_ERR_INVALID_ARG;
+    if (!tlv_validate_buffer(buffer, len)) return DISTRIC_ERR_INVALID_FORMAT;
+
+    memset(msg_out, 0, sizeof(*msg_out));
+
+    tlv_decoder_t* dec = tlv_decoder_create(buffer, len);
+    if (!dec) return DISTRIC_ERR_NO_MEMORY;
+
+    uint32_t seen = 0;
+    tlv_field_t field;
+
+    while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
+        switch (field.tag) {
+            case FIELD_TERM:
+                msg_out->term = tlv_field_get_uint32(&field);
+                seen |= AER_SEEN_TERM;
+                break;
+            case FIELD_SUCCESS:
+                msg_out->success = tlv_field_get_bool(&field);
+                seen |= AER_SEEN_SUCCESS;
+                break;
+            case FIELD_NODE_ID: {
+                const char* s = tlv_field_get_string(&field);
+                if (s) strncpy(msg_out->node_id, s, sizeof(msg_out->node_id) - 1);
+                seen |= AER_SEEN_NODE_ID;
+                break;
+            }
+            case FIELD_MATCH_INDEX:
+                msg_out->match_index = tlv_field_get_uint32(&field);
+                break;
+            default: break;
         }
-        free(msg->entries);
-        msg->entries     = NULL;
-        msg->entry_count = 0;
     }
+
+    CHECK_REQUIRED(dec, seen, AER_REQUIRED);
+    tlv_decoder_free(dec);
+    return DISTRIC_OK;
 }
 
 /* ============================================================================
- * RAFT — INSTALL SNAPSHOT (abbreviated — same pattern)
+ * RAFT — INSTALL SNAPSHOT
  * Required: term, leader_id, last_included_index, last_included_term
  * ========================================================================= */
+#define IS_SEEN_TERM  (1u << 0)
+#define IS_SEEN_LID   (1u << 1)
+#define IS_SEEN_IDX   (1u << 2)
+#define IS_SEEN_TERM2 (1u << 3)
+#define IS_REQUIRED   (IS_SEEN_TERM | IS_SEEN_LID | IS_SEEN_IDX | IS_SEEN_TERM2)
+
 distric_err_t serialize_raft_install_snapshot(
     const raft_install_snapshot_t* msg,
     uint8_t** buffer_out,
@@ -452,16 +425,15 @@ distric_err_t serialize_raft_install_snapshot(
 {
     if (!msg || !buffer_out || !len_out) return DISTRIC_ERR_INVALID_ARG;
 
-    tlv_encoder_t* enc = tlv_encoder_create(1024);
+    tlv_encoder_t* enc = tlv_encoder_create(512);
     if (!enc) return DISTRIC_ERR_NO_MEMORY;
 
-    tlv_encode_uint32(enc, FIELD_TERM,            msg->term);
-    tlv_encode_string(enc, FIELD_LEADER_ID,       msg->leader_id);
-    tlv_encode_uint32(enc, FIELD_SNAPSHOT_INDEX,  msg->last_included_index);
-    tlv_encode_uint32(enc, FIELD_SNAPSHOT_TERM,   msg->last_included_term);
-    if (msg->data && msg->data_len > 0) {
+    tlv_encode_uint32(enc, FIELD_TERM,           msg->term);
+    tlv_encode_string(enc, FIELD_LEADER_ID,      msg->leader_id);
+    tlv_encode_uint32(enc, FIELD_SNAPSHOT_INDEX, msg->last_included_index);
+    tlv_encode_uint32(enc, FIELD_SNAPSHOT_TERM,  msg->last_included_term);
+    if (msg->data && msg->data_len > 0)
         tlv_encode_bytes(enc, FIELD_SNAPSHOT_DATA, msg->data, msg->data_len);
-    }
 
     *buffer_out = tlv_encoder_detach(enc, len_out);
     tlv_encoder_free(enc);
@@ -482,32 +454,26 @@ distric_err_t deserialize_raft_install_snapshot(
     if (!dec) return DISTRIC_ERR_NO_MEMORY;
 
     uint32_t seen = 0;
-#define IS_SEEN_TERM  (1u << 0)
-#define IS_SEEN_LID   (1u << 1)
-#define IS_SEEN_IDX   (1u << 2)
-#define IS_SEEN_TERM2 (1u << 3)
-#define IS_REQUIRED   (IS_SEEN_TERM | IS_SEEN_LID | IS_SEEN_IDX | IS_SEEN_TERM2)
-
     tlv_field_t field;
+
     while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
         switch (field.tag) {
             case FIELD_TERM:
-                tlv_field_get_uint32(&field, &msg_out->term);
+                msg_out->term = tlv_field_get_uint32(&field);
                 seen |= IS_SEEN_TERM;
                 break;
             case FIELD_LEADER_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->leader_id, s,
-                                 sizeof(msg_out->leader_id) - 1); }
+                if (s) strncpy(msg_out->leader_id, s, sizeof(msg_out->leader_id) - 1);
                 seen |= IS_SEEN_LID;
                 break;
             }
             case FIELD_SNAPSHOT_INDEX:
-                tlv_field_get_uint32(&field, &msg_out->last_included_index);
+                msg_out->last_included_index = tlv_field_get_uint32(&field);
                 seen |= IS_SEEN_IDX;
                 break;
             case FIELD_SNAPSHOT_TERM:
-                tlv_field_get_uint32(&field, &msg_out->last_included_term);
+                msg_out->last_included_term = tlv_field_get_uint32(&field);
                 seen |= IS_SEEN_TERM2;
                 break;
             case FIELD_SNAPSHOT_DATA: {
@@ -515,10 +481,7 @@ distric_err_t deserialize_raft_install_snapshot(
                 const uint8_t* d = tlv_field_get_bytes(&field, &dlen);
                 if (d && dlen > 0) {
                     msg_out->data = (uint8_t*)malloc(dlen);
-                    if (msg_out->data) {
-                        memcpy(msg_out->data, d, dlen);
-                        msg_out->data_len = dlen;
-                    }
+                    if (msg_out->data) { memcpy(msg_out->data, d, dlen); msg_out->data_len = dlen; }
                 }
                 break;
             }
@@ -530,6 +493,15 @@ distric_err_t deserialize_raft_install_snapshot(
     tlv_decoder_free(dec);
     return DISTRIC_OK;
 }
+
+/* ============================================================================
+ * RAFT — INSTALL SNAPSHOT RESPONSE
+ * Required: term, node_id, success
+ * ========================================================================= */
+#define ISR_SEEN_TERM    (1u << 0)
+#define ISR_SEEN_NODE_ID (1u << 1)
+#define ISR_SEEN_SUCCESS (1u << 2)
+#define ISR_REQUIRED     (ISR_SEEN_TERM | ISR_SEEN_NODE_ID | ISR_SEEN_SUCCESS)
 
 distric_err_t serialize_raft_install_snapshot_response(
     const raft_install_snapshot_response_t* msg,
@@ -564,27 +536,22 @@ distric_err_t deserialize_raft_install_snapshot_response(
     if (!dec) return DISTRIC_ERR_NO_MEMORY;
 
     uint32_t seen = 0;
-#define ISR_SEEN_TERM    (1u << 0)
-#define ISR_SEEN_NODE_ID (1u << 1)
-#define ISR_SEEN_SUCCESS (1u << 2)
-#define ISR_REQUIRED     (ISR_SEEN_TERM | ISR_SEEN_NODE_ID | ISR_SEEN_SUCCESS)
-
     tlv_field_t field;
+
     while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
         switch (field.tag) {
             case FIELD_TERM:
-                tlv_field_get_uint32(&field, &msg_out->term);
+                msg_out->term = tlv_field_get_uint32(&field);
                 seen |= ISR_SEEN_TERM;
                 break;
             case FIELD_NODE_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->node_id, s,
-                                 sizeof(msg_out->node_id) - 1); }
+                if (s) strncpy(msg_out->node_id, s, sizeof(msg_out->node_id) - 1);
                 seen |= ISR_SEEN_NODE_ID;
                 break;
             }
             case FIELD_SUCCESS:
-                tlv_field_get_bool(&field, &msg_out->success);
+                msg_out->success = tlv_field_get_bool(&field);
                 seen |= ISR_SEEN_SUCCESS;
                 break;
             default: break;
@@ -605,13 +572,193 @@ void free_raft_install_snapshot(raft_install_snapshot_t* msg)
 }
 
 /* ============================================================================
+ * RAFT — CONFIGURATION CHANGE
+ * Required: change_type, node_id
+ * ========================================================================= */
+#define CC_SEEN_TYPE    (1u << 0)
+#define CC_SEEN_NODE_ID (1u << 1)
+#define CC_REQUIRED     (CC_SEEN_TYPE | CC_SEEN_NODE_ID)
+
+distric_err_t serialize_raft_configuration_change(
+    const raft_configuration_change_t* msg,
+    uint8_t** buffer_out,
+    size_t*   len_out)
+{
+    if (!msg || !buffer_out || !len_out) return DISTRIC_ERR_INVALID_ARG;
+
+    tlv_encoder_t* enc = tlv_encoder_create(512);
+    if (!enc) return DISTRIC_ERR_NO_MEMORY;
+
+    tlv_encode_uint32(enc, FIELD_CONFIG_CHANGE_TYPE, msg->type);
+    /* Encode primary node_info */
+    tlv_encode_string(enc, FIELD_NODE_ID,      msg->node_info.node_id);
+    tlv_encode_string(enc, FIELD_NODE_ADDRESS, msg->node_info.address);
+    tlv_encode_uint32(enc, FIELD_NODE_PORT,    msg->node_info.port);
+    tlv_encode_uint32(enc, FIELD_NODE_ROLE,    msg->node_info.role);
+
+    /* Encode old_servers as nested TLV blobs */
+    for (size_t i = 0; i < msg->old_server_count; i++) {
+        const raft_server_info_t* s = &msg->old_servers[i];
+        tlv_encoder_t* ne = tlv_encoder_create(256);
+        if (!ne) { tlv_encoder_free(enc); return DISTRIC_ERR_NO_MEMORY; }
+        tlv_encode_string(ne, FIELD_NODE_ID,      s->node_id);
+        tlv_encode_string(ne, FIELD_NODE_ADDRESS, s->address);
+        tlv_encode_uint32(ne, FIELD_NODE_PORT,    s->port);
+        tlv_encode_uint32(ne, FIELD_NODE_ROLE,    s->role);
+        size_t nlen; uint8_t* nbuf = tlv_encoder_detach(ne, &nlen);
+        tlv_encoder_free(ne);
+        if (!nbuf) { tlv_encoder_free(enc); return DISTRIC_ERR_NO_MEMORY; }
+        tlv_encode_bytes(enc, FIELD_OLD_SERVERS, nbuf, nlen);
+        free(nbuf);
+    }
+
+    /* Encode new_servers as nested TLV blobs */
+    for (size_t i = 0; i < msg->new_server_count; i++) {
+        const raft_server_info_t* s = &msg->new_servers[i];
+        tlv_encoder_t* ne = tlv_encoder_create(256);
+        if (!ne) { tlv_encoder_free(enc); return DISTRIC_ERR_NO_MEMORY; }
+        tlv_encode_string(ne, FIELD_NODE_ID,      s->node_id);
+        tlv_encode_string(ne, FIELD_NODE_ADDRESS, s->address);
+        tlv_encode_uint32(ne, FIELD_NODE_PORT,    s->port);
+        tlv_encode_uint32(ne, FIELD_NODE_ROLE,    s->role);
+        size_t nlen; uint8_t* nbuf = tlv_encoder_detach(ne, &nlen);
+        tlv_encoder_free(ne);
+        if (!nbuf) { tlv_encoder_free(enc); return DISTRIC_ERR_NO_MEMORY; }
+        tlv_encode_bytes(enc, FIELD_NEW_SERVERS, nbuf, nlen);
+        free(nbuf);
+    }
+
+    *buffer_out = tlv_encoder_detach(enc, len_out);
+    tlv_encoder_free(enc);
+    return *buffer_out ? DISTRIC_OK : DISTRIC_ERR_NO_MEMORY;
+}
+
+/* Helper: decode a raft_server_info_t from a nested TLV buffer */
+static void decode_server_info(const uint8_t* buf, size_t len, raft_server_info_t* out)
+{
+    tlv_decoder_t* nd = tlv_decoder_create(buf, len);
+    if (!nd) return;
+    tlv_field_t nf;
+    while (tlv_decode_next(nd, &nf) == DISTRIC_OK) {
+        switch (nf.tag) {
+            case FIELD_NODE_ID: {
+                const char* s = tlv_field_get_string(&nf);
+                if (s) strncpy(out->node_id, s, sizeof(out->node_id) - 1);
+                break;
+            }
+            case FIELD_NODE_ADDRESS: {
+                const char* s = tlv_field_get_string(&nf);
+                if (s) strncpy(out->address, s, sizeof(out->address) - 1);
+                break;
+            }
+            case FIELD_NODE_PORT:
+                out->port = (uint16_t)tlv_field_get_uint32(&nf);
+                break;
+            case FIELD_NODE_ROLE:
+                out->role = tlv_field_get_uint32(&nf);
+                break;
+            default: break;
+        }
+    }
+    tlv_decoder_free(nd);
+}
+
+distric_err_t deserialize_raft_configuration_change(
+    const uint8_t*               buffer,
+    size_t                       len,
+    raft_configuration_change_t* msg_out)
+{
+    if (!buffer || !msg_out || len == 0) return DISTRIC_ERR_INVALID_ARG;
+    if (!tlv_validate_buffer(buffer, len)) return DISTRIC_ERR_INVALID_FORMAT;
+
+    memset(msg_out, 0, sizeof(*msg_out));
+
+    tlv_decoder_t* dec = tlv_decoder_create(buffer, len);
+    if (!dec) return DISTRIC_ERR_NO_MEMORY;
+
+    uint32_t seen = 0;
+    tlv_field_t field;
+
+    /* First pass: count old/new servers */
+    size_t old_count = 0, new_count = 0;
+    while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
+        if (field.tag == FIELD_OLD_SERVERS) old_count++;
+        if (field.tag == FIELD_NEW_SERVERS) new_count++;
+    }
+    if (old_count > 0) {
+        msg_out->old_servers = (raft_server_info_t*)calloc(old_count, sizeof(raft_server_info_t));
+        if (!msg_out->old_servers) { tlv_decoder_free(dec); return DISTRIC_ERR_NO_MEMORY; }
+    }
+    if (new_count > 0) {
+        msg_out->new_servers = (raft_server_info_t*)calloc(new_count, sizeof(raft_server_info_t));
+        if (!msg_out->new_servers) { free(msg_out->old_servers); tlv_decoder_free(dec); return DISTRIC_ERR_NO_MEMORY; }
+    }
+
+    tlv_decoder_reset(dec);
+    size_t old_idx = 0, new_idx = 0;
+
+    while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
+        switch (field.tag) {
+            case FIELD_CONFIG_CHANGE_TYPE:
+                msg_out->type = tlv_field_get_uint32(&field);
+                seen |= CC_SEEN_TYPE;
+                break;
+            case FIELD_NODE_ID: {
+                const char* s = tlv_field_get_string(&field);
+                if (s) strncpy(msg_out->node_info.node_id, s, sizeof(msg_out->node_info.node_id) - 1);
+                seen |= CC_SEEN_NODE_ID;
+                break;
+            }
+            case FIELD_NODE_ADDRESS: {
+                const char* s = tlv_field_get_string(&field);
+                if (s) strncpy(msg_out->node_info.address, s, sizeof(msg_out->node_info.address) - 1);
+                break;
+            }
+            case FIELD_NODE_PORT:
+                msg_out->node_info.port = (uint16_t)tlv_field_get_uint32(&field);
+                break;
+            case FIELD_NODE_ROLE:
+                msg_out->node_info.role = tlv_field_get_uint32(&field);
+                break;
+            case FIELD_OLD_SERVERS:
+                if (old_idx < old_count)
+                    decode_server_info(field.value, field.length, &msg_out->old_servers[old_idx++]);
+                break;
+            case FIELD_NEW_SERVERS:
+                if (new_idx < new_count)
+                    decode_server_info(field.value, field.length, &msg_out->new_servers[new_idx++]);
+                break;
+            default: break;
+        }
+    }
+
+    msg_out->old_server_count = old_idx;
+    msg_out->new_server_count = new_idx;
+
+    CHECK_REQUIRED(dec, seen, CC_REQUIRED);
+    tlv_decoder_free(dec);
+    return DISTRIC_OK;
+}
+
+void free_raft_configuration_change(raft_configuration_change_t* msg)
+{
+    if (!msg) return;
+    free(msg->old_servers);
+    free(msg->new_servers);
+    msg->old_servers      = NULL;
+    msg->new_servers      = NULL;
+    msg->old_server_count = 0;
+    msg->new_server_count = 0;
+}
+
+/* ============================================================================
  * GOSSIP — PING
  * Required: sender_id, incarnation, sequence_number
  * ========================================================================= */
-#define GP_SEEN_SENDER_ID       (1u << 0)
-#define GP_SEEN_INCARNATION     (1u << 1)
-#define GP_SEEN_SEQ             (1u << 2)
-#define GP_REQUIRED             (GP_SEEN_SENDER_ID | GP_SEEN_INCARNATION | GP_SEEN_SEQ)
+#define GP_SEEN_SENDER_ID   (1u << 0)
+#define GP_SEEN_INCARNATION (1u << 1)
+#define GP_SEEN_SEQ         (1u << 2)
+#define GP_REQUIRED         (GP_SEEN_SENDER_ID | GP_SEEN_INCARNATION | GP_SEEN_SEQ)
 
 distric_err_t serialize_gossip_ping(
     const gossip_ping_t* msg,
@@ -623,9 +770,9 @@ distric_err_t serialize_gossip_ping(
     tlv_encoder_t* enc = tlv_encoder_create(128);
     if (!enc) return DISTRIC_ERR_NO_MEMORY;
 
-    tlv_encode_string(enc, FIELD_NODE_ID,        msg->sender_id);
-    tlv_encode_uint64(enc, FIELD_INCARNATION,    msg->incarnation);
-    tlv_encode_uint32(enc, FIELD_SEQUENCE_NUMBER,msg->sequence_number);
+    tlv_encode_string(enc, FIELD_NODE_ID,         msg->sender_id);
+    tlv_encode_uint64(enc, FIELD_INCARNATION,     msg->incarnation);
+    tlv_encode_uint32(enc, FIELD_SEQUENCE_NUMBER, msg->sequence_number);
 
     *buffer_out = tlv_encoder_detach(enc, len_out);
     tlv_encoder_free(enc);
@@ -652,17 +799,16 @@ distric_err_t deserialize_gossip_ping(
         switch (field.tag) {
             case FIELD_NODE_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->sender_id, s,
-                                 sizeof(msg_out->sender_id) - 1); }
+                if (s) strncpy(msg_out->sender_id, s, sizeof(msg_out->sender_id) - 1);
                 seen |= GP_SEEN_SENDER_ID;
                 break;
             }
             case FIELD_INCARNATION:
-                tlv_field_get_uint64(&field, &msg_out->incarnation);
+                msg_out->incarnation = tlv_field_get_uint64(&field);
                 seen |= GP_SEEN_INCARNATION;
                 break;
             case FIELD_SEQUENCE_NUMBER:
-                tlv_field_get_uint32(&field, &msg_out->sequence_number);
+                msg_out->sequence_number = tlv_field_get_uint32(&field);
                 seen |= GP_SEEN_SEQ;
                 break;
             default: break;
@@ -716,17 +862,16 @@ distric_err_t deserialize_gossip_ack(
         switch (field.tag) {
             case FIELD_NODE_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->sender_id, s,
-                                 sizeof(msg_out->sender_id) - 1); }
+                if (s) strncpy(msg_out->sender_id, s, sizeof(msg_out->sender_id) - 1);
                 seen |= GP_SEEN_SENDER_ID;
                 break;
             }
             case FIELD_INCARNATION:
-                tlv_field_get_uint64(&field, &msg_out->incarnation);
+                msg_out->incarnation = tlv_field_get_uint64(&field);
                 seen |= GP_SEEN_INCARNATION;
                 break;
             case FIELD_SEQUENCE_NUMBER:
-                tlv_field_get_uint32(&field, &msg_out->sequence_number);
+                msg_out->sequence_number = tlv_field_get_uint32(&field);
                 seen |= GP_SEEN_SEQ;
                 break;
             default: break;
@@ -742,10 +887,10 @@ distric_err_t deserialize_gossip_ack(
  * GOSSIP — INDIRECT PING
  * Required: sender_id, target_id, sequence_number
  * ========================================================================= */
-#define GIP_SEEN_SENDER  (1u << 0)
-#define GIP_SEEN_TARGET  (1u << 1)
-#define GIP_SEEN_SEQ     (1u << 2)
-#define GIP_REQUIRED     (GIP_SEEN_SENDER | GIP_SEEN_TARGET | GIP_SEEN_SEQ)
+#define GIP_SEEN_SENDER (1u << 0)
+#define GIP_SEEN_TARGET (1u << 1)
+#define GIP_SEEN_SEQ    (1u << 2)
+#define GIP_REQUIRED    (GIP_SEEN_SENDER | GIP_SEEN_TARGET | GIP_SEEN_SEQ)
 
 distric_err_t serialize_gossip_indirect_ping(
     const gossip_indirect_ping_t* msg,
@@ -786,20 +931,18 @@ distric_err_t deserialize_gossip_indirect_ping(
         switch (field.tag) {
             case FIELD_NODE_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->sender_id, s,
-                                 sizeof(msg_out->sender_id) - 1); }
+                if (s) strncpy(msg_out->sender_id, s, sizeof(msg_out->sender_id) - 1);
                 seen |= GIP_SEEN_SENDER;
                 break;
             }
             case FIELD_TARGET_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->target_id, s,
-                                 sizeof(msg_out->target_id) - 1); }
+                if (s) strncpy(msg_out->target_id, s, sizeof(msg_out->target_id) - 1);
                 seen |= GIP_SEEN_TARGET;
                 break;
             }
             case FIELD_SEQUENCE_NUMBER:
-                tlv_field_get_uint32(&field, &msg_out->sequence_number);
+                msg_out->sequence_number = tlv_field_get_uint32(&field);
                 seen |= GIP_SEEN_SEQ;
                 break;
             default: break;
@@ -814,8 +957,11 @@ distric_err_t deserialize_gossip_indirect_ping(
 /* ============================================================================
  * GOSSIP — MEMBERSHIP UPDATE
  * Required: sender_id
- * Optional: updates[] (may be empty)
+ * Optional: updates[]
  * ========================================================================= */
+#define GMU_SEEN_SENDER_ID (1u << 0)
+#define GMU_REQUIRED       (GMU_SEEN_SENDER_ID)
+
 distric_err_t serialize_gossip_membership_update(
     const gossip_membership_update_t* msg,
     uint8_t** buffer_out,
@@ -829,25 +975,26 @@ distric_err_t serialize_gossip_membership_update(
     tlv_encode_string(enc, FIELD_NODE_ID, msg->sender_id);
 
     for (size_t i = 0; i < msg->update_count; i++) {
-        const gossip_node_info_wire_t* n = &msg->updates[i];
+        const gossip_node_info_wire_t* node = &msg->updates[i];
         tlv_encoder_t* ne = tlv_encoder_create(256);
         if (!ne) { tlv_encoder_free(enc); return DISTRIC_ERR_NO_MEMORY; }
 
-        tlv_encode_string(ne, FIELD_NODE_ID,      n->node_id);
-        tlv_encode_string(ne, FIELD_NODE_ADDRESS, n->address);
-        tlv_encode_uint16(ne, FIELD_NODE_PORT,    n->port);
-        tlv_encode_uint32(ne, FIELD_NODE_STATE,   (uint32_t)n->state);
-        tlv_encode_uint32(ne, FIELD_NODE_ROLE,    (uint32_t)n->role);
-        tlv_encode_uint64(ne, FIELD_INCARNATION,  n->incarnation);
-        tlv_encode_uint8 (ne, FIELD_CPU_USAGE,    n->cpu_usage);
-        tlv_encode_uint8 (ne, FIELD_MEMORY_USAGE, n->memory_usage);
+        tlv_encode_string(ne, FIELD_NODE_ID,      node->node_id);
+        tlv_encode_string(ne, FIELD_NODE_ADDRESS, node->address);
+        tlv_encode_uint32(ne, FIELD_NODE_PORT,    node->port);
+        tlv_encode_uint32(ne, FIELD_NODE_STATE,   (uint32_t)node->state);
+        tlv_encode_uint32(ne, FIELD_NODE_ROLE,    (uint32_t)node->role);
+        tlv_encode_uint64(ne, FIELD_INCARNATION,  node->incarnation);
+        tlv_encode_uint8 (ne, FIELD_CPU_USAGE,    node->cpu_usage);
+        tlv_encode_uint8 (ne, FIELD_MEMORY_USAGE, node->memory_usage);
 
-        size_t   nb_len;
-        uint8_t* nb = tlv_encoder_detach(ne, &nb_len);
+        size_t   nlen;
+        uint8_t* nbuf = tlv_encoder_detach(ne, &nlen);
         tlv_encoder_free(ne);
-        if (!nb) { tlv_encoder_free(enc); return DISTRIC_ERR_NO_MEMORY; }
-        tlv_encode_bytes(enc, FIELD_NODE_INFO, nb, nb_len);
-        free(nb);
+        if (!nbuf) { tlv_encoder_free(enc); return DISTRIC_ERR_NO_MEMORY; }
+
+        tlv_encode_bytes(enc, FIELD_NODE_INFO, nbuf, nlen);
+        free(nbuf);
     }
 
     *buffer_out = tlv_encoder_detach(enc, len_out);
@@ -856,9 +1003,9 @@ distric_err_t serialize_gossip_membership_update(
 }
 
 distric_err_t deserialize_gossip_membership_update(
-    const uint8_t*              buffer,
-    size_t                      len,
-    gossip_membership_update_t* msg_out)
+    const uint8_t*               buffer,
+    size_t                       len,
+    gossip_membership_update_t*  msg_out)
 {
     if (!buffer || !msg_out || len == 0) return DISTRIC_ERR_INVALID_ARG;
     if (!tlv_validate_buffer(buffer, len)) return DISTRIC_ERR_INVALID_FORMAT;
@@ -869,23 +1016,16 @@ distric_err_t deserialize_gossip_membership_update(
     if (!dec) return DISTRIC_ERR_NO_MEMORY;
 
     uint32_t seen = 0;
-#define GMU_SEEN_SENDER_ID (1u << 0)
-#define GMU_REQUIRED       GMU_SEEN_SENDER_ID
-
-    /* Count nodes first */
-    size_t node_count = 0;
     tlv_field_t field;
+
+    /* First pass: count node infos */
+    size_t node_count = 0;
     while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
         if (field.tag == FIELD_NODE_INFO) node_count++;
     }
-
     if (node_count > 0) {
-        msg_out->updates = (gossip_node_info_wire_t*)calloc(
-                               node_count, sizeof(gossip_node_info_wire_t));
-        if (!msg_out->updates) {
-            tlv_decoder_free(dec);
-            return DISTRIC_ERR_NO_MEMORY;
-        }
+        msg_out->updates = (gossip_node_info_wire_t*)calloc(node_count, sizeof(gossip_node_info_wire_t));
+        if (!msg_out->updates) { tlv_decoder_free(dec); return DISTRIC_ERR_NO_MEMORY; }
     }
 
     tlv_decoder_reset(dec);
@@ -895,8 +1035,7 @@ distric_err_t deserialize_gossip_membership_update(
         switch (field.tag) {
             case FIELD_NODE_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->sender_id, s,
-                                 sizeof(msg_out->sender_id) - 1); }
+                if (s) strncpy(msg_out->sender_id, s, sizeof(msg_out->sender_id) - 1);
                 seen |= GMU_SEEN_SENDER_ID;
                 break;
             }
@@ -911,36 +1050,36 @@ distric_err_t deserialize_gossip_membership_update(
                         switch (nf.tag) {
                             case FIELD_NODE_ID: {
                                 const char* s = tlv_field_get_string(&nf);
-                                if (s) strncpy(node->node_id, s,
-                                               sizeof(node->node_id) - 1);
+                                if (s) strncpy(node->node_id, s, sizeof(node->node_id) - 1);
                                 break;
                             }
                             case FIELD_NODE_ADDRESS: {
                                 const char* s = tlv_field_get_string(&nf);
-                                if (s) strncpy(node->address, s,
-                                               sizeof(node->address) - 1);
+                                if (s) strncpy(node->address, s, sizeof(node->address) - 1);
                                 break;
                             }
                             case FIELD_NODE_PORT:
-                                tlv_field_get_uint16(&nf, &node->port); break;
+                                node->port = (uint16_t)tlv_field_get_uint32(&nf);
+                                break;
                             case FIELD_NODE_STATE: {
-                                uint32_t v;
-                                tlv_field_get_uint32(&nf, &v);
+                                uint32_t v = tlv_field_get_uint32(&nf);
                                 node->state = (node_state_t)v;
                                 break;
                             }
                             case FIELD_NODE_ROLE: {
-                                uint32_t v;
-                                tlv_field_get_uint32(&nf, &v);
+                                uint32_t v = tlv_field_get_uint32(&nf);
                                 node->role = (node_role_t)v;
                                 break;
                             }
                             case FIELD_INCARNATION:
-                                tlv_field_get_uint64(&nf, &node->incarnation); break;
+                                node->incarnation = tlv_field_get_uint64(&nf);
+                                break;
                             case FIELD_CPU_USAGE:
-                                tlv_field_get_uint8(&nf, &node->cpu_usage); break;
+                                node->cpu_usage = tlv_field_get_uint8(&nf);
+                                break;
                             case FIELD_MEMORY_USAGE:
-                                tlv_field_get_uint8(&nf, &node->memory_usage); break;
+                                node->memory_usage = tlv_field_get_uint8(&nf);
+                                break;
                             default: break;
                         }
                     }
@@ -953,7 +1092,6 @@ distric_err_t deserialize_gossip_membership_update(
     }
 
     msg_out->update_count = node_idx;
-
     CHECK_REQUIRED(dec, seen, GMU_REQUIRED);
     tlv_decoder_free(dec);
     return DISTRIC_OK;
@@ -970,7 +1108,6 @@ void free_gossip_membership_update(gossip_membership_update_t* msg)
 /* ============================================================================
  * TASK — ASSIGNMENT
  * Required: task_id, workflow_id, task_type, timeout_sec
- * Optional: config_json, input_data, retry_count
  * ========================================================================= */
 #define TA_SEEN_TASK_ID     (1u << 0)
 #define TA_SEEN_WORKFLOW_ID (1u << 1)
@@ -989,19 +1126,15 @@ distric_err_t serialize_task_assignment(
     tlv_encoder_t* enc = tlv_encoder_create(512);
     if (!enc) return DISTRIC_ERR_NO_MEMORY;
 
-    tlv_encode_string(enc, FIELD_TASK_ID,    msg->task_id);
-    tlv_encode_string(enc, FIELD_WORKFLOW_ID,msg->workflow_id);
-    tlv_encode_string(enc, FIELD_TASK_TYPE,  msg->task_type);
-    tlv_encode_uint32(enc, FIELD_TIMEOUT_SEC,msg->timeout_sec);
-    tlv_encode_uint32(enc, FIELD_RETRY_COUNT,msg->retry_count);
-
-    if (msg->config_json) {
+    tlv_encode_string(enc, FIELD_TASK_ID,     msg->task_id);
+    tlv_encode_string(enc, FIELD_WORKFLOW_ID, msg->workflow_id);
+    tlv_encode_string(enc, FIELD_TASK_TYPE,   msg->task_type);
+    tlv_encode_uint32(enc, FIELD_TIMEOUT_SEC, msg->timeout_sec);
+    tlv_encode_uint32(enc, FIELD_RETRY_COUNT, msg->retry_count);
+    if (msg->config_json)
         tlv_encode_string(enc, FIELD_TASK_CONFIG, msg->config_json);
-    }
-    if (msg->input_data && msg->input_data_len > 0) {
-        tlv_encode_bytes(enc, FIELD_TASK_INPUT, msg->input_data,
-                         msg->input_data_len);
-    }
+    if (msg->input_data && msg->input_data_len > 0)
+        tlv_encode_bytes(enc, FIELD_TASK_INPUT, msg->input_data, msg->input_data_len);
 
     *buffer_out = tlv_encoder_detach(enc, len_out);
     tlv_encoder_free(enc);
@@ -1028,31 +1161,28 @@ distric_err_t deserialize_task_assignment(
         switch (field.tag) {
             case FIELD_TASK_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->task_id, s,
-                                 sizeof(msg_out->task_id) - 1); }
+                if (s) strncpy(msg_out->task_id, s, sizeof(msg_out->task_id) - 1);
                 seen |= TA_SEEN_TASK_ID;
                 break;
             }
             case FIELD_WORKFLOW_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->workflow_id, s,
-                                 sizeof(msg_out->workflow_id) - 1); }
+                if (s) strncpy(msg_out->workflow_id, s, sizeof(msg_out->workflow_id) - 1);
                 seen |= TA_SEEN_WORKFLOW_ID;
                 break;
             }
             case FIELD_TASK_TYPE: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->task_type, s,
-                                 sizeof(msg_out->task_type) - 1); }
+                if (s) strncpy(msg_out->task_type, s, sizeof(msg_out->task_type) - 1);
                 seen |= TA_SEEN_TASK_TYPE;
                 break;
             }
             case FIELD_TIMEOUT_SEC:
-                tlv_field_get_uint32(&field, &msg_out->timeout_sec);
+                msg_out->timeout_sec = tlv_field_get_uint32(&field);
                 seen |= TA_SEEN_TIMEOUT;
                 break;
             case FIELD_RETRY_COUNT:
-                tlv_field_get_uint32(&field, &msg_out->retry_count);
+                msg_out->retry_count = tlv_field_get_uint32(&field);
                 break;
             case FIELD_TASK_CONFIG: {
                 const char* s = tlv_field_get_string(&field);
@@ -1064,10 +1194,7 @@ distric_err_t deserialize_task_assignment(
                 const uint8_t* d = tlv_field_get_bytes(&field, &dlen);
                 if (d && dlen > 0) {
                     msg_out->input_data = (uint8_t*)malloc(dlen);
-                    if (msg_out->input_data) {
-                        memcpy(msg_out->input_data, d, dlen);
-                        msg_out->input_data_len = dlen;
-                    }
+                    if (msg_out->input_data) { memcpy(msg_out->input_data, d, dlen); msg_out->input_data_len = dlen; }
                 }
                 break;
             }
@@ -1093,7 +1220,6 @@ void free_task_assignment(task_assignment_t* msg)
 /* ============================================================================
  * TASK — RESULT
  * Required: task_id, worker_id, status
- * Optional: output_data, error_message, exit_code, timestamps
  * ========================================================================= */
 #define TR_SEEN_TASK_ID   (1u << 0)
 #define TR_SEEN_WORKER_ID (1u << 1)
@@ -1113,14 +1239,10 @@ distric_err_t serialize_task_result(
     tlv_encode_string(enc, FIELD_TASK_ID,    msg->task_id);
     tlv_encode_string(enc, FIELD_WORKER_ID,  msg->worker_id);
     tlv_encode_uint32(enc, FIELD_TASK_STATUS,(uint32_t)msg->status);
-
-    if (msg->output_data && msg->output_data_len > 0) {
-        tlv_encode_bytes(enc, FIELD_TASK_OUTPUT, msg->output_data,
-                         msg->output_data_len);
-    }
-    if (msg->error_message) {
+    if (msg->output_data && msg->output_data_len > 0)
+        tlv_encode_bytes(enc, FIELD_TASK_OUTPUT, msg->output_data, msg->output_data_len);
+    if (msg->error_message)
         tlv_encode_string(enc, FIELD_TASK_ERROR, msg->error_message);
-    }
     tlv_encode_int32 (enc, FIELD_EXIT_CODE,    msg->exit_code);
     tlv_encode_uint64(enc, FIELD_STARTED_AT,   msg->started_at);
     tlv_encode_uint64(enc, FIELD_COMPLETED_AT, msg->completed_at);
@@ -1150,21 +1272,18 @@ distric_err_t deserialize_task_result(
         switch (field.tag) {
             case FIELD_TASK_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->task_id, s,
-                                 sizeof(msg_out->task_id) - 1); }
+                if (s) strncpy(msg_out->task_id, s, sizeof(msg_out->task_id) - 1);
                 seen |= TR_SEEN_TASK_ID;
                 break;
             }
             case FIELD_WORKER_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->worker_id, s,
-                                 sizeof(msg_out->worker_id) - 1); }
+                if (s) strncpy(msg_out->worker_id, s, sizeof(msg_out->worker_id) - 1);
                 seen |= TR_SEEN_WORKER_ID;
                 break;
             }
             case FIELD_TASK_STATUS: {
-                uint32_t v;
-                tlv_field_get_uint32(&field, &v);
+                uint32_t v = tlv_field_get_uint32(&field);
                 msg_out->status = (task_status_t)v;
                 seen |= TR_SEEN_STATUS;
                 break;
@@ -1174,10 +1293,7 @@ distric_err_t deserialize_task_result(
                 const uint8_t* d = tlv_field_get_bytes(&field, &dlen);
                 if (d && dlen > 0) {
                     msg_out->output_data = (uint8_t*)malloc(dlen);
-                    if (msg_out->output_data) {
-                        memcpy(msg_out->output_data, d, dlen);
-                        msg_out->output_data_len = dlen;
-                    }
+                    if (msg_out->output_data) { memcpy(msg_out->output_data, d, dlen); msg_out->output_data_len = dlen; }
                 }
                 break;
             }
@@ -1187,11 +1303,14 @@ distric_err_t deserialize_task_result(
                 break;
             }
             case FIELD_EXIT_CODE:
-                tlv_field_get_int32(&field, &msg_out->exit_code); break;
+                msg_out->exit_code = tlv_field_get_int32(&field);
+                break;
             case FIELD_STARTED_AT:
-                tlv_field_get_uint64(&field, &msg_out->started_at); break;
+                msg_out->started_at = tlv_field_get_uint64(&field);
+                break;
             case FIELD_COMPLETED_AT:
-                tlv_field_get_uint64(&field, &msg_out->completed_at); break;
+                msg_out->completed_at = tlv_field_get_uint64(&field);
+                break;
             default: break;
         }
     }
@@ -1206,15 +1325,14 @@ void free_task_result(task_result_t* msg)
     if (!msg) return;
     free(msg->output_data);
     free(msg->error_message);
-    msg->output_data      = NULL;
-    msg->error_message    = NULL;
-    msg->output_data_len  = 0;
+    msg->output_data     = NULL;
+    msg->error_message   = NULL;
+    msg->output_data_len = 0;
 }
 
 /* ============================================================================
  * CLIENT — SUBMIT
  * Required: message_id, event_type, timestamp
- * Optional: payload_json
  * ========================================================================= */
 #define CS_SEEN_MSG_ID     (1u << 0)
 #define CS_SEEN_EVENT_TYPE (1u << 1)
@@ -1234,10 +1352,8 @@ distric_err_t serialize_client_submit(
     tlv_encode_string(enc, FIELD_MESSAGE_ID,  msg->message_id);
     tlv_encode_string(enc, FIELD_EVENT_TYPE,  msg->event_type);
     tlv_encode_uint64(enc, FIELD_TIMESTAMP,   msg->timestamp);
-
-    if (msg->payload_json) {
+    if (msg->payload_json)
         tlv_encode_string(enc, FIELD_MESSAGE_PAYLOAD, msg->payload_json);
-    }
 
     *buffer_out = tlv_encoder_detach(enc, len_out);
     tlv_encoder_free(enc);
@@ -1264,20 +1380,18 @@ distric_err_t deserialize_client_submit(
         switch (field.tag) {
             case FIELD_MESSAGE_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->message_id, s,
-                                 sizeof(msg_out->message_id) - 1); }
+                if (s) strncpy(msg_out->message_id, s, sizeof(msg_out->message_id) - 1);
                 seen |= CS_SEEN_MSG_ID;
                 break;
             }
             case FIELD_EVENT_TYPE: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->event_type, s,
-                                 sizeof(msg_out->event_type) - 1); }
+                if (s) strncpy(msg_out->event_type, s, sizeof(msg_out->event_type) - 1);
                 seen |= CS_SEEN_EVENT_TYPE;
                 break;
             }
             case FIELD_TIMESTAMP:
-                tlv_field_get_uint64(&field, &msg_out->timestamp);
+                msg_out->timestamp = tlv_field_get_uint64(&field);
                 seen |= CS_SEEN_TIMESTAMP;
                 break;
             case FIELD_MESSAGE_PAYLOAD: {
@@ -1304,11 +1418,10 @@ void free_client_submit(client_submit_t* msg)
 /* ============================================================================
  * CLIENT — RESPONSE
  * Required: message_id, response_code
- * Optional: response_message, workflows_triggered
  * ========================================================================= */
-#define CR_SEEN_MSG_ID   (1u << 0)
+#define CR_SEEN_MSG_ID    (1u << 0)
 #define CR_SEEN_RESP_CODE (1u << 1)
-#define CR_REQUIRED      (CR_SEEN_MSG_ID | CR_SEEN_RESP_CODE)
+#define CR_REQUIRED       (CR_SEEN_MSG_ID | CR_SEEN_RESP_CODE)
 
 distric_err_t serialize_client_response(
     const client_response_t* msg,
@@ -1317,20 +1430,16 @@ distric_err_t serialize_client_response(
 {
     if (!msg || !buffer_out || !len_out) return DISTRIC_ERR_INVALID_ARG;
 
-    tlv_encoder_t* enc = tlv_encoder_create(256);
+    tlv_encoder_t* enc = tlv_encoder_create(512);
     if (!enc) return DISTRIC_ERR_NO_MEMORY;
 
     tlv_encode_string(enc, FIELD_MESSAGE_ID,    msg->message_id);
     tlv_encode_uint32(enc, FIELD_RESPONSE_CODE, msg->response_code);
-
-    if (msg->response_message) {
+    if (msg->response_message)
         tlv_encode_string(enc, FIELD_RESPONSE_MESSAGE, msg->response_message);
-    }
-    for (size_t i = 0; i < msg->workflow_count; i++) {
-        if (msg->workflows_triggered[i]) {
+    for (size_t i = 0; i < msg->workflow_count; i++)
+        if (msg->workflows_triggered[i])
             tlv_encode_string(enc, FIELD_TRIGGERED, msg->workflows_triggered[i]);
-        }
-    }
 
     *buffer_out = tlv_encoder_detach(enc, len_out);
     tlv_encoder_free(enc);
@@ -1353,17 +1462,14 @@ distric_err_t deserialize_client_response(
     uint32_t seen = 0;
     tlv_field_t field;
 
-    /* Count triggered workflows first */
+    /* First pass: count triggered workflows */
     size_t wf_count = 0;
     while (tlv_decode_next(dec, &field) == DISTRIC_OK) {
         if (field.tag == FIELD_TRIGGERED) wf_count++;
     }
     if (wf_count > 0) {
         msg_out->workflows_triggered = (char**)calloc(wf_count, sizeof(char*));
-        if (!msg_out->workflows_triggered) {
-            tlv_decoder_free(dec);
-            return DISTRIC_ERR_NO_MEMORY;
-        }
+        if (!msg_out->workflows_triggered) { tlv_decoder_free(dec); return DISTRIC_ERR_NO_MEMORY; }
     }
 
     tlv_decoder_reset(dec);
@@ -1373,13 +1479,12 @@ distric_err_t deserialize_client_response(
         switch (field.tag) {
             case FIELD_MESSAGE_ID: {
                 const char* s = tlv_field_get_string(&field);
-                if (s) { strncpy(msg_out->message_id, s,
-                                 sizeof(msg_out->message_id) - 1); }
+                if (s) strncpy(msg_out->message_id, s, sizeof(msg_out->message_id) - 1);
                 seen |= CR_SEEN_MSG_ID;
                 break;
             }
             case FIELD_RESPONSE_CODE:
-                tlv_field_get_uint32(&field, &msg_out->response_code);
+                msg_out->response_code = tlv_field_get_uint32(&field);
                 seen |= CR_SEEN_RESP_CODE;
                 break;
             case FIELD_RESPONSE_MESSAGE: {
@@ -1408,9 +1513,7 @@ void free_client_response(client_response_t* msg)
 {
     if (!msg) return;
     free(msg->response_message);
-    for (size_t i = 0; i < msg->workflow_count; i++) {
-        free(msg->workflows_triggered[i]);
-    }
+    for (size_t i = 0; i < msg->workflow_count; i++) free(msg->workflows_triggered[i]);
     free(msg->workflows_triggered);
     msg->response_message    = NULL;
     msg->workflows_triggered = NULL;
@@ -1419,8 +1522,6 @@ void free_client_response(client_response_t* msg)
 
 /* ============================================================================
  * UTILITY FUNCTIONS
- * Human-readable string representations for wire-format enum types.
- * These are declared in messages.h but were missing their implementations.
  * ========================================================================= */
 
 const char* raft_entry_type_to_string(uint8_t type)

@@ -1,39 +1,34 @@
 cmake_minimum_required(VERSION 3.15)
 
-# Library: distric_protocol
-project(distric_protocol VERSION 1.0.0 LANGUAGES C)
+project(distric_protocol VERSION 2.0.0 LANGUAGES C)
 
-# Set C11 standard with GNU extensions
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 
-# Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic -Werror")
 
-# Find dependencies
 find_package(Threads REQUIRED)
 
-# Source files
 set(PROTOCOL_SOURCES
     src/binary.c
     src/crc32.c
     src/tlv.c
     src/messages.c
     src/rpc.c
+    src/auth.c
+    src/capability.c
+    src/error_info.c
 )
 
-# Create library
 add_library(distric_protocol STATIC ${PROTOCOL_SOURCES})
 
-# Set C11 properties explicitly with GNU extensions
 set_target_properties(distric_protocol PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
     C_EXTENSIONS ON
 )
 
-# Include directories
 target_include_directories(distric_protocol
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -42,8 +37,6 @@ target_include_directories(distric_protocol
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# Link dependencies
-# Protocol layer depends on observability (for future metrics/logging)
 target_link_libraries(distric_protocol
     PUBLIC
         distric_obs
@@ -51,12 +44,27 @@ target_link_libraries(distric_protocol
         Threads::Threads
 )
 
-# Add tests
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
 
-# Installation
+# ---- Optional: libFuzzer targets (requires clang + -DBUILD_FUZZ=ON) ----
+option(BUILD_FUZZ "Build libFuzzer harnesses" OFF)
+
+if(BUILD_FUZZ)
+    foreach(TARGET fuzz_tlv fuzz_header fuzz_auth)
+        add_executable(${TARGET} tests/${TARGET}.c)
+        target_compile_options(${TARGET} PRIVATE
+            -fsanitize=fuzzer,address,undefined -O1)
+        target_link_options(${TARGET} PRIVATE
+            -fsanitize=fuzzer,address,undefined)
+        target_link_libraries(${TARGET} PRIVATE distric_protocol)
+        target_include_directories(${TARGET} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    endforeach()
+endif()
+
 install(TARGETS distric_protocol
     EXPORT distric_protocol-targets
     LIBRARY DESTINATION lib
